@@ -118,42 +118,6 @@ fn ensure_enwik8() -> Result<PathBuf, BuildError> {
     Ok(enwik8_path)
 }
 
-/// Split text into chunks at line boundaries, roughly `chunk_size` bytes each.
-fn split_into_chunks(text: &str, chunk_size: usize) -> Vec<&str> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < text.len() {
-        let target = (start + chunk_size).min(text.len());
-        // Snap to a char boundary
-        let target = snap_to_char_boundary(text, target);
-        // Find the nearest newline at or after target to avoid splitting mid-line
-        let end = if target < text.len() {
-            text[target..].find('\n').map_or(target, |i| target + i + 1)
-        } else {
-            target
-        };
-        if end <= start {
-            break;
-        }
-        chunks.push(&text[start..end]);
-        start = end;
-    }
-
-    chunks
-}
-
-fn snap_to_char_boundary(text: &str, idx: usize) -> usize {
-    if idx >= text.len() {
-        return text.len();
-    }
-    // Walk backwards to find a char boundary
-    let mut i = idx;
-    while i > 0 && !text.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
 
 /// Convert a HuggingFace repo's tokenizer.json to .tkz format.
 pub fn convert(repo_id: &str, output: &Path) -> Result<ConvertResult, BuildError> {
@@ -185,21 +149,21 @@ pub fn convert(repo_id: &str, output: &Path) -> Result<ConvertResult, BuildError
 
 /// Verify a .tkz file against a reference tokenizer backend using enwik8.
 ///
-/// Downloads and caches enwik8 (~100MB), splits into ~1KB chunks, and compares
-/// token IDs from tokie against the reference backend (HF tokenizers or tiktoken-rs).
+/// Downloads and caches enwik8 (~100MB), encodes the first 1MB as a single
+/// string with both backends, and compares the full token ID vectors.
 pub fn verify(repo_id: &str, tkz_path: &Path) -> Result<VerifyResult, BuildError> {
     let tokie_tok = Tokenizer::from_file(tkz_path).map_err(BuildError::SaveTkz)?;
 
     let enwik8_path = ensure_enwik8()?;
     let raw = std::fs::read(&enwik8_path)
         .map_err(|e| BuildError::Download(format!("failed to read enwik8: {e}")))?;
-    let text = String::from_utf8_lossy(&raw);
-    let chunks = split_into_chunks(&text, 1024);
+    // Use first 1MB to keep verification fast
+    let truncated = &raw[..raw.len().min(1_000_000)];
+    let text = String::from_utf8_lossy(truncated);
 
-    let mut mismatches = Vec::new();
-    let mut passed = 0;
+    let tokie_ids = tokie_tok.encode(&text, false).ids;
 
-    if let Some(encoding_name) = tiktoken_encoding_name(repo_id) {
+    let ref_ids = if let Some(encoding_name) = tiktoken_encoding_name(repo_id) {
         let tiktoken = match encoding_name {
             "cl100k_base" => tiktoken_rs::cl100k_base(),
             "o200k_base" => tiktoken_rs::o200k_base(),
@@ -208,55 +172,57 @@ pub fn verify(repo_id: &str, tkz_path: &Path) -> Result<VerifyResult, BuildError
         }
         .expect("failed to load tiktoken encoding");
 
-        for chunk in &chunks {
-            let tokie_ids = tokie_tok.encode(chunk, false).ids;
-            let ref_ids: Vec<u32> = tiktoken
-                .encode_with_special_tokens(chunk)
-                .into_iter()
-                .map(|id| id as u32)
-                .collect();
-
-            if tokie_ids == ref_ids {
-                passed += 1;
-            } else {
-                mismatches.push(Mismatch {
-                    text: chunk[..snap_to_char_boundary(chunk, 80)].to_string(),
-                    tokie_ids,
-                    reference_ids: ref_ids,
-                });
-            }
-        }
+        tiktoken
+            .encode_with_special_tokens(&text)
+            .into_iter()
+            .map(|id| id as u32)
+            .collect::<Vec<u32>>()
     } else {
-        let hf_tok = tokenizers::Tokenizer::from_pretrained(repo_id, None)
+        let mut hf_tok = tokenizers::Tokenizer::from_pretrained(repo_id, None)
             .map_err(|e| BuildError::Download(format!("HF tokenizer load failed: {e}")))?;
+        let _ = hf_tok.with_truncation(None);
 
-        for chunk in &chunks {
-            let tokie_ids = tokie_tok.encode(chunk, false).ids;
-            let hf_encoding = hf_tok
-                .encode(chunk.to_string(), false)
-                .map_err(|e| BuildError::Download(format!("HF encode failed: {e}")))?;
-            let ref_ids: Vec<u32> = hf_encoding.get_ids().to_vec();
+        let hf_encoding = hf_tok
+            .encode(text.to_string(), false)
+            .map_err(|e| BuildError::Download(format!("HF encode failed: {e}")))?;
+        hf_encoding.get_ids().to_vec()
+    };
 
-            if tokie_ids == ref_ids {
-                passed += 1;
-            } else {
-                mismatches.push(Mismatch {
-                    text: chunk[..snap_to_char_boundary(chunk, 80)].to_string(),
-                    tokie_ids,
-                    reference_ids: ref_ids,
-                });
-            }
-        }
+    if tokie_ids == ref_ids {
+        return Ok(VerifyResult {
+            total: tokie_ids.len(),
+            passed: tokie_ids.len(),
+            failed: 0,
+            mismatches: vec![],
+        });
     }
 
-    let total = chunks.len();
-    let failed = mismatches.len();
+    // Find the first divergence point
+    let first_diff = tokie_ids
+        .iter()
+        .zip(ref_ids.iter())
+        .position(|(a, b)| a != b)
+        .unwrap_or(tokie_ids.len().min(ref_ids.len()));
+
+    let mismatch = Mismatch {
+        text: format!(
+            "enwik8 (1MB): {} tokie tokens vs {} ref tokens, first diff at token {}",
+            tokie_ids.len(),
+            ref_ids.len(),
+            first_diff
+        ),
+        tokie_ids: tokie_ids[first_diff.saturating_sub(2)..(first_diff + 5).min(tokie_ids.len())]
+            .to_vec(),
+        reference_ids: ref_ids
+            [first_diff.saturating_sub(2)..(first_diff + 5).min(ref_ids.len())]
+            .to_vec(),
+    };
 
     Ok(VerifyResult {
-        total,
-        passed,
-        failed,
-        mismatches,
+        total: tokie_ids.len().max(ref_ids.len()),
+        passed: first_diff,
+        failed: tokie_ids.len().max(ref_ids.len()) - first_diff,
+        mismatches: vec![mismatch],
     })
 }
 
