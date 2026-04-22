@@ -62,12 +62,11 @@ jobs:
           fi
           echo "Benchmarking base commit: $BASE_SHA"
           git stash --include-untracked || true
-          git checkout "$BASE_SHA"
+          git checkout "$BASE_SHA" -- . || git checkout --force "$BASE_SHA"
           cargo run --example speed_regression --release --features hf \
             > benchmark_base.json 2>benchmark_base.log || echo '{"results":[]}' > benchmark_base.json
           cat benchmark_base.log
-          git checkout -
-          git stash pop || true
+          git checkout --force - || true
 
       - name: Compare results
         if: github.event_name == 'push' || github.event_name == 'pull_request'
