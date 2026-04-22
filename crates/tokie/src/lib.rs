@@ -57,6 +57,8 @@ pub mod encoder;
 pub mod hf;
 #[cfg(feature = "hf")]
 mod hub;
+#[cfg(feature = "build")]
+pub mod build;
 pub mod normalizer;
 pub mod padding;
 mod postprocessor;
@@ -70,6 +72,8 @@ pub use decoder::{Decoder, DecoderType, VocabDecoder};
 pub use hf::JsonLoadError;
 #[cfg(feature = "hf")]
 pub use hub::{FromPretrainedOptions, HubError};
+#[cfg(feature = "build")]
+pub use build::{BuildError, ConvertResult, VerifyResult, Mismatch};
 pub use normalizer::{bert_uncased_normalize, clean_text, fnr, metaspace_normalize, strip_accents, FnrFinder, Normalizer};
 pub use padding::{Encoding, PaddingParams, PaddingStrategy, PaddingDirection, TruncationParams, TruncationStrategy, TruncationDirection};
 pub use postprocessor::PostProcessor;
