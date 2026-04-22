@@ -3,6 +3,8 @@ name: Tokenizer Accuracy
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -41,4 +43,4 @@ jobs:
           fi
 
       - name: Run tokenizer accuracy tests
-        run: cargo test -p tokie --test accuracy --features hf -- --ignored
+        run: cargo test -p tokie --test accuracy --features build -- --ignored

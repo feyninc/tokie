@@ -4,7 +4,7 @@
 //!
 //! Requires network access and benches/data/enwik8 (1MB used).
 
-#![cfg(feature = "hf")]
+#![cfg(feature = "build")]
 
 use std::path::Path;
 
