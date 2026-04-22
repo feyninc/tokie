@@ -5,7 +5,7 @@
 //! tokie = { version = "0.1", features = ["build"] }
 //! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use hf_hub::Repo;
 
@@ -70,16 +70,90 @@ fn tiktoken_encoding_name(repo_id: &str) -> Option<&'static str> {
     }
 }
 
-const VERIFY_TEXTS: &[&str] = &[
-    "Hello, world!",
-    "The quick brown fox jumps over the lazy dog.",
-    "Machine learning models encode text into dense vector representations.",
-    "Tokenization is the process of splitting text into smaller units called tokens.",
-    "BGE, GTE, and E5 are popular embedding models for semantic search.",
-    "The 18th century was a time of great change.",
-    "user@example.com visited https://example.org/path?query=1",
-    "I can't believe it's not butter! Don't you think so?",
-];
+const ENWIK8_URL: &str = "http://mattmahoney.net/dc/enwik8.zip";
+
+/// Download and cache enwik8. Returns the path to the cached file.
+fn ensure_enwik8() -> Result<PathBuf, BuildError> {
+    let cache_dir = dirs_next::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("tokie");
+    let enwik8_path = cache_dir.join("enwik8");
+
+    if enwik8_path.exists() {
+        return Ok(enwik8_path);
+    }
+
+    std::fs::create_dir_all(&cache_dir).ok();
+
+    let zip_path = cache_dir.join("enwik8.zip");
+    let response = ureq::get(ENWIK8_URL)
+        .call()
+        .map_err(|e| BuildError::Download(format!("failed to download enwik8: {e}")))?;
+
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| BuildError::Download(format!("failed to read enwik8 response: {e}")))?;
+    std::fs::write(&zip_path, &bytes)
+        .map_err(|e| BuildError::Download(format!("failed to write enwik8.zip: {e}")))?;
+
+    // Extract the zip
+    let file = std::fs::File::open(&zip_path)
+        .map_err(|e| BuildError::Download(format!("failed to open enwik8.zip: {e}")))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| BuildError::Download(format!("failed to read enwik8.zip: {e}")))?;
+    let mut entry = archive
+        .by_index(0)
+        .map_err(|e| BuildError::Download(format!("failed to extract enwik8: {e}")))?;
+    let mut content = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut content)
+        .map_err(|e| BuildError::Download(format!("failed to read enwik8 entry: {e}")))?;
+    std::fs::write(&enwik8_path, &content)
+        .map_err(|e| BuildError::Download(format!("failed to write enwik8: {e}")))?;
+
+    // Clean up zip
+    std::fs::remove_file(&zip_path).ok();
+
+    Ok(enwik8_path)
+}
+
+/// Split text into chunks at line boundaries, roughly `chunk_size` bytes each.
+fn split_into_chunks(text: &str, chunk_size: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+
+    while start < text.len() {
+        let target = (start + chunk_size).min(text.len());
+        // Snap to a char boundary
+        let target = snap_to_char_boundary(text, target);
+        // Find the nearest newline at or after target to avoid splitting mid-line
+        let end = if target < text.len() {
+            text[target..].find('\n').map_or(target, |i| target + i + 1)
+        } else {
+            target
+        };
+        if end <= start {
+            break;
+        }
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+
+    chunks
+}
+
+fn snap_to_char_boundary(text: &str, idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    // Walk backwards to find a char boundary
+    let mut i = idx;
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
 
 /// Convert a HuggingFace repo's tokenizer.json to .tkz format.
 pub fn convert(repo_id: &str, output: &Path) -> Result<ConvertResult, BuildError> {
@@ -109,12 +183,18 @@ pub fn convert(repo_id: &str, output: &Path) -> Result<ConvertResult, BuildError
     })
 }
 
-/// Verify a .tkz file against a reference tokenizer backend.
+/// Verify a .tkz file against a reference tokenizer backend using enwik8.
 ///
-/// Auto-detects whether to use tiktoken-rs or HF tokenizers based on repo_id.
+/// Downloads and caches enwik8 (~100MB), splits into ~1KB chunks, and compares
+/// token IDs from tokie against the reference backend (HF tokenizers or tiktoken-rs).
 pub fn verify(repo_id: &str, tkz_path: &Path) -> Result<VerifyResult, BuildError> {
-    let tokie_tok =
-        Tokenizer::from_file(tkz_path).map_err(BuildError::SaveTkz)?;
+    let tokie_tok = Tokenizer::from_file(tkz_path).map_err(BuildError::SaveTkz)?;
+
+    let enwik8_path = ensure_enwik8()?;
+    let raw = std::fs::read(&enwik8_path)
+        .map_err(|e| BuildError::Download(format!("failed to read enwik8: {e}")))?;
+    let text = String::from_utf8_lossy(&raw);
+    let chunks = split_into_chunks(&text, 1024);
 
     let mut mismatches = Vec::new();
     let mut passed = 0;
@@ -128,10 +208,10 @@ pub fn verify(repo_id: &str, tkz_path: &Path) -> Result<VerifyResult, BuildError
         }
         .expect("failed to load tiktoken encoding");
 
-        for text in VERIFY_TEXTS {
-            let tokie_ids = tokie_tok.encode(text, false).ids;
+        for chunk in &chunks {
+            let tokie_ids = tokie_tok.encode(chunk, false).ids;
             let ref_ids: Vec<u32> = tiktoken
-                .encode_with_special_tokens(text)
+                .encode_with_special_tokens(chunk)
                 .into_iter()
                 .map(|id| id as u32)
                 .collect();
@@ -140,7 +220,7 @@ pub fn verify(repo_id: &str, tkz_path: &Path) -> Result<VerifyResult, BuildError
                 passed += 1;
             } else {
                 mismatches.push(Mismatch {
-                    text: text.to_string(),
+                    text: chunk[..snap_to_char_boundary(chunk, 80)].to_string(),
                     tokie_ids,
                     reference_ids: ref_ids,
                 });
@@ -150,10 +230,10 @@ pub fn verify(repo_id: &str, tkz_path: &Path) -> Result<VerifyResult, BuildError
         let hf_tok = tokenizers::Tokenizer::from_pretrained(repo_id, None)
             .map_err(|e| BuildError::Download(format!("HF tokenizer load failed: {e}")))?;
 
-        for text in VERIFY_TEXTS {
-            let tokie_ids = tokie_tok.encode(text, false).ids;
+        for chunk in &chunks {
+            let tokie_ids = tokie_tok.encode(chunk, false).ids;
             let hf_encoding = hf_tok
-                .encode(text.to_string(), false)
+                .encode(chunk.to_string(), false)
                 .map_err(|e| BuildError::Download(format!("HF encode failed: {e}")))?;
             let ref_ids: Vec<u32> = hf_encoding.get_ids().to_vec();
 
@@ -161,7 +241,7 @@ pub fn verify(repo_id: &str, tkz_path: &Path) -> Result<VerifyResult, BuildError
                 passed += 1;
             } else {
                 mismatches.push(Mismatch {
-                    text: text.to_string(),
+                    text: chunk[..snap_to_char_boundary(chunk, 80)].to_string(),
                     tokie_ids,
                     reference_ids: ref_ids,
                 });
@@ -169,7 +249,7 @@ pub fn verify(repo_id: &str, tkz_path: &Path) -> Result<VerifyResult, BuildError
         }
     }
 
-    let total = VERIFY_TEXTS.len();
+    let total = chunks.len();
     let failed = mismatches.len();
 
     Ok(VerifyResult {

@@ -13,7 +13,7 @@ categories = ["text-processing", "science"]
 [features]
 default = []
 hf = ["hf-hub"]
-build = ["hf", "dep:tokenizers", "dep:tiktoken-rs", "dep:ureq"]
+build = ["hf", "dep:tokenizers", "dep:tiktoken-rs", "dep:ureq", "dep:zip", "dep:dirs-next"]
 
 [dependencies]
 crc32fast = "1.4"
@@ -31,6 +31,8 @@ unicode-general-category = "1.0"
 tokenizers = { version = "0.22", features = ["http"], optional = true }
 tiktoken-rs = { version = "0.6", optional = true }
 ureq = { version = "2", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+dirs-next = { version = "2", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"

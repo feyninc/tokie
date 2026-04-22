@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use tokie::build::VerifyResult;
 
 #[derive(Parser)]
 #[command(name = "tokie", about = "Build, verify, and upload tokie tokenizers")]
@@ -43,6 +44,53 @@ enum Commands {
     },
 }
 
+const MAX_MISMATCHES_SHOWN: usize = 5;
+
+fn print_verify_result(result: &VerifyResult) {
+    if result.failed == 0 {
+        println!("OK  {}/{} chunks pass", result.passed, result.total);
+        return;
+    }
+
+    println!(
+        "FAILED  {}/{} chunks pass ({} mismatches)",
+        result.passed, result.total, result.failed
+    );
+
+    let shown = result.mismatches.len().min(MAX_MISMATCHES_SHOWN);
+    for m in &result.mismatches[..shown] {
+        println!("  MISMATCH: \"{}\"", m.text);
+
+        // Find first divergence index
+        let first_diff = m
+            .tokie_ids
+            .iter()
+            .zip(m.reference_ids.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(m.tokie_ids.len().min(m.reference_ids.len()));
+
+        let start = first_diff.saturating_sub(2);
+        let tokie_end = (first_diff + 5).min(m.tokie_ids.len());
+        let ref_end = (first_diff + 5).min(m.reference_ids.len());
+
+        println!(
+            "    first diff at token {}: tokie[{}..{}]={:?}  ref[{}..{}]={:?}",
+            first_diff,
+            start,
+            tokie_end,
+            &m.tokie_ids[start..tokie_end],
+            start,
+            ref_end,
+            &m.reference_ids[start..ref_end],
+        );
+    }
+
+    let remaining = result.mismatches.len() - shown;
+    if remaining > 0 {
+        println!("  ... and {remaining} more mismatches");
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -83,21 +131,9 @@ fn cmd_convert(repo_id: &str, output: &PathBuf, verify: bool, upload: bool, toke
         print!("Verifying ... ");
         match tokie::build::verify(repo_id, output) {
             Ok(result) => {
-                if result.failed == 0 {
-                    println!("OK  {}/{} texts pass", result.passed, result.total);
-                } else {
-                    println!("FAILED  {}/{} texts pass", result.passed, result.total);
-                    for m in &result.mismatches {
-                        println!("  MISMATCH: \"{}\"", m.text);
-                        println!(
-                            "    tokie: {:?}",
-                            &m.tokie_ids[..m.tokie_ids.len().min(15)]
-                        );
-                        println!(
-                            "    ref:   {:?}",
-                            &m.reference_ids[..m.reference_ids.len().min(15)]
-                        );
-                    }
+                let failed = result.failed > 0;
+                print_verify_result(&result);
+                if failed {
                     std::process::exit(1);
                 }
             }
@@ -144,21 +180,9 @@ fn cmd_verify(repo_id: &str, tkz: Option<PathBuf>) {
     print!("Verifying {repo_id} ... ");
     match tokie::build::verify(repo_id, &tkz_path) {
         Ok(result) => {
-            if result.failed == 0 {
-                println!("OK  {}/{} texts pass", result.passed, result.total);
-            } else {
-                println!("FAILED  {}/{} texts pass", result.passed, result.total);
-                for m in &result.mismatches {
-                    println!("  MISMATCH: \"{}\"", m.text);
-                    println!(
-                        "    tokie: {:?}",
-                        &m.tokie_ids[..m.tokie_ids.len().min(15)]
-                    );
-                    println!(
-                        "    ref:   {:?}",
-                        &m.reference_ids[..m.reference_ids.len().min(15)]
-                    );
-                }
+            let failed = result.failed > 0;
+            print_verify_result(&result);
+            if failed {
                 std::process::exit(1);
             }
         }
