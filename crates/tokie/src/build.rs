@@ -179,3 +179,48 @@ pub fn verify(repo_id: &str, tkz_path: &Path) -> Result<VerifyResult, BuildError
         mismatches,
     })
 }
+
+/// Upload a .tkz file to the tokiers/ org on HuggingFace Hub.
+///
+/// Uses the HF Hub HTTP API directly (hf-hub crate is download-only).
+/// If `token` is None, falls back to HF_TOKEN env var.
+pub fn upload(tkz_path: &Path, tokiers_name: &str, token: Option<&str>) -> Result<(), BuildError> {
+    if !tkz_path.exists() {
+        return Err(BuildError::Upload(format!(
+            "file not found: {}",
+            tkz_path.display()
+        )));
+    }
+
+    let token_str = token
+        .map(|t| t.to_string())
+        .or_else(|| std::env::var("HF_TOKEN").ok())
+        .ok_or_else(|| {
+            BuildError::Upload(
+                "no HF token found — pass --token or set HF_TOKEN env var".to_string(),
+            )
+        })?;
+
+    let file_content = std::fs::read(tkz_path)
+        .map_err(|e| BuildError::Upload(format!("failed to read {}: {e}", tkz_path.display())))?;
+
+    let repo_id = format!("tokiers/{tokiers_name}");
+    let url = format!(
+        "https://huggingface.co/api/models/{repo_id}/upload/main/tokenizer.tkz",
+    );
+
+    let response = ureq::put(&url)
+        .set("Authorization", &format!("Bearer {token_str}"))
+        .set("Content-Type", "application/octet-stream")
+        .send_bytes(&file_content)
+        .map_err(|e| BuildError::Upload(format!("HTTP upload to {repo_id} failed: {e}")))?;
+
+    if response.status() >= 400 {
+        return Err(BuildError::Upload(format!(
+            "upload returned HTTP {}: check your token has write access to tokiers/ org",
+            response.status()
+        )));
+    }
+
+    Ok(())
+}
