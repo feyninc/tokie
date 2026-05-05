@@ -1172,10 +1172,9 @@ dependencies = [
 
 [[package]]
 name = "pretokie"
-version = "0.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52cb5f02994a0b0264a8eb100161df7d304d41e3bb9d52e0c0c1c9bac101eeb9"
+version = "0.0.4"
 dependencies = [
+ "foldhash",
  "regex-automata",
  "unicode-general-category",
 ]
@@ -1183,8 +1182,9 @@ dependencies = [
 [[package]]
 name = "pretokie"
 version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b5871f5067ed1410c4ba981870a5d47ef6c02414343ff4a449b8d3627d602f2"
 dependencies = [
- "foldhash",
  "regex-automata",
  "unicode-general-category",
 ]
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "tokie"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "chunk",
  "crc32fast",
@@ -1716,7 +1716,7 @@ dependencies = [
  "hf-hub",
  "icu_normalizer 1.5.0",
  "memchr",
- "pretokie 0.0.3",
+ "pretokie 0.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "smallvec",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "tokie-python"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "pyo3",
  "tokie",

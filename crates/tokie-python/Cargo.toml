@@ -1,6 +1,6 @@
 [package]
 name = "tokie-python"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 description = "Python bindings for tokie — blazingly fast tokenizer"
 license = "MIT OR Apache-2.0"
