@@ -50,7 +50,7 @@ jobs:
       - name: Test in Pyodide
         run: |
           npm install pyodide
-          node --experimental-vm-modules <<'SCRIPT'
+          node --input-type=module --experimental-vm-modules <<'SCRIPT'
           import { loadPyodide } from "pyodide";
           import { readFileSync, readdirSync } from "fs";
 
