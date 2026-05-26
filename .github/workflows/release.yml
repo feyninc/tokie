@@ -64,25 +64,25 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.13'
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-unknown-emscripten
 
       - name: Install Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: '3.1.58'
+          version: '4.0.9'
 
       - name: Build Emscripten wheel
         uses: PyO3/maturin-action@v1
         with:
           target: wasm32-unknown-emscripten
-          args: --release --out dist -i python3.12 --no-default-features
+          args: --release --out dist -i python3.13 --no-default-features
           working-directory: crates/tokie-python
-          rust-toolchain: stable
+          rust-toolchain: nightly
 
       - uses: actions/upload-artifact@v4
         with:
