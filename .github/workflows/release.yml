@@ -55,6 +55,40 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: crates/tokie-python/dist
 
+  build-emscripten:
+    name: Build Emscripten wheel (Pyodide)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-emscripten
+
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '3.1.58'
+
+      - name: Build Emscripten wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: wasm32-unknown-emscripten
+          args: --release --out dist -i python3.12 --no-default-features
+          working-directory: crates/tokie-python
+          rust-toolchain: stable
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-wasm32-unknown-emscripten
+          path: crates/tokie-python/dist
+
   build-sdist:
     name: Build source distribution
     runs-on: ubuntu-latest
@@ -74,7 +108,7 @@ jobs:
 
   upload-pypi:
     name: Upload to PyPI
-    needs: [build-wheels, build-sdist]
+    needs: [build-wheels, build-emscripten, build-sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

@@ -116,6 +116,7 @@ impl PyTokenizer {
 
     /// Download and load a tokenizer from the HuggingFace Hub.
     /// Tries .tkz first, then falls back to tokenizer.json.
+    #[cfg(feature = "hf")]
     #[staticmethod]
     fn from_pretrained(py: Python<'_>, repo_id: &str) -> PyResult<Self> {
         let repo = repo_id.to_string();
