@@ -66,28 +66,28 @@ jobs:
           pyodide.FS.writeFile(`/tmp/${wheelFile}`, wheelData);
 
           await pyodide.runPythonAsync(`
-          import micropip
-          await micropip.install("emfs:///tmp/${wheelFile}")
-          `);
+import micropip
+await micropip.install("emfs:///tmp/${wheelFile}")
+`);
 
           pyodide.runPython(`
-          import tokie
+import tokie
 
-          # Verify module exports
-          assert hasattr(tokie, 'Tokenizer'), "Missing Tokenizer class"
-          assert hasattr(tokie, 'Encoding'), "Missing Encoding class"
-          assert hasattr(tokie, 'TokieError'), "Missing TokieError exception"
+# Verify module exports
+assert hasattr(tokie, 'Tokenizer'), "Missing Tokenizer class"
+assert hasattr(tokie, 'Encoding'), "Missing Encoding class"
+assert hasattr(tokie, 'TokieError'), "Missing TokieError exception"
 
-          # Verify Tokenizer methods are present
-          t = tokie.Tokenizer
-          for method in ['from_json', 'from_file', 'encode', 'decode', 'encode_batch', 'decode_batch', 'count_tokens']:
-              assert hasattr(t, method), f"Missing method: {method}"
+# Verify Tokenizer methods are present
+t = tokie.Tokenizer
+for method in ['from_json', 'from_file', 'encode', 'decode', 'encode_batch', 'decode_batch', 'count_tokens']:
+    assert hasattr(t, method), f"Missing method: {method}"
 
-          # Verify from_pretrained is NOT available (hf feature disabled)
-          assert not hasattr(t, 'from_pretrained'), "from_pretrained should be absent in wasm build"
+# Verify from_pretrained is NOT available (hf feature disabled)
+assert not hasattr(t, 'from_pretrained'), "from_pretrained should be absent in wasm build"
 
-          print("All Pyodide compatibility checks passed!")
-          `);
+print("All Pyodide compatibility checks passed!")
+`);
 
           console.log("Pyodide test succeeded");
           SCRIPT
