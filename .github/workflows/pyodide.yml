@@ -11,83 +11,100 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  EMSDK_VERSION: "4.0.9"
 
 jobs:
-  build-and-test:
-    name: Build & test in Pyodide
+  build-pyemscripten:
+    name: Build PyEmscripten wheel (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: '3.14'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: wasm32-unknown-emscripten
+      - name: Install pyodide-build
+        run: pip install pyodide-build
 
-      - name: Install Emscripten
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: ${{ env.EMSDK_VERSION }}
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Build wasm wheel
-        run: maturin build --release --target wasm32-unknown-emscripten --no-default-features -i python3.13 --out dist
-        working-directory: crates/tokie-python
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Test in Pyodide
+      - name: Get pyodide config
+        id: pyodide-config
         run: |
-          npm install pyodide
-          node --input-type=module --experimental-vm-modules <<'SCRIPT'
-          import { loadPyodide } from "pyodide";
-          import { readFileSync, readdirSync } from "fs";
+          echo "rust-toolchain=$(pyodide config get rust_toolchain)" >> "$GITHUB_OUTPUT"
+          echo "emscripten-version=$(pyodide config get emscripten_version)" >> "$GITHUB_OUTPUT"
+          echo "pyodide-abi-version=$(pyodide config get pyodide_abi_version)" >> "$GITHUB_OUTPUT"
+          echo "rustflags=$(pyodide config get rustflags)" >> "$GITHUB_OUTPUT"
 
-          const distFiles = readdirSync("crates/tokie-python/dist");
-          const wheelFile = distFiles.find(f => f.endsWith(".whl"));
-          if (!wheelFile) throw new Error("No wheel found in dist/");
+      - uses: emscripten-core/setup-emsdk@v16
+        with:
+          version: ${{ steps.pyodide-config.outputs.emscripten-version }}
 
-          console.log(`Testing wheel: ${wheelFile}`);
-          const pyodide = await loadPyodide();
-          await pyodide.loadPackage("micropip");
+      - name: Build PyEmscripten wheel
+        uses: PyO3/maturin-action@v1
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUSTFLAGS: ${{ steps.pyodide-config.outputs.rustflags }}
+          MATURIN_PYEMSCRIPTEN_PLATFORM_VERSION: ${{ steps.pyodide-config.outputs.pyodide-abi-version }}
+        with:
+          target: wasm32-unknown-emscripten
+          args: --release --out dist --interpreter ${{ matrix.python-version }} --no-default-features
+          working-directory: crates/tokie-python
+          rust-toolchain: ${{ steps.pyodide-config.outputs.rust-toolchain }}
 
-          const wheelData = readFileSync(`crates/tokie-python/dist/${wheelFile}`);
-          pyodide.FS.writeFile(`/tmp/${wheelFile}`, wheelData);
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-pyemscripten-${{ matrix.python-version }}
+          path: crates/tokie-python/dist
 
-          await pyodide.runPythonAsync(`
-import micropip
-await micropip.install("emfs:///tmp/${wheelFile}")
-`);
+  test-pyemscripten:
+    name: Test in Pyodide (${{ matrix.python-version }})
+    needs: [build-pyemscripten]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: '3.14'
+    steps:
+      - uses: actions/checkout@v4
 
-          pyodide.runPython(`
-import tokie
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
-# Verify module exports
-assert hasattr(tokie, 'Tokenizer'), "Missing Tokenizer class"
-assert hasattr(tokie, 'Encoding'), "Missing Encoding class"
-assert hasattr(tokie, 'TokieError'), "Missing TokieError exception"
+      - name: Install pyodide-build
+        run: pip install pyodide-build
 
-# Verify Tokenizer methods are present
-t = tokie.Tokenizer
-for method in ['from_json', 'from_file', 'encode', 'decode', 'encode_batch', 'decode_batch', 'count_tokens']:
-    assert hasattr(t, method), f"Missing method: {method}"
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-pyemscripten-${{ matrix.python-version }}
+          path: dist
 
-# Verify from_pretrained is NOT available (hf feature disabled)
-assert not hasattr(t, 'from_pretrained'), "from_pretrained should be absent in wasm build"
+      - name: Test in Pyodide venv
+        run: |
+          pyodide venv .venv-pyodide
+          source .venv-pyodide/bin/activate
+          pip install --upgrade pip
+          pip install tokie --no-index --no-deps --find-links dist
+          python -c "
+          import tokie
 
-print("All Pyodide compatibility checks passed!")
-`);
+          # Verify module exports
+          assert hasattr(tokie, 'Tokenizer'), 'Missing Tokenizer class'
+          assert hasattr(tokie, 'Encoding'), 'Missing Encoding class'
+          assert hasattr(tokie, 'TokieError'), 'Missing TokieError exception'
 
-          console.log("Pyodide test succeeded");
-          SCRIPT
+          # Verify Tokenizer methods are present
+          t = tokie.Tokenizer
+          for method in ['from_json', 'from_file', 'encode', 'decode', 'encode_batch', 'decode_batch', 'count_tokens']:
+              assert hasattr(t, method), f'Missing method: {method}'
+
+          # Verify from_pretrained is NOT available (hf feature disabled)
+          assert not hasattr(t, 'from_pretrained'), 'from_pretrained should be absent in wasm build'
+
+          print('All Pyodide compatibility checks passed!')
+          "
