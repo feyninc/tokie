@@ -16,4 +16,4 @@ hf = ["tokie-core/hf"]
 
 [dependencies]
 tokie-core = { package = "tokie", path = "../tokie", default-features = false }
-pyo3 = { version = "0.24", features = ["extension-module"] }
+pyo3 = { version = "0.25", features = ["extension-module"] }
