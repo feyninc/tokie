@@ -74,27 +74,27 @@ jobs:
         run: pip install pyodide-build
 
       - name: Get pyodide config
-        id: pyodide-config
+        id: pyodide_config
         run: |
-          echo "rust-toolchain=$(pyodide config get rust_toolchain)" >> "$GITHUB_OUTPUT"
-          echo "emscripten-version=$(pyodide config get emscripten_version)" >> "$GITHUB_OUTPUT"
-          echo "pyodide-abi-version=$(pyodide config get pyodide_abi_version)" >> "$GITHUB_OUTPUT"
+          echo "rust_toolchain=$(pyodide config get rust_toolchain)" >> "$GITHUB_OUTPUT"
+          echo "emscripten_version=$(pyodide config get emscripten_version)" >> "$GITHUB_OUTPUT"
+          echo "pyodide_abi_version=$(pyodide config get pyodide_abi_version)" >> "$GITHUB_OUTPUT"
           echo "rustflags=$(pyodide config get rustflags)" >> "$GITHUB_OUTPUT"
 
       - uses: emscripten-core/setup-emsdk@v16
         with:
-          version: ${{ steps.pyodide-config.outputs.emscripten-version }}
+          version: ${{ steps.pyodide_config.outputs.emscripten_version }}
 
       - name: Build PyEmscripten wheel
         uses: PyO3/maturin-action@v1
         env:
-          CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUSTFLAGS: ${{ steps.pyodide-config.outputs.rustflags }}
-          MATURIN_PYEMSCRIPTEN_PLATFORM_VERSION: ${{ steps.pyodide-config.outputs.pyodide-abi-version }}
+          CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUSTFLAGS: ${{ steps.pyodide_config.outputs.rustflags }}
+          MATURIN_PYEMSCRIPTEN_PLATFORM_VERSION: ${{ steps.pyodide_config.outputs.pyodide_abi_version }}
         with:
           target: wasm32-unknown-emscripten
           args: --release --out dist --interpreter ${{ matrix.python-version }} --no-default-features
           working-directory: crates/tokie-python
-          rust-toolchain: ${{ steps.pyodide-config.outputs.rust-toolchain }}
+          rust-toolchain: ${{ steps.pyodide_config.outputs.rust_toolchain }}
 
       - uses: actions/upload-artifact@v4
         with:
