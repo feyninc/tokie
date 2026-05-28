@@ -1,0 +1,93 @@
+name: Pyodide compatibility
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  EMSDK_VERSION: "4.0.9"
+
+jobs:
+  build-and-test:
+    name: Build & test in Pyodide
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-emscripten
+
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ env.EMSDK_VERSION }}
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build wasm wheel
+        run: maturin build --release --target wasm32-unknown-emscripten --no-default-features -i python3.13 --out dist
+        working-directory: crates/tokie-python
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test in Pyodide
+        run: |
+          npm install pyodide
+          node --input-type=module --experimental-vm-modules <<'SCRIPT'
+          import { loadPyodide } from "pyodide";
+          import { readFileSync, readdirSync } from "fs";
+
+          const distFiles = readdirSync("crates/tokie-python/dist");
+          const wheelFile = distFiles.find(f => f.endsWith(".whl"));
+          if (!wheelFile) throw new Error("No wheel found in dist/");
+
+          console.log(`Testing wheel: ${wheelFile}`);
+          const pyodide = await loadPyodide();
+          await pyodide.loadPackage("micropip");
+
+          const wheelData = readFileSync(`crates/tokie-python/dist/${wheelFile}`);
+          pyodide.FS.writeFile(`/tmp/${wheelFile}`, wheelData);
+
+          await pyodide.runPythonAsync(`
+import micropip
+await micropip.install("emfs:///tmp/${wheelFile}")
+`);
+
+          pyodide.runPython(`
+import tokie
+
+# Verify module exports
+assert hasattr(tokie, 'Tokenizer'), "Missing Tokenizer class"
+assert hasattr(tokie, 'Encoding'), "Missing Encoding class"
+assert hasattr(tokie, 'TokieError'), "Missing TokieError exception"
+
+# Verify Tokenizer methods are present
+t = tokie.Tokenizer
+for method in ['from_json', 'from_file', 'encode', 'decode', 'encode_batch', 'decode_batch', 'count_tokens']:
+    assert hasattr(t, method), f"Missing method: {method}"
+
+# Verify from_pretrained is NOT available (hf feature disabled)
+assert not hasattr(t, 'from_pretrained'), "from_pretrained should be absent in wasm build"
+
+print("All Pyodide compatibility checks passed!")
+`);
+
+          console.log("Pyodide test succeeded");
+          SCRIPT
