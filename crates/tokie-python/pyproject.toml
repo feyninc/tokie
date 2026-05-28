@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tokie"
-version = "0.0.10a1"
+version = "0.0.10a2"
 description = "Blazingly fast tokenizer — 50x faster, 10x smaller, 100% accurate"
 readme = "README_PYPI.md"
 requires-python = ">=3.10"
