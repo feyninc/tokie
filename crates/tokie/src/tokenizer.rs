@@ -92,6 +92,9 @@ pub struct Tokenizer {
     /// Special token metadata: maps token string -> token ID.
     /// Populated from the `added_tokens` array in tokenizer.json where `special: true`.
     special_tokens: Vec<(String, TokenId)>,
+    /// Process-unique id tagging pooled pretoken-cache contents (see
+    /// `crate::pool`).
+    cache_generation: u64,
 }
 
 impl Tokenizer {
@@ -116,7 +119,54 @@ impl Tokenizer {
             reverse_vocab: OnceLock::new(),
             added_tokens_matcher: None,
             special_tokens: Vec::new(),
+            cache_generation: crate::pool::next_generation(),
         }
+    }
+
+    /// Byte-balanced work-stealing scaffold for batch calls: split `texts`
+    /// into fine-grained chunks, run one worker per CPU with a leased
+    /// long-lived pretoken cache, workers claim chunks as they finish
+    /// (fast P-cores keep working instead of idling on the slowest
+    /// E-core's tail), and return per-chunk results in input order.
+    fn steal_batches<'a, 'b, R, F>(&self, texts: &'b [&'a str], work: F) -> Vec<R>
+    where
+        R: Send,
+        F: Fn(&'b [&'a str], &mut PretokenCache) -> R + Sync,
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cpus = num_cpus();
+        let chunks = byte_balanced_chunks(texts, cpus * 4);
+        let next = AtomicUsize::new(0);
+        let mut results: Vec<Option<R>> = Vec::new();
+        results.resize_with(chunks.len(), || None);
+        let generation = self.cache_generation;
+        thread::scope(|s| {
+            let handles: Vec<_> = (0..cpus.min(chunks.len()))
+                .map(|_| {
+                    let chunks = &chunks;
+                    let next = &next;
+                    let work = &work;
+                    s.spawn(move || {
+                        let mut lease = crate::pool::CacheLease::checkout(generation);
+                        let mut out: Vec<(usize, R)> = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= chunks.len() {
+                                break;
+                            }
+                            out.push((i, work(chunks[i], lease.cache())));
+                        }
+                        out
+                    })
+                })
+                .collect();
+            for h in handles {
+                for (i, r) in h.join().unwrap() {
+                    results[i] = Some(r);
+                }
+            }
+        });
+        results.into_iter().map(|r| r.unwrap()).collect()
     }
 
     /// Set added tokens matcher. These are matched BEFORE pretokenization, like HuggingFace does.
@@ -721,24 +771,15 @@ impl Tokenizer {
         let cpus = num_cpus();
 
         let mut encodings: Vec<Encoding> = if texts.len() > cpus && cpus > 1 {
-            thread::scope(|s| {
-                byte_balanced_chunks(texts, cpus)
-                    .into_iter()
-                    .map(|text_chunk| {
-                        s.spawn(|| {
-                            let chunk_bytes: usize = text_chunk.iter().map(|t| t.len()).sum();
-                            let mut cache = (chunk_bytes >= PRETOKEN_CACHE_MIN_BYTES)
-                                .then(PretokenCache::new);
-                            text_chunk.iter()
-                                .map(|t| self.encode_inner(t, add_special_tokens, cache.as_mut()))
-                                .collect::<Vec<_>>()
-                        })
-                    })
+            self.steal_batches(texts, |chunk, cache| {
+                chunk
+                    .iter()
+                    .map(|t| self.encode_inner(t, add_special_tokens, Some(cache)))
                     .collect::<Vec<_>>()
-                    .into_iter()
-                    .flat_map(|h| h.join().unwrap())
-                    .collect()
             })
+            .into_iter()
+            .flatten()
+            .collect()
         } else {
             texts.iter().map(|t| self.encode(t, add_special_tokens)).collect()
         };
@@ -780,29 +821,18 @@ impl Tokenizer {
             return (ids, lens);
         }
 
-        let results: Vec<(Vec<TokenId>, Vec<u64>)> = thread::scope(|s| {
-            byte_balanced_chunks(texts, cpus)
-                .into_iter()
-                .map(|text_chunk| {
-                    s.spawn(move || {
-                        let chunk_bytes: usize = text_chunk.iter().map(|t| t.len()).sum();
-                        let mut cache = (chunk_bytes >= PRETOKEN_CACHE_MIN_BYTES)
-                            .then(PretokenCache::new);
-                        let mut ids = Vec::with_capacity(chunk_bytes / 3);
-                        let mut lens = Vec::with_capacity(text_chunk.len());
-                        for t in text_chunk {
-                            let v = self.encode_ids_ctx(t, add_special_tokens, cache.as_mut());
-                            lens.push(v.len() as u64);
-                            ids.extend_from_slice(&v);
-                        }
-                        (ids, lens)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect()
-        });
+        let results: Vec<(Vec<TokenId>, Vec<u64>)> =
+            self.steal_batches(texts, |chunk, cache| {
+                let chunk_bytes: usize = chunk.iter().map(|t| t.len()).sum();
+                let mut ids = Vec::with_capacity(chunk_bytes / 3);
+                let mut lens = Vec::with_capacity(chunk.len());
+                for t in chunk {
+                    let v = self.encode_ids_ctx(t, add_special_tokens, Some(cache));
+                    lens.push(v.len() as u64);
+                    ids.extend_from_slice(&v);
+                }
+                (ids, lens)
+            });
 
         let total_ids: usize = results.iter().map(|(i, _)| i.len()).sum();
         let mut ids = Vec::with_capacity(total_ids);
@@ -821,24 +851,15 @@ impl Tokenizer {
             return texts.iter().map(|t| self.count_tokens(t)).collect();
         }
 
-        thread::scope(|s| {
-            byte_balanced_chunks(texts, cpus)
-                .into_iter()
-                .map(|text_chunk| {
-                    s.spawn(|| {
-                        let chunk_bytes: usize = text_chunk.iter().map(|t| t.len()).sum();
-                        let mut cache = (chunk_bytes >= PRETOKEN_CACHE_MIN_BYTES)
-                            .then(PretokenCache::new);
-                        text_chunk.iter()
-                            .map(|t| self.encode_raw_ctx(t, cache.as_mut()).len())
-                            .collect::<Vec<_>>()
-                    })
-                })
+        self.steal_batches(texts, |chunk, cache| {
+            chunk
+                .iter()
+                .map(|t| self.encode_raw_ctx(t, Some(cache)).len())
                 .collect::<Vec<_>>()
-                .into_iter()
-                .flat_map(|h| h.join().unwrap())
-                .collect()
         })
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Count tokens without storing them (no special tokens).

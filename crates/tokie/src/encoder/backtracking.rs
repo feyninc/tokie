@@ -684,6 +684,12 @@ impl PretokenCache {
         Self { entries: vec![empty; n].into_boxed_slice(), mask: n - 1 }
     }
 
+    /// Reset every entry to empty (for reuse under a different tokenizer).
+    pub fn clear(&mut self) {
+        let empty = CacheEntry { key: [0; 16], toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
+        self.entries.fill(empty);
+    }
+
     #[inline(always)]
     fn key_block(bytes: &[u8]) -> [u8; 16] {
         debug_assert!(!bytes.is_empty() && bytes.len() <= CACHE_KEY_MAX);

@@ -63,6 +63,7 @@ pub mod normalizer;
 pub mod padding;
 mod postprocessor;
 pub mod pretok;
+mod pool;
 mod serde;
 mod tokenizer;
 mod types;
