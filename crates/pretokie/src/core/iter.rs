@@ -135,18 +135,35 @@ impl<'a, C: PretokConfig> Core<'a, C> {
     /// Scan remaining digits after the first digit byte is already consumed.
     #[inline(always)]
     fn scan_digits(&mut self) {
+        // \p{N} covers Nd/Nl/No, so non-ASCII numerics (¹, ❶, Ⅷ) continue a run
         match C::DIGIT_MODE {
             DigitMode::Unlimited => {
-                while self.pos < self.len && is_digit(self.at(self.pos)) {
-                    self.pos += 1;
+                while self.pos < self.len {
+                    let b = self.at(self.pos);
+                    if is_digit(b) {
+                        self.pos += 1;
+                    } else if b >= 0x80 {
+                        let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
+                        if ch.is_numeric() { self.pos += cl; } else { break; }
+                    } else {
+                        break;
+                    }
                 }
             }
             DigitMode::Chunked3 => {
-                // First digit already consumed; scan up to 2 more
+                // First digit already consumed; scan up to 2 more chars
                 let mut count = 1u8;
-                while self.pos < self.len && count < 3 && is_digit(self.at(self.pos)) {
-                    self.pos += 1;
-                    count += 1;
+                while self.pos < self.len && count < 3 {
+                    let b = self.at(self.pos);
+                    if is_digit(b) {
+                        self.pos += 1;
+                        count += 1;
+                    } else if b >= 0x80 {
+                        let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
+                        if ch.is_numeric() { self.pos += cl; count += 1; } else { break; }
+                    } else {
+                        break;
+                    }
                 }
             }
             DigitMode::Single => {
@@ -167,10 +184,10 @@ impl<'a, C: PretokConfig> Core<'a, C> {
         } else {
             self.bytes[self.pos + 1]
         };
+        // No lookahead in the regex: '(?i:[sdmt]|ll|ve|re) matches even when
+        // more letters follow ("don'ts" -> "don", "'t", "s"; "O'Toole" -> "O", "'T", "oole")
         if matches!(b1, b's' | b't' | b'd' | b'm') {
-            if rem == 2 || !is_ascii_letter(self.bytes[self.pos + 2]) {
-                return 2;
-            }
+            return 2;
         }
         if rem < 3 { return 0; }
         let b2 = if C::CONTRACTION_CASE == ContractionCase::Insensitive {
@@ -261,8 +278,11 @@ impl<'a, C: PretokConfig> Core<'a, C> {
         }
         if self.pos < self.len && prev_pos > start {
             if C::WS_EXCEPTION == WsException::Digits {
-                // SmolLM: don't back up before digits
-                if !is_digit(self.at(self.pos)) {
+                // SmolLM: don't back up before numerics (\p{N} incl. ½, ¹)
+                let next = self.at(self.pos);
+                let is_num = is_digit(next)
+                    || (next >= 0x80 && decode_utf8(&self.bytes[self.pos..]).0.is_numeric());
+                if !is_num {
                     self.pos = prev_pos;
                 }
             } else {
@@ -469,6 +489,11 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                                 return Some(piece);
                             }
                         }
+                    } else if ch.is_numeric() && C::SPACE_PREFIXES_DIGITS {
+                        // GPT-2 ` ?\p{N}+`: space attaches to a numeric run (incl. ¹, ❶)
+                        let (_, cl) = decode_utf8(&self.bytes[self.pos + 1..]);
+                        self.pos += 1 + cl;
+                        self.scan_digits();
                     } else if ch.is_whitespace() || ch.is_numeric() {
                         self.scan_whitespace();
                     } else {
@@ -541,9 +566,13 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
             } else if ch.is_whitespace() {
                 self.scan_whitespace();
             } else {
-                // Non-ASCII symbol: try prefix letters, else punct group
+                // Non-ASCII symbol: one-char prefix to letters where the config's
+                // letter rule allows it, else a punct group (incl. trailing newlines)
                 self.pos += cl;
-                if self.pos < self.len {
+                if C::PUNCT_PREFIX_MODE == PunctPrefixMode::SpaceOnly {
+                    // GPT-2/SmolLM: punct never prefixes letters
+                    self.scan_punct();
+                } else if self.pos < self.len {
                     let next = self.at(self.pos);
                     if is_ascii_letter(next) {
                         self.scan_letters_after_punct_prefix(next);
@@ -563,10 +592,10 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                             } else {
                                 self.scan_letters();
                             }
-                        } else if Self::is_unicode_punct_char(ch2) {
+                        } else {
                             self.scan_punct();
                         }
-                    } else if Self::is_punct_byte(next) {
+                    } else {
                         self.scan_punct();
                     }
                 }
@@ -698,6 +727,11 @@ mod tests {
         assert_eq!(SmolLM::new("a  b").collect::<Vec<_>>(), vec!["a", " ", " b"]);
     }
     #[test] fn smollm_newline_digits() { assert_eq!(SmolLM::new("abc\n123").collect::<Vec<_>>(), vec!["abc", "\n", "1", "2", "3"]); }
+    #[test] fn smollm_whitespace_before_unicode_digit() {
+        // \s+(?=\p{N}) exception covers unicode numerics (½ U+00BD), not just ASCII digits
+        assert_eq!(SmolLM::new("a\n\n½ cup").collect::<Vec<_>>(), vec!["a", "\n\n", "½", " cup"]);
+        assert_eq!(SmolLM::new("x  ½").collect::<Vec<_>>(), vec!["x", "  ", "½"]);
+    }
 
     // DeepSeek
     #[test] fn deepseek_basic() { assert_eq!(DeepSeek::new("Hello world").collect::<Vec<_>>(), vec!["Hello", " world"]); }
@@ -721,5 +755,53 @@ mod tests {
     #[test] fn qwen_newline() {
         assert_eq!(Qwen::new("a\nb").collect::<Vec<_>>(), vec!["a", "\n", "b"]);
         assert_eq!(Qwen::new("a \nb").collect::<Vec<_>>(), vec!["a", " \n", "b"]);
+    }
+
+    // Unicode numerics: \p{N} covers No/Nl (¹ U+00B9, ❶ U+2776), not just ASCII digits
+    #[test] fn gpt2_space_unicode_numeric() {
+        assert_eq!(Gpt2::new("x ¹").collect::<Vec<_>>(), vec!["x", " ¹"]);
+        assert_eq!(Gpt2::new("a ❶b").collect::<Vec<_>>(), vec!["a", " ❶", "b"]);
+    }
+    #[test] fn gpt2_unicode_numeric_run() {
+        assert_eq!(Gpt2::new("¹²³").collect::<Vec<_>>(), vec!["¹²³"]);
+        assert_eq!(Gpt2::new("12¹").collect::<Vec<_>>(), vec!["12¹"]);
+    }
+    #[test] fn cl100k_unicode_numeric_chunked() {
+        assert_eq!(Cl100k::new("1¹23").collect::<Vec<_>>(), vec!["1¹2", "3"]);
+    }
+    #[test] fn qwen_unicode_numeric_single() {
+        assert_eq!(Qwen::new("1¹2").collect::<Vec<_>>(), vec!["1", "¹", "2"]);
+        assert_eq!(Qwen::new(" ¹").collect::<Vec<_>>(), vec![" ", "¹"]);
+    }
+
+    // Multibyte punctuation must consume trailing newlines ([^\s\p{L}\p{N}]+[\r\n]*)
+    #[test] fn qwen_multibyte_punct_trailing_newlines() {
+        assert_eq!(Qwen::new("smart”\n\nM").collect::<Vec<_>>(), vec!["smart", "”\n\n", "M"]);
+        assert_eq!(Qwen::new("you…\nA").collect::<Vec<_>>(), vec!["you", "…\n", "A"]);
+        assert_eq!(Qwen::new("”\n \nx").collect::<Vec<_>>(), vec!["”\n", " \n", "x"]);
+        assert_eq!(Qwen::new("”…\n\nx").collect::<Vec<_>>(), vec!["”…\n\n", "x"]);
+        assert_eq!(Qwen::new("x«\n\ny").collect::<Vec<_>>(), vec!["x", "«\n\n", "y"]);
+    }
+    #[test] fn cl100k_multibyte_punct_trailing_newlines() {
+        assert_eq!(Cl100k::new("a”\n\nb").collect::<Vec<_>>(), vec!["a", "”\n\n", "b"]);
+    }
+    #[test] fn gpt2_multibyte_punct_no_trailing() {
+        // GPT-2 has no [\r\n]* suffix and punct never prefixes letters
+        assert_eq!(Gpt2::new("x«\n\ny").collect::<Vec<_>>(), vec!["x", "«", "\n", "\n", "y"]);
+        assert_eq!(Gpt2::new("«abc").collect::<Vec<_>>(), vec!["«", "abc"]);
+        assert_eq!(Gpt2::new("«»").collect::<Vec<_>>(), vec!["«»"]);
+    }
+
+    // Contractions are not blocked by a following letter ('(?i:[sdmt]|ll|ve|re) has no lookahead)
+    #[test] fn qwen_contraction_before_letter() {
+        assert_eq!(Qwen::new("O'Toole").collect::<Vec<_>>(), vec!["O", "'T", "oole"]);
+        assert_eq!(Qwen::new("don'ts").collect::<Vec<_>>(), vec!["don", "'t", "s"]);
+        assert_eq!(Qwen::new("'Toole").collect::<Vec<_>>(), vec!["'T", "oole"]);
+    }
+    #[test] fn gpt2_contraction_before_letter() {
+        assert_eq!(Gpt2::new("don'ts").collect::<Vec<_>>(), vec!["don", "'t", "s"]);
+    }
+    #[test] fn o200k_contraction_suffix_before_letter() {
+        assert_eq!(O200k::new("don'ts").collect::<Vec<_>>(), vec!["don't", "s"]);
     }
 }
