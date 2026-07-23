@@ -10,6 +10,9 @@ pub enum ContractionCase {
 pub enum ContractionMode {
     Standalone,
     Suffix,
+    /// No contraction rule in the pattern (DeepSeek): apostrophe+letters is
+    /// handled by the punct-prefix rule instead.
+    None,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,6 +56,14 @@ pub enum PunctPrefixMode {
     AsciiOnly,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PunctClass {
+    /// Negated class like `[^\s\p{L}\p{N}]` — includes Cf/Cc/Co chars.
+    NegatedAlnum,
+    /// Positive class `[\p{P}\p{S}]` (DeepSeek) — excludes format/control chars.
+    PunctSymbolOnly,
+}
+
 pub trait PretokConfig {
     const CONTRACTION_CASE: ContractionCase;
     const CONTRACTION_MODE: ContractionMode;
@@ -63,4 +74,5 @@ pub trait PretokConfig {
     const PUNCT_TRAILING: PunctTrailing;
     const WS_EXCEPTION: WsException;
     const PUNCT_PREFIX_MODE: PunctPrefixMode;
+    const PUNCT_CLASS: PunctClass = PunctClass::NegatedAlnum;
 }

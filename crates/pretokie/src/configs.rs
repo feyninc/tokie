@@ -70,7 +70,7 @@ impl PretokConfig for SmolLMConfig {
 pub struct DeepSeekConfig;
 impl PretokConfig for DeepSeekConfig {
     const CONTRACTION_CASE: ContractionCase = ContractionCase::Insensitive;
-    const CONTRACTION_MODE: ContractionMode = ContractionMode::Standalone;
+    const CONTRACTION_MODE: ContractionMode = ContractionMode::None;
     const DIGIT_MODE: DigitMode = DigitMode::Chunked3;
     const LETTER_MODE: LetterMode = LetterMode::PlainWithMarks;
     const SPACE_PREFIXES_DIGITS: bool = false;
@@ -78,6 +78,7 @@ impl PretokConfig for DeepSeekConfig {
     const PUNCT_TRAILING: PunctTrailing = PunctTrailing::Newlines;
     const WS_EXCEPTION: WsException = WsException::Cjk;
     const PUNCT_PREFIX_MODE: PunctPrefixMode = PunctPrefixMode::AsciiOnly;
+    const PUNCT_CLASS: PunctClass = PunctClass::PunctSymbolOnly;
 }
 
 pub struct QwenConfig;

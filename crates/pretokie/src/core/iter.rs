@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 
 use crate::core::config::*;
-use crate::util::{decode_utf8, is_ascii_letter, is_digit, is_lower, is_upper, is_unicode_letter, is_unicode_mark};
+use crate::util::{decode_utf8, is_ascii_letter, is_digit, is_lower, is_punct_or_symbol, is_upper, is_unicode_letter, is_unicode_mark};
 
 pub struct Core<'a, C: PretokConfig> {
     bytes: &'a [u8],
@@ -176,6 +176,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
 
     #[inline(always)]
     fn check_contraction(&self) -> usize {
+        if C::CONTRACTION_MODE == ContractionMode::None { return 0; }
         if self.pos >= self.len || self.bytes[self.pos] != b'\'' { return 0; }
         let rem = self.len - self.pos;
         if rem < 2 { return 0; }
@@ -208,13 +209,20 @@ impl<'a, C: PretokConfig> Core<'a, C> {
 
     #[inline(always)]
     fn is_punct_byte(b: u8) -> bool {
-        !is_ascii_letter(b) && !is_digit(b) && b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' && b < 0x80
+        if C::PUNCT_CLASS == PunctClass::PunctSymbolOnly {
+            // [\p{P}\p{S}] in ASCII = printable non-alphanumerics; excludes controls
+            matches!(b, 0x21..=0x2F | 0x3A..=0x40 | 0x5B..=0x60 | 0x7B..=0x7E)
+        } else {
+            !is_ascii_letter(b) && !is_digit(b) && b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' && b < 0x80
+        }
     }
 
-    /// Check if a Unicode char is a non-letter/non-digit/non-whitespace symbol.
+    /// Check if a Unicode char is in this config's punct class.
     #[inline(always)]
     fn is_unicode_punct_char(ch: char) -> bool {
-        if C::LETTER_MODE == LetterMode::PlainWithMarks || C::LETTER_MODE == LetterMode::CamelCase {
+        if C::PUNCT_CLASS == PunctClass::PunctSymbolOnly {
+            is_punct_or_symbol(ch)
+        } else if C::LETTER_MODE == LetterMode::PlainWithMarks || C::LETTER_MODE == LetterMode::CamelCase {
             !ch.is_alphabetic() && !ch.is_numeric() && !ch.is_whitespace() && !is_unicode_mark(ch)
         } else {
             !is_unicode_letter(ch) && !ch.is_numeric() && !ch.is_whitespace()
@@ -423,14 +431,13 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                     let next = self.at(self.pos + 1);
                     if is_ascii_letter(next) {
                         self.pos += 1; // skip apostrophe prefix
-                        self.pos += 1; // consume first letter
-                        self.do_letter_scan(next);
+                        self.scan_letters_after_punct_prefix(next);
                         if let Some(piece) = self.handle_post_letters(start) {
                             return Some(piece);
                         }
                     } else if next >= 0x80 {
                         let (ch, _) = decode_utf8(&self.bytes[self.pos + 1..]);
-                        if Self::is_letter_char(ch) {
+                        if Self::is_letter_char(ch) && C::PUNCT_PREFIX_MODE != PunctPrefixMode::AsciiOnly {
                             self.pos += 1; // skip apostrophe prefix
                             self.scan_letters();
                             if C::LETTER_MODE == LetterMode::CamelCase {
@@ -565,12 +572,39 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                 self.scan_digits();
             } else if ch.is_whitespace() {
                 self.scan_whitespace();
+            } else if C::PUNCT_CLASS == PunctClass::PunctSymbolOnly && !is_punct_or_symbol(ch) {
+                // DeepSeek: a Cf/Cc char is not punct — it's the letter rule's
+                // optional one-char prefix [^\r\n\p{L}\p{P}\p{S}]?, or stands alone
+                self.pos += cl;
+                if self.pos < self.len {
+                    let next = self.at(self.pos);
+                    if is_ascii_letter(next) {
+                        self.pos += 1;
+                        self.scan_letters();
+                        if let Some(piece) = self.handle_post_letters(start) {
+                            return Some(piece);
+                        }
+                    } else if next >= 0x80 {
+                        let (ch2, cl2) = decode_utf8(&self.bytes[self.pos..]);
+                        if Self::is_letter_char(ch2) {
+                            self.pos += cl2;
+                            self.scan_letters();
+                            if let Some(piece) = self.handle_post_letters(start) {
+                                return Some(piece);
+                            }
+                        }
+                    }
+                }
             } else {
                 // Non-ASCII symbol: one-char prefix to letters where the config's
                 // letter rule allows it, else a punct group (incl. trailing newlines)
                 self.pos += cl;
-                if C::PUNCT_PREFIX_MODE == PunctPrefixMode::SpaceOnly {
-                    // GPT-2/SmolLM: punct never prefixes letters
+                if C::PUNCT_PREFIX_MODE == PunctPrefixMode::SpaceOnly
+                    || C::PUNCT_PREFIX_MODE == PunctPrefixMode::AsciiOnly
+                {
+                    // GPT-2/SmolLM: punct never prefixes letters.
+                    // DeepSeek: non-ASCII \p{P}\p{S} is excluded from the letter-prefix
+                    // class — only the ASCII punct list prefixes letters.
                     self.scan_punct();
                 } else if self.pos < self.len {
                     let next = self.at(self.pos);
@@ -741,6 +775,46 @@ mod tests {
         assert_eq!(DeepSeek::new("DON'T").collect::<Vec<_>>(), vec!["DON", "'T"]);
     }
     #[test] fn deepseek_marks() { assert_eq!(DeepSeek::new("ก\u{0E31}น").collect::<Vec<_>>(), vec!["ก\u{0E31}น"]); }
+    #[test] fn deepseek_format_chars_not_punct() {
+        // DeepSeek's punct class is [\p{P}\p{S}]: Cf/Cc chars (ZWSP, soft hyphen,
+        // C1 controls) are not punct — they act as the letter rule's optional
+        // one-char prefix [^\r\n\p{L}\p{P}\p{S}]? or stand alone
+        assert_eq!(DeepSeek::new("values \u{200B}\u{200B}that").collect::<Vec<_>>(), vec!["values", " ", "\u{200B}", "\u{200B}that"]);
+        assert_eq!(DeepSeek::new("higher \u{AD}partic").collect::<Vec<_>>(), vec!["higher", " ", "\u{AD}partic"]);
+        assert_eq!(DeepSeek::new("\u{200B}école").collect::<Vec<_>>(), vec!["\u{200B}école"]);
+        assert_eq!(DeepSeek::new("a\u{80}\u{94}b").collect::<Vec<_>>(), vec!["a", "\u{80}", "\u{94}b"]);
+    }
+    #[test] fn deepseek_nonascii_punct_no_letter_prefix() {
+        // Non-ASCII \p{P}/\p{S} chars are excluded from the letter-prefix class;
+        // only the ASCII punct list can prefix letters
+        assert_eq!(DeepSeek::new("x «y").collect::<Vec<_>>(), vec!["x", " «", "y"]);
+        assert_eq!(DeepSeek::new("«ab").collect::<Vec<_>>(), vec!["«", "ab"]);
+    }
+    #[test] fn qwen_format_chars_are_punct() {
+        // Qwen's negated class [^\s\p{L}\p{N}] DOES include Cf chars
+        assert_eq!(Qwen::new("a \u{200B}b").collect::<Vec<_>>(), vec!["a", " \u{200B}", "b"]);
+        assert_eq!(Qwen::new("x\u{AD}y").collect::<Vec<_>>(), vec!["x", "\u{AD}y"]);
+    }
+    #[test] fn indic_marks_complete_table() {
+        // Gujarati marks (U+0A81..U+0AFF) were missing from the hand-rolled mark
+        // table; now generated complete. DeepSeek merges [\p{L}\p{M}]+ runs;
+        // GPT-2's plain \p{L} splits at every mark (marks are punct there);
+        // Voyage (Qwen3 dispatch) allows a one-char non-letter prefix.
+        assert_eq!(DeepSeek::new("આફ્રિકા ખંડ").collect::<Vec<_>>(), vec!["આફ્રિકા", " ખંડ"]);
+        assert_eq!(
+            Gpt2::new("આફ્રિકા ખંડ").collect::<Vec<_>>(),
+            vec!["આફ", "્", "ર", "િ", "ક", "ા", " ખ", "ં", "ડ"]
+        );
+        assert_eq!(Voyage::new("આફ્રિકા").collect::<Vec<_>>(), vec!["આફ", "્ર", "િક", "ા"]);
+    }
+    #[test] fn deepseek_no_contraction_split() {
+        // DeepSeek's pattern has no contraction rule; [punct][A-Za-z]+ takes ALL
+        // following ASCII letters ("'Toole", "'ts"), and only ASCII ("l", "'", "été")
+        assert_eq!(DeepSeek::new("O'Toole").collect::<Vec<_>>(), vec!["O", "'Toole"]);
+        assert_eq!(DeepSeek::new("don'ts").collect::<Vec<_>>(), vec!["don", "'ts"]);
+        assert_eq!(DeepSeek::new(".\n\n'The").collect::<Vec<_>>(), vec![".\n\n", "'The"]);
+        assert_eq!(DeepSeek::new("l'été").collect::<Vec<_>>(), vec!["l", "'", "été"]);
+    }
     #[test] fn deepseek_punct_prefix() { assert_eq!(DeepSeek::new("$hello").collect::<Vec<_>>(), vec!["$hello"]); }
 
     // Qwen
