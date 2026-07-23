@@ -3,96 +3,96 @@
     {
       "model": "BERT",
       "size": "45 KB",
-      "tokie_ms": 0.56,
-      "hf_ms": 10.9,
-      "speedup": 20,
+      "tokie_ms": 0.38,
+      "hf_ms": 9.6,
+      "speedup": 25,
       "tokens": 10002
     },
     {
       "model": "BERT",
       "size": "900 KB",
-      "tokie_ms": 9.84,
-      "hf_ms": 280.6,
-      "speedup": 29,
+      "tokie_ms": 3.6,
+      "hf_ms": 256.9,
+      "speedup": 71,
       "tokens": 200002
     },
     {
       "model": "GPT-2",
       "size": "45 KB",
-      "tokie_ms": 0.51,
-      "hf_ms": 8.5,
-      "speedup": 17,
+      "tokie_ms": 0.13,
+      "hf_ms": 8.6,
+      "speedup": 65,
       "tokens": 10001
     },
     {
       "model": "GPT-2",
       "size": "900 KB",
-      "tokie_ms": 9.42,
-      "hf_ms": 209.2,
-      "speedup": 22,
+      "tokie_ms": 1.44,
+      "hf_ms": 191.4,
+      "speedup": 133,
       "tokens": 200001
     },
     {
       "model": "Llama 3",
       "size": "45 KB",
-      "tokie_ms": 0.58,
-      "hf_ms": 8.5,
-      "speedup": 15,
+      "tokie_ms": 0.22,
+      "hf_ms": 8.6,
+      "speedup": 39,
       "tokens": 10002
     },
     {
       "model": "Llama 3",
       "size": "900 KB",
-      "tokie_ms": 9.45,
-      "hf_ms": 210.8,
-      "speedup": 22,
+      "tokie_ms": 2.49,
+      "hf_ms": 194.6,
+      "speedup": 78,
       "tokens": 200002
     },
     {
       "model": "Qwen 3",
       "size": "45 KB",
-      "tokie_ms": 0.55,
-      "hf_ms": 9.3,
-      "speedup": 17,
+      "tokie_ms": 0.13,
+      "hf_ms": 9.1,
+      "speedup": 68,
       "tokens": 10001
     },
     {
       "model": "Qwen 3",
       "size": "900 KB",
-      "tokie_ms": 9.58,
-      "hf_ms": 230.1,
-      "speedup": 24,
+      "tokie_ms": 1.36,
+      "hf_ms": 209.8,
+      "speedup": 154,
       "tokens": 200001
     },
     {
       "model": "ModernBERT",
       "size": "45 KB",
-      "tokie_ms": 0.52,
-      "hf_ms": 10.2,
-      "speedup": 20,
+      "tokie_ms": 0.15,
+      "hf_ms": 9.3,
+      "speedup": 62,
       "tokens": 10003
     },
     {
       "model": "ModernBERT",
       "size": "900 KB",
-      "tokie_ms": 9.75,
-      "hf_ms": 236.3,
-      "speedup": 24,
+      "tokie_ms": 1.42,
+      "hf_ms": 211.3,
+      "speedup": 149,
       "tokens": 200003
     },
     {
       "model": "Gemma 3",
       "size": "45 KB",
-      "tokie_ms": 5.2,
-      "hf_ms": 11.6,
+      "tokie_ms": 4.54,
+      "hf_ms": 9.7,
       "speedup": 2,
       "tokens": 10002
     },
     {
       "model": "Gemma 3",
       "size": "900 KB",
-      "tokie_ms": 131.07,
-      "hf_ms": 329.5,
+      "tokie_ms": 114.08,
+      "hf_ms": 289.2,
       "speedup": 3,
       "tokens": 200002
     }
@@ -101,62 +101,62 @@
     {
       "model": "cl100k (GPT-4)",
       "size": "45 KB",
-      "tokie_ms": 0.69,
-      "tiktoken_ms": 2.37,
-      "speedup": 3.5
+      "tokie_ms": 0.13,
+      "tiktoken_ms": 2.12,
+      "speedup": 16.8
     },
     {
       "model": "cl100k (GPT-4)",
       "size": "900 KB",
-      "tokie_ms": 9.63,
-      "tiktoken_ms": 45.67,
-      "speedup": 4.7
+      "tokie_ms": 1.28,
+      "tiktoken_ms": 42.31,
+      "speedup": 33.1
     },
     {
       "model": "o200k (GPT-4o)",
       "size": "45 KB",
-      "tokie_ms": 0.52,
-      "tiktoken_ms": 4.1,
-      "speedup": 7.9
+      "tokie_ms": 0.16,
+      "tiktoken_ms": 3.57,
+      "speedup": 22.0
     },
     {
       "model": "o200k (GPT-4o)",
       "size": "900 KB",
-      "tokie_ms": 9.83,
-      "tiktoken_ms": 81.47,
-      "speedup": 8.3
+      "tokie_ms": 1.66,
+      "tiktoken_ms": 70.72,
+      "speedup": 42.5
     }
   ],
   "loading": [
     {
       "model": "BERT",
-      "tokie_ms": 120.2,
-      "hf_ms": 98.1,
-      "speedup": 0.8
+      "tokie_ms": 2.8,
+      "hf_ms": 123.1,
+      "speedup": 44.2
     },
     {
       "model": "GPT-2",
-      "tokie_ms": 121.1,
-      "hf_ms": 129.6,
-      "speedup": 1.1
+      "tokie_ms": 6.2,
+      "hf_ms": 151.2,
+      "speedup": 24.3
     },
     {
       "model": "Llama 3.2",
-      "tokie_ms": 177.8,
-      "hf_ms": 252.5,
-      "speedup": 1.4
+      "tokie_ms": 10.6,
+      "hf_ms": 261.2,
+      "speedup": 24.7
     },
     {
       "model": "cl100k",
-      "tokie_ms": 56.0,
-      "hf_ms": 177.8,
-      "speedup": 3.2
+      "tokie_ms": 11.1,
+      "hf_ms": 244.3,
+      "speedup": 22.0
     },
     {
       "model": "o200k",
-      "tokie_ms": 122.5,
-      "hf_ms": 288.9,
-      "speedup": 2.4
+      "tokie_ms": 23.2,
+      "hf_ms": 309.9,
+      "speedup": 13.3
     }
   ]
 }

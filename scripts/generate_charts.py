@@ -79,7 +79,7 @@ def _horiz_chart(title, bars, xlabel, caption, fname, figsize=None):
 
 
 # ---------------------------------------------------------------------------
-# Data (Python benchmarks, Apple M3 Pro, 900KB synthetic enwik8-like text)
+# Data (Python benchmarks, Apple M3, tokie 0.1.0, 900KB synthetic text)
 #
 # Encode (single string, 900KB, median of 10):
 #   GPT-2:  tokie=9.42ms (95.5 MB/s), kitoken=18.5ms (48.6 MB/s), HF=209.2ms (4.3 MB/s)
@@ -100,13 +100,13 @@ def chart_overview():
     _horiz_chart(
         "Tokenization speed",
         [
-            ("tokie",          95.5,  TOKIE_COLOR, ""),
-            ("kitoken",        48.6,  GOLD_COLOR,  "2.0x slower"),
-            ("tiktoken",       16.5,  GRAY_COLOR,  "5.8x slower"),
-            ("HF tokenizers",  4.3,   GRAY_COLOR,  "22x slower"),
+            ("tokie",          625.0, TOKIE_COLOR, ""),
+            ("kitoken",        70.0,  GOLD_COLOR,  "8.9x slower"),
+            ("tiktoken",       24.9,  GRAY_COLOR,  "25x slower"),
+            ("HF tokenizers",  4.7,   GRAY_COLOR,  "133x slower"),
         ],
         "MB/s",
-        "GPT-2 encoder, enwik8 900KB, Apple M3 Pro",
+        "GPT-2 encoder, 900KB text, Apple M3, tokie 0.1.0",
         "benchmark",
     )
 
@@ -116,12 +116,12 @@ def chart_bpe():
     _horiz_chart(
         "BPE encoding speed",
         [
-            ("tokie",          95.5,  TOKIE_COLOR, ""),
-            ("kitoken",        48.6,  GOLD_COLOR,  "2.0x slower"),
-            ("HF tokenizers",  4.3,   GRAY_COLOR,  "22x slower"),
+            ("tokie",          625.0, TOKIE_COLOR, ""),
+            ("kitoken",        70.0,  GOLD_COLOR,  "8.9x slower"),
+            ("HF tokenizers",  4.7,   GRAY_COLOR,  "133x slower"),
         ],
         "MB/s",
-        "GPT-2 encoder, enwik8 900KB, Apple M3 Pro",
+        "GPT-2 encoder, 900KB text, Apple M3, tokie 0.1.0",
         "benchmark_bpe",
     )
 
@@ -131,12 +131,12 @@ def chart_wordpiece():
     _horiz_chart(
         "WordPiece encoding speed",
         [
-            ("tokie",          91.5,  TOKIE_COLOR, ""),
-            ("kitoken",        18.4,  GOLD_COLOR,  "5.0x slower"),
-            ("HF tokenizers",  3.2,   GRAY_COLOR,  "29x slower"),
+            ("tokie",          250.0, TOKIE_COLOR, ""),
+            ("kitoken",        28.1,  GOLD_COLOR,  "8.9x slower"),
+            ("HF tokenizers",  3.5,   GRAY_COLOR,  "71x slower"),
         ],
         "MB/s",
-        "BERT-base-uncased, enwik8 900KB, Apple M3 Pro",
+        "BERT-base-uncased, 900KB text, Apple M3, tokie 0.1.0",
         "benchmark_wordpiece",
     )
 
@@ -147,11 +147,11 @@ def chart_sentencepiece():
     _horiz_chart(
         "SentencePiece BPE encoding speed",
         [
-            ("tokie",          6.9,   TOKIE_COLOR, ""),
-            ("HF tokenizers",  2.7,   GRAY_COLOR,  "2.5x slower"),
+            ("tokie",          7.9,   TOKIE_COLOR, ""),
+            ("HF tokenizers",  3.1,   GRAY_COLOR,  "2.5x slower"),
         ],
         "MB/s",
-        "Gemma 3, enwik8 900KB, Apple M3 Pro",
+        "Gemma 3, 900KB text, Apple M3, tokie 0.1.0",
         "benchmark_sentencepiece",
     )
 
@@ -176,9 +176,9 @@ def chart_tiktoken():
                  color=fg, fontsize=14, fontweight="bold", pad=10)
 
     models = ["cl100k\n(GPT-4)", "o200k\n(GPT-4o)"]
-    tokie_vals = [9.63, 9.83]
-    tt_vals = [45.67, 81.47]
-    speedups = ["4.7x faster", "8.3x faster"]
+    tokie_vals = [1.28, 1.66]
+    tt_vals = [42.31, 70.72]
+    speedups = ["33x faster", "42x faster"]
 
     x = [0, 1]
     width = 0.32
@@ -210,11 +210,11 @@ def chart_loading():
     _horiz_chart(
         "Tokenizer loading time",
         [
-            ("tokie (.tkz)",   54.6,   TOKIE_COLOR, ""),
-            ("HF tokenizers",  173.2,  GRAY_COLOR,  "3.2x slower"),
+            ("tokie (.tkz)",   11.1,   TOKIE_COLOR, ""),
+            ("HF tokenizers",  244.3,  GRAY_COLOR,  "22x slower"),
         ],
         "ms",
-        "cl100k tokenizer, cold load, Apple M3 Pro",
+        "cl100k tokenizer, warm cached load, Apple M3, tokie 0.1.0",
         "benchmark_loading",
     )
 
