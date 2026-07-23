@@ -13,3 +13,4 @@ crate-type = ["cdylib"]
 [dependencies]
 tokie-core = { package = "tokie", path = "../tokie", features = ["hf"] }
 pyo3 = { version = "0.24", features = ["extension-module"] }
+numpy = "0.24"

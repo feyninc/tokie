@@ -268,6 +268,30 @@ impl PyTokenizer {
             .collect()
     }
 
+    /// Encode multiple texts in parallel into one contiguous buffer.
+    ///
+    /// Returns `(ids, lengths)` as numpy arrays: `ids` is a uint32 array of
+    /// every document's token ids concatenated in order; `lengths` is a
+    /// uint64 array of per-document id counts (`np.cumsum(lengths)` gives
+    /// document end offsets). No per-document Python objects are
+    /// materialized; the Rust buffers are handed to numpy without copying.
+    /// Padding is not applied; truncation and special tokens are.
+    #[pyo3(signature = (texts, add_special_tokens=true))]
+    fn encode_batch_flat<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<String>,
+        add_special_tokens: bool,
+    ) -> (Bound<'py, numpy::PyArray1<u32>>, Bound<'py, numpy::PyArray1<u64>>) {
+        use numpy::IntoPyArray;
+        let inner = self.read();
+        let (ids, lens) = py.allow_threads(|| {
+            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+            inner.encode_batch_flat(&text_refs, add_special_tokens)
+        });
+        (ids.into_pyarray(py), lens.into_pyarray(py))
+    }
+
     /// Count the number of tokens in the text.
     fn count_tokens(&self, py: Python<'_>, text: &str) -> usize {
         let text = text.to_string();

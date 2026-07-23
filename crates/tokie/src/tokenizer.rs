@@ -271,7 +271,18 @@ impl Tokenizer {
     /// Encoding struct, no attention/type-id buffers). The low-latency path
     /// for callers that only consume ids.
     pub fn encode_ids(&self, text: &str, add_special_tokens: bool) -> Vec<TokenId> {
-        let mut tokens = self.encode_raw(text);
+        self.encode_ids_ctx(text, add_special_tokens, None)
+    }
+
+    /// [`Self::encode_ids`] with an optional per-thread pretoken cache
+    /// (batch hot path).
+    fn encode_ids_ctx(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+        cache: Option<&mut PretokenCache>,
+    ) -> Vec<TokenId> {
+        let mut tokens = self.encode_raw_ctx(text, cache);
         if let Some(ref trunc) = self.truncation {
             let special = if add_special_tokens {
                 self.post_processor.num_special_tokens_single()
@@ -739,6 +750,70 @@ impl Tokenizer {
         encodings
     }
 
+    /// Encode multiple texts in parallel into one contiguous id buffer.
+    ///
+    /// Returns `(ids, lens)`: every document's token ids concatenated in
+    /// order, and per-document id counts. This is the zero-materialization
+    /// bulk contract — no per-document `Encoding` objects or vectors reach
+    /// the caller, so bindings can hand the buffers over as flat arrays.
+    /// Truncation and special tokens apply as in [`Self::encode_ids`];
+    /// padding does not (bulk consumers reconstruct boundaries from
+    /// `lens`).
+    pub fn encode_batch_flat(
+        &self,
+        texts: &[&str],
+        add_special_tokens: bool,
+    ) -> (Vec<TokenId>, Vec<u64>) {
+        let cpus = num_cpus();
+        if texts.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        if texts.len() <= cpus || cpus == 1 {
+            let total_bytes: usize = texts.iter().map(|t| t.len()).sum();
+            let mut ids = Vec::with_capacity(total_bytes / 3);
+            let mut lens = Vec::with_capacity(texts.len());
+            for t in texts {
+                let v = self.encode_ids(t, add_special_tokens);
+                lens.push(v.len() as u64);
+                ids.extend_from_slice(&v);
+            }
+            return (ids, lens);
+        }
+
+        let results: Vec<(Vec<TokenId>, Vec<u64>)> = thread::scope(|s| {
+            byte_balanced_chunks(texts, cpus)
+                .into_iter()
+                .map(|text_chunk| {
+                    s.spawn(move || {
+                        let chunk_bytes: usize = text_chunk.iter().map(|t| t.len()).sum();
+                        let mut cache = (chunk_bytes >= PRETOKEN_CACHE_MIN_BYTES)
+                            .then(PretokenCache::new);
+                        let mut ids = Vec::with_capacity(chunk_bytes / 3);
+                        let mut lens = Vec::with_capacity(text_chunk.len());
+                        for t in text_chunk {
+                            let v = self.encode_ids_ctx(t, add_special_tokens, cache.as_mut());
+                            lens.push(v.len() as u64);
+                            ids.extend_from_slice(&v);
+                        }
+                        (ids, lens)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        let total_ids: usize = results.iter().map(|(i, _)| i.len()).sum();
+        let mut ids = Vec::with_capacity(total_ids);
+        let mut lens = Vec::with_capacity(texts.len());
+        for (i, l) in results {
+            ids.extend_from_slice(&i);
+            lens.extend_from_slice(&l);
+        }
+        (ids, lens)
+    }
+
     /// Count tokens for multiple texts in parallel.
     pub fn count_tokens_batch(&self, texts: &[&str]) -> Vec<usize> {
         let cpus = num_cpus();
@@ -1010,6 +1085,37 @@ mod tests {
         let batch_with = tokenizer.encode_batch(&texts, true);
         let batch_without = tokenizer.encode_batch(&texts, false);
         assert_eq!(batch_with, batch_without);
+    }
+
+    #[test]
+    fn test_encode_batch_flat_matches_encode_batch() {
+        let tokenizer = make_pretok_tokenizer();
+        // Enough texts to cross the parallel threshold (texts.len() > cpus)
+        let texts: Vec<&str> = (0..64).map(|i| match i % 5 {
+            0 => "Hello world, this is a somewhat longer document to encode.",
+            1 => "abc def ghi",
+            2 => "",
+            3 => "short",
+            _ => "the quick brown fox jumps over the lazy dog 0123456789",
+        }).collect();
+        let (flat, lens) = tokenizer.encode_batch_flat(&texts, false);
+        let batch = tokenizer.encode_batch(&texts, false);
+        assert_eq!(lens.len(), texts.len());
+        assert_eq!(flat.len() as u64, lens.iter().sum::<u64>());
+        let mut off = 0usize;
+        for (i, enc) in batch.iter().enumerate() {
+            let n = lens[i] as usize;
+            assert_eq!(&flat[off..off + n], enc.ids.as_slice(), "doc {i}");
+            off += n;
+        }
+        assert_eq!(off, flat.len());
+    }
+
+    #[test]
+    fn test_encode_batch_flat_empty() {
+        let tokenizer = make_pretok_tokenizer();
+        let (flat, lens) = tokenizer.encode_batch_flat(&[], false);
+        assert!(flat.is_empty() && lens.is_empty());
     }
 
     #[test]
