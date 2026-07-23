@@ -62,6 +62,4 @@ jobs:
           test "$(stat -c%s benches/data/owt_sample.txt)" -eq 50000000
 
       - name: Run tokenizer accuracy tests
-        # known_gap_* tests document real, tracked parity gaps (see accuracy.rs)
-        # without keeping CI red; run them locally to measure the gap.
-        run: cargo test -p tokie --test accuracy --features build -- --ignored --skip known_gap_
+        run: cargo test -p tokie --test accuracy --features build -- --ignored

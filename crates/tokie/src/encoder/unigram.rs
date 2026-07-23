@@ -43,7 +43,11 @@ pub struct UnigramEncoder {
     matcher: DoubleArrayAhoCorasick,
 
     /// Token scores (log probabilities), indexed by token ID.
-    scores: Vec<f32>,
+    ///
+    /// Stored as f64 to match HF exactly: near-tie Viterbi paths (e.g. equal
+    /// token multisets summed in different orders) resolve by the last ulp of
+    /// these sums, so rounding through f32 flips segmentations vs HF.
+    scores: Vec<f64>,
 
     /// Unknown token ID.
     unk_token: TokenId,
@@ -85,11 +89,11 @@ impl UnigramEncoder {
     /// * `vocab` - List of (token_id, token_bytes, score) tuples, sorted by ID
     /// * `unk_token` - Token ID to use for unknown sequences
     pub fn from_vocab_with_scores(
-        vocab: &[(u32, Vec<u8>, f32)],
+        vocab: &[(u32, Vec<u8>, f64)],
         unk_token: TokenId,
     ) -> (Self, Vec<Vec<u8>>) {
         let token_bytes: Vec<Vec<u8>> = vocab.iter().map(|(_, bytes, _)| bytes.clone()).collect();
-        let scores: Vec<f32> = vocab.iter().map(|(_, _, score)| *score).collect();
+        let scores: Vec<f64> = vocab.iter().map(|(_, _, score)| *score).collect();
 
         // Build byte fallback table (<0xXX> tokens)
         let mut byte_tokens = [u32::MAX; 256];
@@ -147,7 +151,7 @@ impl UnigramEncoder {
     /// Create encoder from pre-built components (for deserialization).
     pub fn from_parts(
         matcher: DoubleArrayAhoCorasick,
-        scores: Vec<f32>,
+        scores: Vec<f64>,
         unk_token: TokenId,
         byte_tokens: [TokenId; 256],
         token_lengths: Vec<u16>,
@@ -193,7 +197,7 @@ impl UnigramEncoder {
     }
 
     /// Get token scores.
-    pub fn scores(&self) -> &[f32] {
+    pub fn scores(&self) -> &[f64] {
         &self.scores
     }
 
@@ -283,7 +287,7 @@ impl UnigramEncoder {
         //   to prefer short-token + <unk> over longer real tokens (e.g., "▁أ" + <unk>
         //   beats "▁أبو" because -9.7 + 0.0 > -12.6).
         let unk_penalty = if self.has_byte_fallback {
-            self.scores[self.unk_token as usize] as f64
+            self.scores[self.unk_token as usize]
         } else {
             -100.0
         };
@@ -297,8 +301,27 @@ impl UnigramEncoder {
             matches_at[m.start].push((m.end, m.pattern_id));
         }
 
+        // Metaspace piece boundaries: HF's Metaspace pre-tokenizer splits
+        // before every ▁ (MergedWithNext) and runs Viterbi per piece with a
+        // fresh score accumulator. Replicate both effects: no match may cross
+        // a boundary, and the accumulator rebases to 0.0 at each boundary.
+        // The rebase matters for exact parity: piece-local prefix sums can
+        // differ in their last ulps, but adding a large accumulated prefix
+        // score washes those differences into exact ties, which then resolve
+        // differently than HF's per-piece comparisons.
+        let mut boundaries = memchr::memmem::find_iter(text, "\u{2581}".as_bytes());
+        let mut next_boundary = boundaries.next().unwrap_or(n);
+
         // Forward pass: process positions in order
         for pos in 0..n {
+            if pos == next_boundary {
+                if best_score[pos] != f64::NEG_INFINITY {
+                    best_score[pos] = 0.0;
+                }
+                next_boundary = boundaries.next().unwrap_or(n);
+                debug_assert!(next_boundary > pos);
+            }
+
             if best_score[pos] == f64::NEG_INFINITY {
                 continue;
             }
@@ -306,9 +329,12 @@ impl UnigramEncoder {
             let current_score = best_score[pos];
             let has_match = !matches_at[pos].is_empty();
 
-            // Process all matches starting at this position
+            // Process all matches starting at this position (within the piece)
             for &(end, token_id) in &matches_at[pos] {
-                let token_score = self.scores[token_id as usize] as f64;
+                if end > next_boundary {
+                    continue;
+                }
+                let token_score = self.scores[token_id as usize];
                 let new_score = current_score + token_score;
                 if new_score > best_score[end] {
                     best_score[end] = new_score;
@@ -320,7 +346,7 @@ impl UnigramEncoder {
             let byte_val = text[pos];
             let byte_token = self.byte_tokens[byte_val as usize];
             if byte_token != u32::MAX {
-                let token_score = self.scores[byte_token as usize] as f64;
+                let token_score = self.scores[byte_token as usize];
                 let new_score = current_score + token_score;
 
                 if new_score > best_score[pos + 1] {

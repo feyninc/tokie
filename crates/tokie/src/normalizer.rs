@@ -17,7 +17,10 @@
 //! ```
 
 use std::borrow::Cow;
+use std::sync::Arc;
 use unicode_general_category::{get_general_category, GeneralCategory};
+
+use crate::charsmap::PrecompiledCharsmap;
 
 /// Lookup table for ASCII bytes that need cleaning in clean_text.
 /// true = problematic byte (control char, DEL, or high bit set)
@@ -41,7 +44,7 @@ static NEEDS_CLEANING: [bool; 256] = {
 /// Text normalizer configuration.
 ///
 /// Normalizers transform input text before pre-tokenization and encoding.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Normalizer {
     /// No normalization (GPT-2, RoBERTa, Llama, etc.)
     #[default]
@@ -112,6 +115,28 @@ pub enum Normalizer {
     ///
     /// Example: "Hello world" → "Hello▁world"
     MetaspaceReplace,
+
+    /// SentencePiece normalization driven by the model's exact
+    /// `precompiled_charsmap` blob (XLM-RoBERTa, T5, bge-m3, ...).
+    ///
+    /// This implements the model's own charsmap transform (NFKC-style
+    /// rewrites, exact per-character keep/map/drop decisions) followed by the
+    /// metaspace step matching the model's pre-tokenizer chain:
+    ///
+    /// - `whitespace_split: true` (XLM-R, T5 — WhitespaceSplit + Metaspace):
+    ///   collapse whitespace, strip leading/trailing, prepend `▁`, spaces → `▁`
+    /// - `whitespace_split: false` (bge-m3 family — Replace `" {2,}"` +
+    ///   Metaspace only): collapse space runs, no strip (a trailing space
+    ///   becomes a real `▁` token), prepend `▁`, spaces → `▁`
+    ///
+    /// Unlike [`Normalizer::SentencePiece`], which approximates the charsmap
+    /// with Unicode-category rules, this reproduces HF byte-for-byte (the real
+    /// xlm-roberta charsmap keeps U+00AD and C1 controls that category rules
+    /// would strip).
+    SentencePiecePrecompiled {
+        charsmap: Arc<PrecompiledCharsmap>,
+        whitespace_split: bool,
+    },
 }
 
 impl Normalizer {
@@ -130,6 +155,9 @@ impl Normalizer {
             Normalizer::SentencePiece => sentencepiece_normalize(text),
             Normalizer::SentencePieceLowercase => sentencepiece_lowercase_normalize(text),
             Normalizer::MetaspaceReplace => metaspace_replace_normalize(text),
+            Normalizer::SentencePiecePrecompiled { charsmap, whitespace_split } => {
+                sentencepiece_precompiled_normalize(charsmap, *whitespace_split, text)
+            }
         }
     }
 
@@ -250,6 +278,71 @@ pub fn sentencepiece_normalize(text: &str) -> Cow<'_, str> {
     }
 
     Cow::Owned(result)
+}
+
+/// SentencePiece normalization using the model's exact `precompiled_charsmap`.
+///
+/// Applies the charsmap transform (grapheme-wise, HF-identical — see
+/// [`PrecompiledCharsmap`]) followed by the metaspace step matching the
+/// model's pre-tokenizer chain:
+///
+/// - `whitespace_split: true` — WhitespaceSplit + Metaspace (XLM-R, T5):
+///   whitespace runs of any kind separate words and are dropped, edges
+///   stripped, every word prefixed with `▁`.
+/// - `whitespace_split: false` — Replace `" {2,}"` → `" "` + Metaspace
+///   (bge-m3, snowflake-arctic-v2): only space runs collapse, nothing is
+///   stripped (e.g. a trailing space survives as a lone `▁`), and `▁` is
+///   prepended unless the text already starts with a space or `▁`.
+pub fn sentencepiece_precompiled_normalize<'a>(
+    charsmap: &PrecompiledCharsmap,
+    whitespace_split: bool,
+    text: &'a str,
+) -> Cow<'a, str> {
+    if text.is_empty() {
+        return Cow::Borrowed(text);
+    }
+
+    // Step 1: exact charsmap transform
+    let mut transformed = String::with_capacity(text.len());
+    charsmap.normalize_into(text, &mut transformed);
+
+    if whitespace_split {
+        // Step 2: collapse whitespace and strip (WhitespaceSplit)
+        let collapsed = collapse_and_strip_whitespace(&transformed);
+
+        // Step 3: apply metaspace (prepend ▁ and replace spaces)
+        let mut result = String::with_capacity(collapsed.len() + 3);
+        result.push('▁');
+        for c in collapsed.chars() {
+            if c == ' ' {
+                result.push('▁');
+            } else {
+                result.push(c);
+            }
+        }
+        Cow::Owned(result)
+    } else {
+        // Step 2-3 fused: collapse space runs (Replace " {2,}" → " ") and
+        // replace with ▁; prepend ▁ unless the text starts with space/▁
+        // (HF Metaspace checks starts_with(replacement) after replacing).
+        let mut result = String::with_capacity(transformed.len() + 3);
+        if !(transformed.starts_with(' ') || transformed.starts_with('▁')) {
+            result.push('▁');
+        }
+        let mut prev_space = false;
+        for c in transformed.chars() {
+            if c == ' ' {
+                if !prev_space {
+                    result.push('▁');
+                }
+                prev_space = true;
+            } else {
+                result.push(c);
+                prev_space = false;
+            }
+        }
+        Cow::Owned(result)
+    }
 }
 
 /// SentencePiece normalization with NFKD + StripAccents + lowercase.

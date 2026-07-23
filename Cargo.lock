@@ -1869,6 +1869,7 @@ dependencies = [
 name = "tokie"
 version = "0.0.8"
 dependencies = [
+ "base64 0.22.1",
  "chunk",
  "crc32fast",
  "criterion",
@@ -1885,6 +1886,7 @@ dependencies = [
  "tiktoken-rs",
  "tokenizers",
  "unicode-general-category",
+ "unicode-segmentation",
  "ureq",
  "zip",
 ]

@@ -80,9 +80,18 @@ fn load_owt_docs(max_bytes: usize) -> Vec<String> {
 
 /// Compare tokie against HuggingFace per document, panicking with a readable
 /// report (doc index + text fragment around the first divergence).
-fn compare_model_docs(tokie_source: &str, hf_model: &str, docs: &[String]) {
-    let tok = Tokenizer::from_pretrained(tokie_source)
-        .unwrap_or_else(|e| panic!("Failed to load tokie {tokie_source}: {e}"));
+///
+/// Loads tokie from the model's tokenizer.json explicitly: `from_pretrained`
+/// would silently prefer a pre-built tokiers/*.tkz when one exists, bypassing
+/// the detection path these tests exist to exercise.
+fn compare_model_docs(hf_model: &str, docs: &[String]) {
+    let api = hf_hub::api::sync::ApiBuilder::new().build().unwrap();
+    let json_path = api
+        .repo(hf_hub::Repo::model(hf_model.to_string()))
+        .get("tokenizer.json")
+        .unwrap_or_else(|e| panic!("Failed to download tokenizer.json for {hf_model}: {e}"));
+    let tok = Tokenizer::from_json(&json_path)
+        .unwrap_or_else(|e| panic!("Failed to load tokie from json {hf_model}: {e}"));
     let mut hf = HfTokenizer::from_pretrained(hf_model, None)
         .unwrap_or_else(|e| panic!("Failed to load HF {hf_model}: {e}"));
     let _ = hf.with_truncation(None);
@@ -231,7 +240,7 @@ macro_rules! owt_accuracy_test {
         #[ignore] // Requires network + benches/data/owt_sample.txt
         fn $name() {
             let docs = load_owt_docs(25_000_000);
-            compare_model_docs($hf, $hf, &docs);
+            compare_model_docs($hf, &docs);
         }
     };
 }
@@ -241,13 +250,7 @@ owt_accuracy_test!(owt_qwen3,       "Qwen/Qwen3-0.6B");                // Qwen p
 owt_accuracy_test!(owt_smollm2,     "HuggingFaceTB/SmolLM2-135M");     // SmolLM pretok
 owt_accuracy_test!(owt_deepseek_v3, "deepseek-ai/DeepSeek-V3");        // DeepSeek pretok
 owt_accuracy_test!(owt_bert,        "google-bert/bert-base-uncased");  // WordPiece
-// KNOWN GAP (~1% of docs): the hand-rolled approximation of SentencePiece's
-// Precompiled charsmap in normalizer.rs strips Cf/Cc chars (U+00AD, C1
-// controls) that xlm-roberta's real charsmap keeps. Fixing requires applying
-// the tokenizer.json precompiled_charsmap blob (e.g. via the spm_precompiled
-// crate) — a .tkz format change. CI skips `known_gap_*` tests; run them
-// locally to measure the gap.
-owt_accuracy_test!(known_gap_owt_xlm_roberta, "FacebookAI/xlm-roberta-base"); // SP-Unigram
+owt_accuracy_test!(owt_xlm_roberta,  "FacebookAI/xlm-roberta-base");  // SP-Unigram (precompiled charsmap)
 owt_accuracy_test!(owt_mistral_7b,  "mistralai/Mistral-7B-v0.1");      // SP-BPE
 
 // ============================================================================

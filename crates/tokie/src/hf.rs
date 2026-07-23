@@ -676,10 +676,13 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
     if let Some(typ) = normalizer["type"].as_str() {
         match typ {
             "Precompiled" => {
-                // Precompiled charsmap = SentencePiece normalization (NFKC + whitespace collapse)
+                // Precompiled charsmap = SentencePiece normalization
                 // Models: T5 (with WhitespaceSplit), bge-m3 (without WhitespaceSplit)
                 if has_metaspace {
-                    return Normalizer::SentencePiece;
+                    // Prefer the model's exact charsmap blob; fall back to the
+                    // category-rule approximation if it's missing or malformed.
+                    return parse_precompiled_charsmap(normalizer, has_whitespace_split)
+                        .unwrap_or(Normalizer::SentencePiece);
                 }
             }
             "BertNormalizer" => {
@@ -724,7 +727,11 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
                     // General SentencePiece: Sequence with Precompiled + Metaspace
                     // (with or without WhitespaceSplit — bge-m3 omits it)
                     if has_precompiled && has_metaspace {
-                        return Normalizer::SentencePiece;
+                        return normalizers
+                            .iter()
+                            .find(|n| n["type"].as_str() == Some("Precompiled"))
+                            .and_then(|n| parse_precompiled_charsmap(n, has_whitespace_split))
+                            .unwrap_or(Normalizer::SentencePiece);
                     }
 
                     // Mixtral pattern: Prepend "▁" + Replace " " → "▁"
@@ -776,6 +783,26 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
     }
 
     Normalizer::None
+}
+
+/// Parse the base64 `precompiled_charsmap` blob from a Precompiled normalizer
+/// JSON node. Returns `None` if absent or malformed (caller falls back to the
+/// approximate SentencePiece normalizer).
+///
+/// `whitespace_split` selects the metaspace shape: WhitespaceSplit + Metaspace
+/// (XLM-R, T5) vs Replace `" {2,}"` + Metaspace only (bge-m3 family).
+fn parse_precompiled_charsmap(
+    normalizer: &serde_json::Value,
+    whitespace_split: bool,
+) -> Option<Normalizer> {
+    use base64::Engine as _;
+    let b64 = normalizer["precompiled_charsmap"].as_str()?;
+    let blob = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let charsmap = crate::charsmap::PrecompiledCharsmap::from_blob(&blob).ok()?;
+    Some(Normalizer::SentencePiecePrecompiled {
+        charsmap: std::sync::Arc::new(charsmap),
+        whitespace_split,
+    })
 }
 
 /// Check if the tokenizer uses a WhitespaceSplit pre_tokenizer.
@@ -1034,7 +1061,7 @@ fn load_unigram(
     let unk_id = model["unk_id"].as_u64().unwrap_or(0) as u32;
 
     // Parse vocab with scores
-    let vocab: Vec<(u32, Vec<u8>, f32)> = vocab_arr
+    let vocab: Vec<(u32, Vec<u8>, f64)> = vocab_arr
         .iter()
         .enumerate()
         .filter_map(|(id, entry)| {
@@ -1043,7 +1070,7 @@ fn load_unigram(
                 return None;
             }
             let token_str = arr[0].as_str()?;
-            let score = arr[1].as_f64()? as f32;
+            let score = arr[1].as_f64()?;
             let bytes = decode_sentencepiece_token(token_str);
             Some((id as u32, bytes, score))
         })

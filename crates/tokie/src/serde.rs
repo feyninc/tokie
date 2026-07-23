@@ -8,7 +8,7 @@
 //! ```text
 //! Header (88 bytes):
 //!   - magic: "TOKI" (4 bytes)
-//!   - version: u32 (4 bytes) - currently v11
+//!   - version: u32 (4 bytes) - currently v12
 //!   - encoder_type: u32 (4 bytes) - 0=Backtracking, 1=Simple, 2=WordPiece
 //!   - pretokenizer_type: u32 (4 bytes) - 0=None, 1=GPT2, 2=CL100K, 3=O200K, 4=BERT, 5=Voyage
 //!   - normalizer_type: u32 (4 bytes) - 0=None, 1=BertUncased, 2=BertCased, 3=Nfc
@@ -22,6 +22,7 @@
 //!   - daac_data_offset: u32, daac_data_checksum: u32
 //!   - prefix_data_offset: u32, prefix_data_checksum: u32
 //!   - pp_data_offset: u32, pp_data_checksum: u32
+//!   - charsmap_data_offset: u32, charsmap_data_checksum: u32 (v12+; padding before)
 //!
 //! Sections:
 //!   - TOKEN_DATA: Decoder's flat buffer (offsets + data)
@@ -29,11 +30,14 @@
 //!   - DAAC_DATA: Pre-built DoubleArrayAhoCorasick state (empty for Simple encoder)
 //!   - PREFIX_DATA: next_prefix_match table (empty for Simple encoder)
 //!   - PP_DATA: Post-processor parameters (empty for None)
+//!   - CHARSMAP_DATA: Raw SentencePiece precompiled_charsmap blob (v12+, empty
+//!     unless normalizer is SentencePiecePrecompiled)
 //! ```
 
 use core::mem::size_of;
 use std::io::{Read, Write};
 
+use crate::charsmap::PrecompiledCharsmap;
 use crate::encoder::{BacktrackingBytePairEncoder, BytePairEncoder, Encoder, EncoderType, SentencePieceBPE, UnigramEncoder, WordPieceEncoder};
 use crate::decoder::{Decoder, DecoderType, VocabDecoder};
 use crate::normalizer::Normalizer;
@@ -45,7 +49,7 @@ use daggrs::DoubleArrayAhoCorasick;
 use foldhash::HashMap as FoldHashMap;
 
 const MAGIC: &[u8; 4] = b"TOKI";
-const VERSION: u32 = 11; // v11 adds pad_token_id in reserved field (0xFFFFFFFF = None)
+const VERSION: u32 = 12; // v12 adds CHARSMAP_DATA section for SentencePiece precompiled charsmaps
 const HEADER_SIZE: usize = 88;
 
 impl PretokType {
@@ -66,6 +70,8 @@ impl PretokType {
 }
 
 impl Normalizer {
+    /// Type id 8 (SentencePiecePrecompiled) is not constructible here — it
+    /// needs the CHARSMAP_DATA section, handled in `Tokenizer::load`.
     fn from_u32(v: u32) -> Option<Self> {
         match v {
             0 => Some(Self::None),
@@ -90,9 +96,16 @@ impl Normalizer {
             Self::SentencePiece => 5,
             Self::SentencePieceLowercase => 6,
             Self::MetaspaceReplace => 7,
+            Self::SentencePiecePrecompiled { whitespace_split: true, .. } => 8,
+            Self::SentencePiecePrecompiled { whitespace_split: false, .. } => 9,
         }
     }
 }
+
+/// Precompiled-charsmap normalizer ids (need the CHARSMAP_DATA section):
+/// 8 = with WhitespaceSplit (XLM-R/T5), 9 = Metaspace-only (bge-m3 family).
+const NORMALIZER_SP_PRECOMPILED_WS: u32 = 8;
+const NORMALIZER_SP_PRECOMPILED_META: u32 = 9;
 
 impl PostProcessor {
     fn type_id(&self) -> u32 {
@@ -304,12 +317,19 @@ impl Tokenizer {
         // Serialize post-processor
         let pp_data = post_processor.serialize();
 
+        // Serialize charsmap (raw precompiled_charsmap blob, v12+)
+        let charsmap_data: &[u8] = match normalizer {
+            Normalizer::SentencePiecePrecompiled { charsmap, .. } => charsmap.blob(),
+            _ => &[],
+        };
+
         // Compute checksums
         let token_checksum = crc32(&token_data);
         let merge_checksum = crc32(&merge_data);
         let daac_checksum = crc32(&daac_data);
         let prefix_checksum = crc32(&prefix_data);
         let pp_checksum = crc32(&pp_data);
+        let charsmap_checksum = crc32(charsmap_data);
 
         // Compute offsets (after header)
         let token_offset = HEADER_SIZE as u32;
@@ -317,6 +337,7 @@ impl Tokenizer {
         let daac_offset = merge_offset + merge_data.len() as u32;
         let prefix_offset = daac_offset + daac_data.len() as u32;
         let pp_offset = prefix_offset + prefix_data.len() as u32;
+        let charsmap_offset = pp_offset + pp_data.len() as u32;
 
         // Write header (88 bytes total)
         // 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + (5 × 8) = 40 + 40 = 80... need 8 more
@@ -350,10 +371,9 @@ impl Tokenizer {
         writer.write_all(&prefix_checksum.to_le_bytes())?;
         writer.write_all(&pp_offset.to_le_bytes())?;
         writer.write_all(&pp_checksum.to_le_bytes())?;
-
-        // Header total: 40 + 40 = 80 bytes... but we said 88
-        // Let me add padding
-        writer.write_all(&0u64.to_le_bytes())?; // 8 bytes padding to reach 88
+        // v12: 6th section in the former padding bytes (80..88)
+        writer.write_all(&charsmap_offset.to_le_bytes())?;
+        writer.write_all(&charsmap_checksum.to_le_bytes())?;
 
         // Write sections
         writer.write_all(&token_data)?;
@@ -361,6 +381,7 @@ impl Tokenizer {
         writer.write_all(&daac_data)?;
         writer.write_all(&prefix_data)?;
         writer.write_all(&pp_data)?;
+        writer.write_all(charsmap_data)?;
 
         Ok(())
     }
@@ -390,7 +411,7 @@ impl Tokenizer {
         }
 
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != VERSION && version != 10 {
+        if !(10..=VERSION).contains(&version) {
             return Err(SerdeError::UnsupportedVersion(version));
         }
 
@@ -403,8 +424,17 @@ impl Tokenizer {
             .ok_or(SerdeError::InvalidPretokenizer(pretokenizer_type))?;
 
         let normalizer_type = u32::from_le_bytes(data[16..20].try_into().unwrap());
-        let normalizer = Normalizer::from_u32(normalizer_type)
-            .ok_or(SerdeError::InvalidNormalizer(normalizer_type))?;
+        // SentencePiecePrecompiled needs the CHARSMAP_DATA section; built below.
+        let normalizer = if normalizer_type == NORMALIZER_SP_PRECOMPILED_WS
+            || normalizer_type == NORMALIZER_SP_PRECOMPILED_META
+        {
+            None
+        } else {
+            Some(
+                Normalizer::from_u32(normalizer_type)
+                    .ok_or(SerdeError::InvalidNormalizer(normalizer_type))?,
+            )
+        };
 
         let pp_type = u32::from_le_bytes(data[20..24].try_into().unwrap());
 
@@ -430,7 +460,15 @@ impl Tokenizer {
         let prefix_checksum = u32::from_le_bytes(data[68..72].try_into().unwrap());
         let pp_offset = u32::from_le_bytes(data[72..76].try_into().unwrap()) as usize;
         let pp_checksum = u32::from_le_bytes(data[76..80].try_into().unwrap());
-        // data[80..88] is padding
+        // v12+: 6th section in bytes 80..88 (padding in v10/v11)
+        let (charsmap_offset, charsmap_checksum) = if version >= 12 {
+            (
+                u32::from_le_bytes(data[80..84].try_into().unwrap()) as usize,
+                u32::from_le_bytes(data[84..88].try_into().unwrap()),
+            )
+        } else {
+            (data.len(), 0)
+        };
 
         // Extract and verify sections
         let token_data = &data[token_offset..merge_offset];
@@ -453,10 +491,31 @@ impl Tokenizer {
             return Err(SerdeError::ChecksumMismatch { section: "prefix_data" });
         }
 
-        let pp_data = &data[pp_offset..];
+        if charsmap_offset < pp_offset || charsmap_offset > data.len() {
+            return Err(SerdeError::InvalidData("charsmap section out of bounds"));
+        }
+        let pp_data = &data[pp_offset..charsmap_offset];
         if crc32(pp_data) != pp_checksum {
             return Err(SerdeError::ChecksumMismatch { section: "pp_data" });
         }
+
+        let charsmap_data = &data[charsmap_offset..];
+        if version >= 12 && crc32(charsmap_data) != charsmap_checksum {
+            return Err(SerdeError::ChecksumMismatch { section: "charsmap_data" });
+        }
+
+        // Build the normalizer, parsing the charsmap blob if required
+        let normalizer = match normalizer {
+            Some(n) => n,
+            None => {
+                let charsmap = PrecompiledCharsmap::from_blob(charsmap_data)
+                    .map_err(|_| SerdeError::InvalidData("invalid precompiled charsmap"))?;
+                Normalizer::SentencePiecePrecompiled {
+                    charsmap: std::sync::Arc::new(charsmap),
+                    whitespace_split: normalizer_type == NORMALIZER_SP_PRECOMPILED_WS,
+                }
+            }
+        };
 
         // Deserialize post-processor
         let post_processor = PostProcessor::deserialize(pp_type, pp_data)
@@ -583,7 +642,7 @@ impl Tokenizer {
                     })
                     .collect();
 
-                let (scores, unk_token, byte_tokens, token_lengths) = deserialize_unigram_config(merge_data)?;
+                let (scores, unk_token, byte_tokens, token_lengths) = deserialize_unigram_config(merge_data, version)?;
                 let (daac, _) = DoubleArrayAhoCorasick::deserialize(daac_data)
                     .ok_or(SerdeError::InvalidData("failed to deserialize DAAC"))?;
 
@@ -1021,7 +1080,7 @@ fn deserialize_wordpiece_config(data: &[u8]) -> Result<(TokenId, Vec<u8>, usize)
 /// - vocab_size (u32)
 /// - unk_token (u32)
 /// - byte_tokens (256 × u32 = 1024 bytes)
-/// - scores (vocab_size × f32)
+/// - scores (vocab_size × f64; f32 before v12)
 /// - token_lengths (vocab_size × u16)
 fn serialize_unigram_config(enc: &UnigramEncoder) -> Vec<u8> {
     let scores = enc.scores();
@@ -1030,7 +1089,7 @@ fn serialize_unigram_config(enc: &UnigramEncoder) -> Vec<u8> {
     let vocab_size = enc.vocab_size();
 
     // Calculate buffer size
-    let buf_size = 4 + 4 + (256 * 4) + (vocab_size * 4) + (vocab_size * 2);
+    let buf_size = 4 + 4 + (256 * 4) + (vocab_size * 8) + (vocab_size * 2);
     let mut buf = Vec::with_capacity(buf_size);
 
     // vocab_size
@@ -1041,7 +1100,7 @@ fn serialize_unigram_config(enc: &UnigramEncoder) -> Vec<u8> {
     for &bt in byte_tokens.iter() {
         buf.extend_from_slice(&bt.to_le_bytes());
     }
-    // scores (f32 array)
+    // scores (f64 array, v12+; v11 and earlier stored f32)
     for &score in scores {
         buf.extend_from_slice(&score.to_le_bytes());
     }
@@ -1054,7 +1113,14 @@ fn serialize_unigram_config(enc: &UnigramEncoder) -> Vec<u8> {
 }
 
 /// Deserialize Unigram encoder config.
-fn deserialize_unigram_config(data: &[u8]) -> Result<(Vec<f32>, TokenId, [TokenId; 256], Vec<u16>), SerdeError> {
+///
+/// v12+ stores scores as f64; v10/v11 stored f32 (widened on load — old files
+/// keep working, but only freshly generated v12 files match HF bit-for-bit on
+/// near-tie Viterbi paths).
+fn deserialize_unigram_config(
+    data: &[u8],
+    version: u32,
+) -> Result<(Vec<f64>, TokenId, [TokenId; 256], Vec<u16>), SerdeError> {
     if data.len() < 8 + 1024 {
         return Err(SerdeError::InvalidData("unigram config too small"));
     }
@@ -1069,21 +1135,26 @@ fn deserialize_unigram_config(data: &[u8]) -> Result<(Vec<f32>, TokenId, [TokenI
         byte_tokens[i] = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
     }
 
-    // Read scores (vocab_size f32s starting at offset 8 + 1024)
+    // Read scores starting at offset 8 + 1024
     let scores_offset = 8 + 1024;
-    let expected_len = scores_offset + vocab_size * 4 + vocab_size * 2;
+    let score_width = if version >= 12 { 8 } else { 4 };
+    let expected_len = scores_offset + vocab_size * score_width + vocab_size * 2;
     if data.len() < expected_len {
         return Err(SerdeError::InvalidData("unigram config truncated"));
     }
 
     let mut scores = Vec::with_capacity(vocab_size);
     for i in 0..vocab_size {
-        let start = scores_offset + i * 4;
-        scores.push(f32::from_le_bytes(data[start..start + 4].try_into().unwrap()));
+        let start = scores_offset + i * score_width;
+        if score_width == 8 {
+            scores.push(f64::from_le_bytes(data[start..start + 8].try_into().unwrap()));
+        } else {
+            scores.push(f32::from_le_bytes(data[start..start + 4].try_into().unwrap()) as f64);
+        }
     }
 
     // Read token_lengths (vocab_size u16s starting after scores)
-    let lengths_offset = scores_offset + vocab_size * 4;
+    let lengths_offset = scores_offset + vocab_size * score_width;
     let mut token_lengths = Vec::with_capacity(vocab_size);
     for i in 0..vocab_size {
         let start = lengths_offset + i * 2;

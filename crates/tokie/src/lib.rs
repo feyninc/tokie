@@ -51,6 +51,7 @@
 //! // All results are exactly 128 tokens
 //! ```
 
+pub mod charsmap;
 mod decoder;
 pub mod diff;
 pub mod encoder;
@@ -67,6 +68,7 @@ mod serde;
 mod tokenizer;
 mod types;
 
+pub use charsmap::{CharsmapError, PrecompiledCharsmap};
 pub use encoder::{BacktrackingBytePairEncoder, BytePairEncoder, EncodeIter, Encoder, EncoderIter, EncoderType};
 pub use decoder::{Decoder, DecoderType, VocabDecoder};
 pub use hf::JsonLoadError;
