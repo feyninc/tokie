@@ -17,15 +17,16 @@ mod impls;
 pub mod util;
 
 pub use core::iter::Core;
+pub use core::mask::Mask;
 pub use configs::{Gpt2Config, Cl100kConfig, O200kConfig, VoyageConfig, SmolLMConfig, DeepSeekConfig, QwenConfig};
 
-pub type Gpt2<'a> = Core<'a, Gpt2Config>;
-pub type Cl100k<'a> = Core<'a, Cl100kConfig>;
-pub type O200k<'a> = Core<'a, O200kConfig>;
-pub type Voyage<'a> = Core<'a, VoyageConfig>;
-pub type SmolLM<'a> = Core<'a, SmolLMConfig>;
-pub type DeepSeek<'a> = Core<'a, DeepSeekConfig>;
-pub type Qwen<'a> = Core<'a, QwenConfig>;
+pub type Gpt2<'a> = Mask<'a, Gpt2Config>;
+pub type Cl100k<'a> = Mask<'a, Cl100kConfig>;
+pub type O200k<'a> = Mask<'a, O200kConfig>;
+pub type Voyage<'a> = Mask<'a, VoyageConfig>;
+pub type SmolLM<'a> = Mask<'a, SmolLMConfig>;
+pub type DeepSeek<'a> = Mask<'a, DeepSeekConfig>;
+pub type Qwen<'a> = Mask<'a, QwenConfig>;
 
 pub use impls::bert::Bert;
 #[cfg(feature = "regex")]

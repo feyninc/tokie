@@ -23,6 +23,13 @@ impl<'a, C: PretokConfig> Core<'a, C> {
         Self { bytes, pos: 0, len: bytes.len(), _cfg: PhantomData }
     }
 
+    /// Resume iteration at byte offset `pos`, which must be a piece boundary.
+    /// Used by the mask scanner to re-derive pieces inside bad zones.
+    pub fn with_pos(text: &'a str, pos: usize) -> Self {
+        let bytes = text.as_bytes();
+        Self { bytes, pos, len: bytes.len(), _cfg: PhantomData }
+    }
+
     #[inline(always)]
     fn at(&self, pos: usize) -> u8 {
         unsafe { *self.bytes.get_unchecked(pos) }
