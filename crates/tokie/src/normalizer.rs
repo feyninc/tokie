@@ -157,41 +157,33 @@ fn normalize_nfc<'a>(text: &'a str) -> Cow<'a, str> {
 /// Metaspace normalization for SentencePiece tokenizers.
 ///
 /// Transforms text for SentencePiece-style tokenization:
-/// - Prepends `▁` (U+2581) at the start IF text doesn't start with whitespace
+/// - Prepends `▁` (U+2581) at the start
 /// - Replaces all spaces with `▁`
 ///
-/// This matches HuggingFace's Metaspace with `prepend_scheme: "first"`:
+/// This matches HuggingFace's `Prepend("▁")` + `Replace(" " → "▁")`
+/// normalizer sequence (Llama, Mistral, TinyLlama), which prepends
+/// unconditionally — even when the text starts with a space:
 /// - "Hello world" → "▁Hello▁world"
-/// - "  spaces" → "▁▁spaces" (no extra prepend, spaces become ▁)
+/// - " spaces" → "▁▁spaces"
+///
+/// Added-token splitting normalizes each text segment independently, so
+/// a segment like " world" in "Hello </s> world" must keep both the
+/// prepended `▁` and the space-derived `▁`, exactly as HF emits them.
 ///
 /// # Performance
 ///
 /// Uses SIMD-accelerated `fnr` for fast space replacement.
 #[inline]
 pub fn metaspace_normalize(text: &str) -> Cow<'_, str> {
-    // Check if text starts with whitespace
-    let starts_with_space = text.starts_with(' ') || text.starts_with('\t');
-
-    // Use fnr for efficient space -> ▁ replacement
-    let replaced = fnr(text, " ", "▁");
-
-    if starts_with_space {
-        // Don't prepend when text starts with space (space→▁ handles it)
-        match replaced {
-            Cow::Borrowed(_) => {
-                // No spaces were replaced, but we checked starts_with_space
-                // This shouldn't happen if starts_with_space is true
-                replaced
-            }
-            Cow::Owned(s) => Cow::Owned(s),
-        }
-    } else {
-        // Prepend ▁ to the result
-        let mut result = String::with_capacity(replaced.len() + 3);
-        result.push('▁');
-        result.push_str(&replaced);
-        Cow::Owned(result)
+    // HF's Prepend normalizer is a no-op on empty input.
+    if text.is_empty() {
+        return Cow::Borrowed(text);
     }
+    let replaced = fnr(text, " ", "▁");
+    let mut result = String::with_capacity(replaced.len() + 3);
+    result.push('▁');
+    result.push_str(&replaced);
+    Cow::Owned(result)
 }
 
 /// Metaspace replace normalization (no prepend).

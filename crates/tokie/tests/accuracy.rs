@@ -288,3 +288,38 @@ macro_rules! tiktoken_accuracy_test {
 
 tiktoken_accuracy_test!(tiktoken_cl100k, "tokiers/cl100k", "gpt-4");
 tiktoken_accuracy_test!(tiktoken_o200k,  "tokiers/o200k",  "gpt-4o");
+
+/// SentencePiece added-token splitting: HF normalizes each segment around
+/// a special token independently, so the Prepend("▁") + Replace(" "→"▁")
+/// sequence emits ▁ tokens on both sides of the special ("Hello </s>
+/// world" -> ▁Hello ▁ </s> ▁ ▁world). tokie used to skip the prepend on
+/// space-leading segments and drop those ▁ tokens.
+#[test]
+#[ignore] // Requires network
+fn sp_added_token_segment_prepend() {
+    let hf_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0";
+    let tok = Tokenizer::from_pretrained(hf_model)
+        .unwrap_or_else(|e| panic!("Failed to load tokie {hf_model}: {e}"));
+    let mut hf = HfTokenizer::from_pretrained(hf_model, None)
+        .unwrap_or_else(|e| panic!("Failed to load HF {hf_model}: {e}"));
+    let _ = hf.with_truncation(None);
+    let cases = [
+        "Hello </s> world",
+        "Hello </s>world",
+        "Hello</s> world",
+        "</s>",
+        " </s>",
+        "multi </s> tokens </s> here",
+        " spaces lead",
+        "Hello  </s>  world",
+    ];
+    for text in cases {
+        let tokie_ids = tok.encode(text, false).ids;
+        let hf_ids = hf.encode(text, false).unwrap();
+        assert_eq!(
+            tokie_ids.as_slice(),
+            hf_ids.get_ids(),
+            "mismatch on {text:?}"
+        );
+    }
+}
