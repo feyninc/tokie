@@ -1,6 +1,6 @@
 [package]
 name = "pretokie"
-version = "0.0.4"
+version = "0.1.0"
 edition = "2021"
 description = "Fast, zero-allocation pretokenizers for BPE tokenizers"
 license = "MIT OR Apache-2.0"
