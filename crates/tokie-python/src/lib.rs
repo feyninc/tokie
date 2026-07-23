@@ -51,11 +51,19 @@ impl PyEncoding {
 
     #[getter]
     fn attention_mask(&self) -> Vec<u32> {
+        // Empty inner + non-empty ids means the fast ids-only path was taken:
+        // no padding was configured, so the mask is all ones by construction
+        if self.attention_mask_inner.len() != self.ids.len() {
+            return vec![1u32; self.ids.len()];
+        }
         self.attention_mask_inner.iter().map(|&x| x as u32).collect()
     }
 
     #[getter]
     fn type_ids(&self) -> Vec<u32> {
+        if self.type_ids_inner.len() != self.ids.len() {
+            return vec![0u32; self.ids.len()];
+        }
         self.type_ids_inner.iter().map(|&x| x as u32).collect()
     }
 
@@ -168,6 +176,17 @@ impl PyTokenizer {
     fn encode(&self, py: Python<'_>, text: &str, add_special_tokens: bool) -> PyEncoding {
         let text = text.to_string();
         let inner = self.read();
+        if inner.padding().is_none() {
+            // Fast path: bare ids; masks are synthesized lazily on access
+            let ids = py.allow_threads(|| inner.encode_ids(&text, add_special_tokens));
+            return PyEncoding {
+                ids,
+                attention_mask_inner: Vec::new(),
+                type_ids_inner: Vec::new(),
+                offsets_inner: Vec::new(),
+                tok: self.inner.clone(),
+            };
+        }
         let enc = py.allow_threads(|| inner.encode(&text, add_special_tokens));
         PyEncoding::from_encoding(enc, self.inner.clone())
     }

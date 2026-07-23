@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 
 use crate::core::config::*;
-use crate::util::{decode_utf8, is_ascii_letter, is_digit, is_lower, is_punct_or_symbol, is_upper, is_unicode_letter, is_unicode_mark};
+use crate::util::{ascii_letter_run, decode_utf8, is_ascii_letter, is_digit, is_lower, is_punct_or_symbol, is_upper, is_unicode_letter, is_unicode_mark};
 
 pub struct Core<'a, C: PretokConfig> {
     bytes: &'a [u8],
@@ -39,11 +39,14 @@ impl<'a, C: PretokConfig> Core<'a, C> {
     /// Not used for CamelCase — that calls `scan_letters_case_aware` instead.
     #[inline(always)]
     fn scan_letters(&mut self) {
-        while self.pos < self.len {
+        loop {
+            // SWAR fast path: consume whole ASCII-letter runs 8 bytes at a time
+            self.pos += ascii_letter_run(&self.bytes[self.pos..self.len]);
+            if self.pos >= self.len {
+                return;
+            }
             let b = self.at(self.pos);
-            if is_ascii_letter(b) {
-                self.pos += 1;
-            } else if b >= 0x80 {
+            if b >= 0x80 {
                 let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
                 if C::LETTER_MODE == LetterMode::PlainWithMarks {
                     if ch.is_alphabetic() || is_unicode_mark(ch) {
@@ -125,9 +128,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
     /// Scan ASCII-only letters (DeepSeek: punct prefix → ASCII letters only).
     #[inline(always)]
     fn scan_ascii_letters(&mut self) {
-        while self.pos < self.len && is_ascii_letter(self.at(self.pos)) {
-            self.pos += 1;
-        }
+        self.pos += ascii_letter_run(&self.bytes[self.pos..self.len]);
     }
 
     // ---- Digit scanning ----

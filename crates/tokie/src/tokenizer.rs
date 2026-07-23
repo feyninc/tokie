@@ -18,6 +18,29 @@ use crate::encoder::{Encoder, EncoderIter, EncoderType, PretokenCache};
 /// Minimum bytes a thread's work chunk must contain before it pays for a
 /// per-thread `PretokenCache` (4 MiB table; zeroing it costs ~100µs).
 const PRETOKEN_CACHE_MIN_BYTES: usize = 256 * 1024;
+
+/// Split `texts` into up to `parts` contiguous runs of roughly equal total
+/// bytes. Count-based chunking lets one oversized document serialize a whole
+/// thread; byte-balancing keeps workers evenly loaded.
+fn byte_balanced_chunks<'a, 'b>(texts: &'b [&'a str], parts: usize) -> Vec<&'b [&'a str]> {
+    let total: usize = texts.iter().map(|t| t.len()).sum();
+    let target = total / parts + 1;
+    let mut chunks = Vec::with_capacity(parts);
+    let mut start = 0;
+    let mut acc = 0usize;
+    for (i, t) in texts.iter().enumerate() {
+        acc += t.len();
+        if acc >= target && chunks.len() + 1 < parts {
+            chunks.push(&texts[start..=i]);
+            start = i + 1;
+            acc = 0;
+        }
+    }
+    if start < texts.len() {
+        chunks.push(&texts[start..]);
+    }
+    chunks
+}
 use crate::decoder::{Decoder, DecoderType};
 use crate::hf::{self, JsonLoadError};
 use crate::normalizer::Normalizer;
@@ -242,6 +265,27 @@ impl Tokenizer {
     /// ```
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Encoding {
         self.encode_inner(text, add_special_tokens, None)
+    }
+
+    /// Encode to bare token ids (truncation + special tokens applied, no
+    /// Encoding struct, no attention/type-id buffers). The low-latency path
+    /// for callers that only consume ids.
+    pub fn encode_ids(&self, text: &str, add_special_tokens: bool) -> Vec<TokenId> {
+        let mut tokens = self.encode_raw(text);
+        if let Some(ref trunc) = self.truncation {
+            let special = if add_special_tokens {
+                self.post_processor.num_special_tokens_single()
+            } else {
+                0
+            };
+            let max_content = trunc.max_length.saturating_sub(special);
+            truncate_ids(&mut tokens, max_content, trunc.direction);
+        }
+        if add_special_tokens {
+            self.post_processor.process(&tokens)
+        } else {
+            tokens
+        }
     }
 
     /// Encode with an optional per-thread pretoken cache (batch hot path).
@@ -666,9 +710,9 @@ impl Tokenizer {
         let cpus = num_cpus();
 
         let mut encodings: Vec<Encoding> = if texts.len() > cpus && cpus > 1 {
-            let chunk_size = (texts.len() + cpus - 1) / cpus;
             thread::scope(|s| {
-                texts.chunks(chunk_size)
+                byte_balanced_chunks(texts, cpus)
+                    .into_iter()
                     .map(|text_chunk| {
                         s.spawn(|| {
                             let chunk_bytes: usize = text_chunk.iter().map(|t| t.len()).sum();
@@ -702,9 +746,9 @@ impl Tokenizer {
             return texts.iter().map(|t| self.count_tokens(t)).collect();
         }
 
-        let chunk_size = (texts.len() + cpus - 1) / cpus;
         thread::scope(|s| {
-            texts.chunks(chunk_size)
+            byte_balanced_chunks(texts, cpus)
+                .into_iter()
                 .map(|text_chunk| {
                     s.spawn(|| {
                         let chunk_bytes: usize = text_chunk.iter().map(|t| t.len()).sum();

@@ -5,6 +5,46 @@ pub fn is_ascii_letter(b: u8) -> bool {
     (b | 0x20).wrapping_sub(b'a') < 26
 }
 
+/// SWAR: given 8 bytes, return a mask with 0x80 set in each lane whose byte
+/// is an ASCII letter [A-Za-z]. Case is folded with `| 0x20`, then a standard
+/// unsigned in-range check ('a'..='z') is evaluated lane-wise.
+#[inline(always)]
+pub fn ascii_letter_lanes(w: u64) -> u64 {
+    const L: u64 = 0x0101_0101_0101_0101;
+    const H: u64 = 0x8080_8080_8080_8080;
+    let folded = w | (0x20 * L);
+    // Carry-safe per-lane range check: mask each lane to 7 bits, then add a
+    // constant that overflows into the lane's own top bit exactly when the
+    // value is >= the bound. Each lane sum stays below 0x100, so no carry can
+    // cross lanes (subtraction-based forms are NOT per-lane exact).
+    let low7 = folded & !H;
+    let ge_a = low7.wrapping_add(L * (0x80 - b'a' as u64)) & H;
+    let gt_z = low7.wrapping_add(L * (0x80 - (b'z' as u64 + 1))) & H;
+    // Exclude non-ASCII lanes (top bit already set in `folded`)
+    ge_a & !gt_z & !(folded & H)
+}
+
+/// Length of the run of ASCII letters at the start of `bytes`, stopping at
+/// the first non-letter (which may be a UTF-8 lead byte — caller handles it).
+#[inline(always)]
+pub fn ascii_letter_run(bytes: &[u8]) -> usize {
+    let mut i = 0;
+    while i + 8 <= bytes.len() {
+        let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+        let lanes = ascii_letter_lanes(w);
+        if lanes == 0x8080_8080_8080_8080 {
+            i += 8;
+            continue;
+        }
+        // First non-letter lane = first zero 0x80 bit (little-endian order)
+        return i + ((!lanes & 0x8080_8080_8080_8080).trailing_zeros() as usize) / 8;
+    }
+    while i < bytes.len() && is_ascii_letter(bytes[i]) {
+        i += 1;
+    }
+    i
+}
+
 #[inline(always)]
 pub fn is_lower(b: u8) -> bool {
     b.wrapping_sub(b'a') < 26
@@ -159,3 +199,51 @@ const MARK_RANGES: [(u32, u32); 310] = [
     (0x1E023, 0x1E024), (0x1E026, 0x1E02A), (0x1E08F, 0x1E08F), (0x1E130, 0x1E136), (0x1E2AE, 0x1E2AE), (0x1E2EC, 0x1E2EF),
     (0x1E4EC, 0x1E4EF), (0x1E8D0, 0x1E8D6), (0x1E944, 0x1E94A), (0xE0100, 0xE01EF),
 ];
+
+#[cfg(test)]
+mod swar_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_letter_lanes_matches_scalar_exhaustive() {
+        // Every byte value in every lane position
+        for b in 0..=255u8 {
+            for lane in 0..8 {
+                let w = (b as u64) << (lane * 8);
+                let lanes = ascii_letter_lanes(w);
+                let got = (lanes >> (lane * 8)) & 0x80 != 0;
+                assert_eq!(got, is_ascii_letter(b), "byte {b:#04x} lane {lane}");
+                // and 'A' in every *other* lane to test cross-lane borrows
+                let w2 = w | (0x4141_4141_4141_4141 & !(0xFFu64 << (lane * 8)));
+                let lanes2 = ascii_letter_lanes(w2);
+                let got2 = (lanes2 >> (lane * 8)) & 0x80 != 0;
+                assert_eq!(got2, is_ascii_letter(b), "byte {b:#04x} lane {lane} with letters around");
+            }
+        }
+        // Randomized cross-check of full words
+        let mut state = 0x12345678u64;
+        for _ in 0..200_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let w = state;
+            let lanes = ascii_letter_lanes(w);
+            for lane in 0..8 {
+                let b = (w >> (lane * 8)) as u8;
+                let got = (lanes >> (lane * 8)) & 0x80 != 0;
+                assert_eq!(got, is_ascii_letter(b), "word {w:#018x} lane {lane}");
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_letter_run_matches_scalar() {
+        let cases: Vec<&[u8]> = vec![
+            b"", b"a", b"hello", b"hello world", b"HelloWorldThisIsLong",
+            b"abc1def", b"1abc", b"abcdefgh", b"abcdefghi", b"abcdefg\xc3\xa9",
+            b"\xc3\xa9abc", b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab5",
+        ];
+        for c in cases {
+            let expect = c.iter().take_while(|&&b| is_ascii_letter(b)).count();
+            assert_eq!(ascii_letter_run(c), expect, "{c:?}");
+        }
+    }
+}
