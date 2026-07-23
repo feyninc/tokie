@@ -54,6 +54,7 @@ def verify_repo(repo_id, tkz_path, json_path):
         from tokenizers import Tokenizer as HFTok
         hf = HFTok.from_file(json_path)
         hf.no_truncation()
+        hf.no_padding()
         for name, text in [("enwik8", ENWIK), ("probe", probe)]:
             a = hf.encode(text, add_special_tokens=False).ids
             b = list(fresh.encode(text, add_special_tokens=False).ids)
@@ -73,7 +74,11 @@ def verify_repo(repo_id, tkz_path, json_path):
 
 
 def main():
+    only = os.environ.get("TOKIERS_ONLY")
     repos = sorted(m.id for m in api.list_models(author=ORG))
+    if only:
+        want = {f"{ORG}/{n}" for n in only.split(",")}
+        repos = [r for r in repos if r in want]
     print(f"{len(repos)} repos; dry_run={DRY_RUN}", flush=True)
     results = {"pass": [], "self": [], "fail": [], "error": []}
 
