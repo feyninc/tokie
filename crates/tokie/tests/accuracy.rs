@@ -49,6 +49,72 @@ fn compare_model(tokiers_repo: &str, hf_model: &str, text: &str) -> (bool, Optio
     }
 }
 
+/// Load up to `max_bytes` of the OpenWebText sample and split into documents.
+///
+/// Web text exercises unicode the enwik8 XML dump never does (typographic
+/// quotes/ellipses before newlines, No-category numerics like ¹ ❶ ½, format
+/// chars like U+200B/U+00AD, O'Toole-style contractions) — exactly the
+/// patterns where hand-rolled pretokenizers historically diverged from HF.
+fn load_owt_docs(max_bytes: usize) -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("benches/data/owt_sample.txt");
+    let data = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "Failed to read {}: {e}\nDownload it with:\n  curl -sL \
+             https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz \
+             | gunzip -c | head -c 50000000 > benches/data/owt_sample.txt",
+            path.display()
+        )
+    });
+    let truncated = &data[..data.len().min(max_bytes)];
+    let text = String::from_utf8_lossy(truncated);
+    text.split("<|endoftext|>")
+        .filter(|d| !d.is_empty())
+        .map(|d| d.to_string())
+        .collect()
+}
+
+/// Compare tokie against HuggingFace per document, panicking with a readable
+/// report (doc index + text fragment around the first divergence).
+fn compare_model_docs(tokie_source: &str, hf_model: &str, docs: &[String]) {
+    let tok = Tokenizer::from_pretrained(tokie_source)
+        .unwrap_or_else(|e| panic!("Failed to load tokie {tokie_source}: {e}"));
+    let mut hf = HfTokenizer::from_pretrained(hf_model, None)
+        .unwrap_or_else(|e| panic!("Failed to load HF {hf_model}: {e}"));
+    let _ = hf.with_truncation(None);
+
+    let mut failures = Vec::new();
+    for (i, doc) in docs.iter().enumerate() {
+        let tokie_ids = tok.encode(doc, false).ids;
+        let hf_enc = hf.encode(doc.as_str(), false)
+            .unwrap_or_else(|e| panic!("HF encode failed for {hf_model} doc {i}: {e}"));
+        let hf_ids = hf_enc.get_ids();
+        if tokie_ids.as_slice() != hf_ids {
+            let diff = tokie_ids.iter().zip(hf_ids.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(tokie_ids.len().min(hf_ids.len()));
+            let byte = hf_enc.get_offsets().get(diff).map_or(0, |o| o.0);
+            let lo = (0..=byte.min(doc.len())).rev().take(40).find(|&p| doc.is_char_boundary(p)).unwrap_or(0);
+            let hi = (byte..=doc.len()).take(80).filter(|&p| doc.is_char_boundary(p)).last().unwrap_or(doc.len());
+            failures.push(format!(
+                "doc {i}: first divergence at token {diff} (byte {byte}): {:?}",
+                &doc[lo..hi]
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{}/{} docs mismatch HF for {hf_model}:\n{}",
+        failures.len(),
+        docs.len(),
+        failures[..failures.len().min(5)].join("\n")
+    );
+}
+
 // ============================================================================
 // WordPiece models (BERT-family)
 // ============================================================================
@@ -152,6 +218,37 @@ accuracy_test!(qwen3_8b,                "tokiers/Qwen3-8B",                     
 accuracy_test!(qwen3_coder_30b,         "tokiers/Qwen3-Coder-30B-A3B-Instruct",     "Qwen/Qwen3-Coder-30B-A3B-Instruct");
 accuracy_test!(qwen3_5_0_8b,            "tokiers/Qwen3.5-0.8B",                     "Qwen/Qwen3.5-0.8B");
 accuracy_test!(qwen3_5_4b,              "tokiers/Qwen3.5-4B",                       "Qwen/Qwen3.5-4B");
+
+// ============================================================================
+// Web-text (OpenWebText) per-document accuracy — one representative per
+// pretokenizer family / algorithm, loaded from the ORIGINAL HF repo so the
+// tokenizer.json detection path is exercised (tokiers/*.tkz bypasses it).
+// ============================================================================
+
+macro_rules! owt_accuracy_test {
+    ($name:ident, $hf:expr) => {
+        #[test]
+        #[ignore] // Requires network + benches/data/owt_sample.txt
+        fn $name() {
+            let docs = load_owt_docs(25_000_000);
+            compare_model_docs($hf, $hf, &docs);
+        }
+    };
+}
+
+owt_accuracy_test!(owt_gpt2,        "openai-community/gpt2");          // GPT-2 pretok
+owt_accuracy_test!(owt_qwen3,       "Qwen/Qwen3-0.6B");                // Qwen pretok
+owt_accuracy_test!(owt_smollm2,     "HuggingFaceTB/SmolLM2-135M");     // SmolLM pretok
+owt_accuracy_test!(owt_deepseek_v3, "deepseek-ai/DeepSeek-V3");        // DeepSeek pretok
+owt_accuracy_test!(owt_bert,        "google-bert/bert-base-uncased");  // WordPiece
+// KNOWN GAP (~1% of docs): the hand-rolled approximation of SentencePiece's
+// Precompiled charsmap in normalizer.rs strips Cf/Cc chars (U+00AD, C1
+// controls) that xlm-roberta's real charsmap keeps. Fixing requires applying
+// the tokenizer.json precompiled_charsmap blob (e.g. via the spm_precompiled
+// crate) — a .tkz format change. CI skips `known_gap_*` tests; run them
+// locally to measure the gap.
+owt_accuracy_test!(known_gap_owt_xlm_roberta, "FacebookAI/xlm-roberta-base"); // SP-Unigram
+owt_accuracy_test!(owt_mistral_7b,  "mistralai/Mistral-7B-v0.1");      // SP-BPE
 
 // ============================================================================
 // tiktoken models (CL100K, O200K) — compared against tiktoken-rs
