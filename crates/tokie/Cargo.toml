@@ -1,6 +1,6 @@
 [package]
 name = "tokie"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Blazingly fast tokenizer - 50x faster tokenization, 10x smaller model files, 100% accurate drop-in replacement for HuggingFace"
 license = "MIT OR Apache-2.0"
