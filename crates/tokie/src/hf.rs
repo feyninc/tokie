@@ -546,6 +546,13 @@ fn detect_pretokenizer_type(data: &serde_json::Value) -> DetectedPretokenizer {
                     // Collect all Split regex patterns for potential fallback
                     let mut split_patterns: Vec<String> = Vec::new();
 
+                    // Digit chunking may live in its own Split stage (DeepSeek puts
+                    // \p{N}{1,3} before the letter pattern), so scan all stages up front
+                    let has_chunked_digits = pretokenizers.iter().any(|p| {
+                        p["type"].as_str() == Some("Split")
+                            && p["pattern"]["Regex"].as_str().is_some_and(|pat| pat.contains("\\p{N}{"))
+                    });
+
                     // Check for Split with regex pattern to determine exact type
                     for p in pretokenizers {
                         if p["type"].as_str() == Some("Split") {
@@ -565,9 +572,9 @@ fn detect_pretokenizer_type(data: &serde_json::Value) -> DetectedPretokenizer {
                                 // Patterns with [\p{L}\p{M}]+ include combining marks
                                 if pattern.contains("[\\p{L}\\p{M}]+") {
                                     // DeepSeek: multi-stage splits, no contractions in main pattern,
-                                    // digit groups \p{N}{1,3}
+                                    // digit groups \p{N}{1,3} (in an earlier Split stage)
                                     // Qwen3.5: single split, has contractions, single digits \p{N}
-                                    if pattern.contains("\\p{N}{") {
+                                    if has_chunked_digits {
                                         return DetectedPretokenizer { pretok_type: PretokType::DeepSeek, fallback_pattern: None };
                                     }
                                     // Single-digit pattern with marks = Voyage + marks (Qwen3.5)
@@ -1243,6 +1250,39 @@ fn lookup_special_token_id(data: &serde_json::Value, token_str: &str) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_detect_deepseek_multi_stage_splits() {
+        // DeepSeek-V3 puts \p{N}{1,3} in its own Split stage, separate from the
+        // [\p{L}\p{M}]+ letter pattern — detection must consider all stages
+        let data = serde_json::json!({
+            "pre_tokenizer": {
+                "type": "Sequence",
+                "pretokenizers": [
+                    {"type": "Split", "pattern": {"Regex": "\\p{N}{1,3}"}, "behavior": "Isolated", "invert": false},
+                    {"type": "Split", "pattern": {"Regex": "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+"}, "behavior": "Isolated", "invert": false},
+                    {"type": "Split", "pattern": {"Regex": "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false},
+                    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}
+                ]
+            }
+        });
+        assert_eq!(detect_pretokenizer_type(&data).pretok_type, PretokType::DeepSeek);
+    }
+
+    #[test]
+    fn test_detect_qwen35_single_stage_single_digits() {
+        // Qwen3.5-style: one Split with [\p{L}\p{M}]+ and single \p{N} — must stay Qwen35
+        let data = serde_json::json!({
+            "pre_tokenizer": {
+                "type": "Sequence",
+                "pretokenizers": [
+                    {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false},
+                    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}
+                ]
+            }
+        });
+        assert_eq!(detect_pretokenizer_type(&data).pretok_type, PretokType::Qwen35);
+    }
 
     #[test]
     fn test_decode_bytelevel_token_ascii() {
