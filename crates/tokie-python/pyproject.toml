@@ -7,7 +7,7 @@ name = "tokie"
 version = "0.1.0"
 description = "Blazingly fast tokenizer — 50x faster, 10x smaller, 100% accurate"
 readme = "README_PYPI.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
 keywords = [
     "tokenizer",
@@ -30,9 +30,11 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Text Processing",
     "Topic :: Text Processing :: Linguistic",

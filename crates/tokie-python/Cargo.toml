@@ -10,7 +10,11 @@ publish = false
 name = "tokie"
 crate-type = ["cdylib"]
 
+[features]
+default = ["hf"]
+hf = ["tokie-core/hf"]
+
 [dependencies]
-tokie-core = { package = "tokie", path = "../tokie", features = ["hf"] }
-pyo3 = { version = "0.24", features = ["extension-module"] }
-numpy = "0.24"
+tokie-core = { package = "tokie", path = "../tokie", default-features = false }
+pyo3 = { version = "0.25", features = ["extension-module"] }
+numpy = "0.25"

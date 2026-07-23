@@ -190,12 +190,16 @@ impl Tokenizer {
 
         let repo_api = api.repo(repo);
 
-        // Try tokenizer.tkz first (faster to load, smaller to download)
+        // Try tokenizer.tkz first (faster to load, smaller to download).
+        // An unreadable .tkz (e.g. produced by a newer format version) falls
+        // through to tokenizer.json instead of failing the whole load — old
+        // clients must keep working when hub artifacts move ahead of them.
         if let Ok(tkz_path) = repo_api.get("tokenizer.tkz") {
-            let mut tokenizer = Self::from_file(tkz_path).map_err(HubError::LoadBinary)?;
-            // .tkz doesn't store added tokens — try to get them from tokenizer.json
-            load_added_tokens_from_json(&mut tokenizer, &repo_api);
-            return Ok(tokenizer);
+            if let Ok(mut tokenizer) = Self::from_file(tkz_path) {
+                // .tkz doesn't store added tokens — try to get them from tokenizer.json
+                load_added_tokens_from_json(&mut tokenizer, &repo_api);
+                return Ok(tokenizer);
+            }
         }
 
         // Try pre-built .tkz from tokiers/ org (covers 60+ popular models)
@@ -203,10 +207,11 @@ impl Tokenizer {
             let tokiers_repo = Repo::model(format!("tokiers/{tokiers_name}"));
             let tokiers_api = api.repo(tokiers_repo);
             if let Ok(tkz_path) = tokiers_api.get("tokenizer.tkz") {
-                let mut tokenizer = Self::from_file(tkz_path).map_err(HubError::LoadBinary)?;
-                // Try original repo's tokenizer.json for added tokens
-                load_added_tokens_from_json(&mut tokenizer, &repo_api);
-                return Ok(tokenizer);
+                if let Ok(mut tokenizer) = Self::from_file(tkz_path) {
+                    // Try original repo's tokenizer.json for added tokens
+                    load_added_tokens_from_json(&mut tokenizer, &repo_api);
+                    return Ok(tokenizer);
+                }
             }
         }
 

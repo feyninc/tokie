@@ -1,0 +1,110 @@
+name: Pyodide compatibility
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-pyemscripten:
+    name: Build PyEmscripten wheel (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: '3.14'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pyodide-build
+        run: pip install pyodide-build
+
+      - name: Get pyodide config
+        id: pyodide_config
+        run: |
+          echo "rust_toolchain=$(pyodide config get rust_toolchain)" >> "$GITHUB_OUTPUT"
+          echo "emscripten_version=$(pyodide config get emscripten_version)" >> "$GITHUB_OUTPUT"
+          echo "pyodide_abi_version=$(pyodide config get pyodide_abi_version)" >> "$GITHUB_OUTPUT"
+          echo "rustflags=$(pyodide config get rustflags)" >> "$GITHUB_OUTPUT"
+
+      - uses: emscripten-core/setup-emsdk@v16
+        with:
+          version: ${{ steps.pyodide_config.outputs.emscripten_version }}
+
+      - name: Build PyEmscripten wheel
+        uses: PyO3/maturin-action@v1
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUSTFLAGS: ${{ steps.pyodide_config.outputs.rustflags }}
+          MATURIN_PYEMSCRIPTEN_PLATFORM_VERSION: ${{ steps.pyodide_config.outputs.pyodide_abi_version }}
+        with:
+          target: wasm32-unknown-emscripten
+          args: --release --out dist --interpreter ${{ matrix.python-version }} --no-default-features
+          working-directory: crates/tokie-python
+          rust-toolchain: ${{ steps.pyodide_config.outputs.rust_toolchain }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-pyemscripten-${{ matrix.python-version }}
+          path: crates/tokie-python/dist
+
+  test-pyemscripten:
+    name: Test in Pyodide (${{ matrix.python-version }})
+    needs: [build-pyemscripten]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: '3.14'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pyodide-build
+        run: pip install pyodide-build
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-pyemscripten-${{ matrix.python-version }}
+          path: dist
+
+      - name: Test in Pyodide venv
+        run: |
+          pyodide venv .venv-pyodide
+          source .venv-pyodide/bin/activate
+          pip install --upgrade pip
+          pip install tokie --no-index --no-deps --find-links dist
+          python -c "
+          import tokie
+
+          # Verify module exports
+          assert hasattr(tokie, 'Tokenizer'), 'Missing Tokenizer class'
+          assert hasattr(tokie, 'Encoding'), 'Missing Encoding class'
+          assert hasattr(tokie, 'TokieError'), 'Missing TokieError exception'
+
+          # Verify Tokenizer methods are present
+          t = tokie.Tokenizer
+          for method in ['from_json', 'from_file', 'encode', 'decode', 'encode_batch', 'decode_batch', 'count_tokens']:
+              assert hasattr(t, method), f'Missing method: {method}'
+
+          # Verify from_pretrained is NOT available (hf feature disabled)
+          assert not hasattr(t, 'from_pretrained'), 'from_pretrained should be absent in wasm build'
+
+          print('All Pyodide compatibility checks passed!')
+          "
