@@ -269,6 +269,130 @@ fn is_cjk_char(ch: char) -> bool {
 }
 
 // =======================================================================
+// Unicode in-mask classification
+// =======================================================================
+
+/// UTF-8 sequence length from a lead byte (valid UTF-8 assumed).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 { 1 } else if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 }
+}
+
+/// Effective class of a non-ASCII char under config `C`, mirroring
+/// `Core`'s unicode predicates exactly. `Defer` marks chars whose piece
+/// behavior the byte algebra cannot model:
+/// - whitespace (run-global `\s+(?!\S)` / `\s*[\r\n]` bookkeeping),
+/// - letters/marks under CamelCase (case-state dependent),
+/// - numerics under Chunked3 (`\p{N}{1,3}` counts chars, masks count bytes),
+/// - DeepSeek non-[\p{P}\p{S}] chars (the one-char letter-prefix rule).
+#[cfg(target_arch = "aarch64")]
+enum UClass {
+    Letter,
+    Number,
+    Punct,
+    Defer,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn uclass<C: PretokConfig>(ch: char) -> UClass {
+    use crate::util::{is_punct_or_symbol, is_unicode_letter, is_unicode_mark};
+    let letter = match C::LETTER_MODE {
+        LetterMode::Plain => is_unicode_letter(ch),
+        LetterMode::PlainWithMarks | LetterMode::CamelCase => {
+            ch.is_alphabetic() || is_unicode_mark(ch)
+        }
+    };
+    if letter {
+        return if C::LETTER_MODE == LetterMode::CamelCase {
+            UClass::Defer
+        } else {
+            UClass::Letter
+        };
+    }
+    if ch.is_numeric() {
+        return if C::DIGIT_MODE == DigitMode::Chunked3 {
+            UClass::Defer
+        } else {
+            UClass::Number
+        };
+    }
+    if ch.is_whitespace() {
+        return UClass::Defer;
+    }
+    if C::PUNCT_CLASS == PunctClass::PunctSymbolOnly {
+        if is_punct_or_symbol(ch) { UClass::Punct } else { UClass::Defer }
+    } else {
+        UClass::Punct
+    }
+}
+
+/// Per-byte class masks for a batch's non-ASCII chars: every byte of a
+/// classified char carries the char's class, so byte-adjacency equals
+/// char-adjacency and the u64 boundary algebra applies unchanged.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Default)]
+struct UniMasks {
+    l: u64,
+    d: u64,
+    /// Lead bytes of Number chars (Single-mode piece starts).
+    d_lead: u64,
+    o: u64,
+    /// Lead bytes of Punct chars (letter-absorb sources).
+    o_lead: u64,
+    /// Lead bytes of Letter chars (AsciiOnly prefix-run boundaries).
+    l_lead: u64,
+    /// Lead bytes of CJK chars (DeepSeek ws-split exception).
+    cjk_lead: u64,
+    /// Bytes only the scalar path can decide.
+    defer: u64,
+}
+
+/// Classify every non-ASCII char whose lead bit is in `m` for
+/// `bytes[scan..scan+64]`. A char spilling off the batch end is
+/// classified via its full in-text bytes (valid UTF-8 keeps the read in
+/// bounds); only its in-batch bytes get class bits.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)] // keep the clean ASCII path's register allocation intact
+fn classify_uni<C: PretokConfig>(bytes: &[u8], scan: usize, m: u64) -> UniMasks {
+    let mut u = UniMasks::default();
+    let mut m = m;
+    while m != 0 {
+        let i = m.trailing_zeros() as usize;
+        let b = bytes[scan + i];
+        debug_assert!(b & 0xC0 != 0x80, "unclaimed continuation byte at bit {i}");
+        let (ch, clen) = crate::util::decode_utf8(&bytes[scan + i..]);
+        let lead = 1u64 << i;
+        let chm = if clen >= 64 - i {
+            u64::MAX << i
+        } else {
+            ((1u64 << clen) - 1) << i
+        };
+        match uclass::<C>(ch) {
+            UClass::Letter => {
+                u.l |= chm;
+                u.l_lead |= lead;
+            }
+            UClass::Number => {
+                u.d |= chm;
+                u.d_lead |= lead;
+            }
+            UClass::Punct => {
+                u.o |= chm;
+                u.o_lead |= lead;
+            }
+            UClass::Defer => u.defer |= chm,
+        }
+        if C::WS_EXCEPTION == WsException::Cjk && is_cjk_char(ch) {
+            u.cjk_lead |= lead;
+        }
+        m &= !chm;
+    }
+    u
+}
+
+// =======================================================================
 // Per-batch boundary algebra, parameterized by PretokConfig
 // =======================================================================
 
@@ -291,28 +415,81 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     let want_ctl = C::PUNCT_CLASS == PunctClass::PunctSymbolOnly;
     let m = ascii_masks(bytes, scan, camel, want_slash, want_ctl);
 
-    let l = m.l;
-    let d = m.d;
     let sp = m.s | m.t; // `Core` lets both space and tab prefix content
     let n = m.n;
     let ws = sp | n;
     let hi = m.hi;
-    let o = !(l | d | ws | hi); // ASCII punct + controls (Core's punct class)
     let ap = m.ap;
 
     let mut bad = 0u64;
 
-    // ---- carries from the byte before the batch ----
+    // ---- carries from the char before the batch ----
+    // For a non-ASCII previous char, walk back to its lead (at most 3
+    // bytes), classify it, and claim any of its bytes that straddle into
+    // this batch — so a batch following a unicode char keeps its fast
+    // path instead of starting in a bad zone.
     let (pl, pd, psp, pws, po, plo, pn);
+    let (mut claim_l, mut claim_d, mut claim_o) = (0u64, 0u64, 0u64);
+    let mut claimed = 0u64;
+    let mut edge_kill = 0u64;
     if scan == 0 {
         (pl, pd, psp, pws, po, plo, pn) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     } else {
         let b = bytes[scan - 1];
         if b >= 0x80 {
-            // Unclassified previous char: boundaries near the batch start
-            // are uncertain (up to the punct-prefix +2 pattern).
-            bad |= 0b111;
-            (pl, pd, psp, pws, po, plo, pn) = (0, 0, 0, 0, 0, 0, 0);
+            let mut j = scan - 1;
+            while bytes[j] & 0xC0 == 0x80 {
+                j -= 1;
+            }
+            let (ch, clen) = crate::util::decode_utf8(&bytes[j..]);
+            let end = j + clen;
+            let claim_bits = if end > scan {
+                (1u64 << (end - scan)) - 1
+            } else {
+                0
+            };
+            claimed = claim_bits;
+            match uclass::<C>(ch) {
+                UClass::Letter => {
+                    claim_l = claim_bits;
+                    (pl, pd, psp, pws, po, plo, pn) = (1, 0, 0, 0, 0, 0, 0);
+                }
+                UClass::Number => {
+                    claim_d = claim_bits;
+                    (pl, pd, psp, pws, po, plo, pn) = (0, 1, 0, 0, 0, 0, 0);
+                }
+                UClass::Punct => {
+                    claim_o = claim_bits;
+                    (pl, pd, psp, pws, po, plo, pn) = (0, 0, 0, 0, 1, 0, 0);
+                    // Cross-edge letter absorb: a letter right after this
+                    // punct char is absorbed iff the punct char itself
+                    // starts a piece — decided by the char BEFORE it.
+                    let letter_bit = 1u64 << (end - scan);
+                    if C::PUNCT_PREFIX_MODE == PunctPrefixMode::Any
+                        && (m.l | hi) & letter_bit != 0
+                    {
+                        if j == 0 {
+                            edge_kill = letter_bit; // text-start punct absorbs
+                        } else if bytes[j - 1] < 0x80 {
+                            let b2 = bytes[j - 1];
+                            let o2 = !crate::util::is_ascii_letter(b2)
+                                && !crate::util::is_digit(b2)
+                                && !is_ascii_ws_byte(b2);
+                            let sp2 = b2 == b' ' || b2 == b'\t';
+                            if !o2 && !sp2 {
+                                edge_kill = letter_bit; // fresh punct piece absorbs
+                            }
+                            // else: run member / space-prefixed → no absorb
+                        } else {
+                            bad |= claim_bits | letter_bit | letter_bit << 1;
+                        }
+                    }
+                }
+                UClass::Defer => {
+                    bad |= claim_bits | 0b111;
+                    (pl, pd, psp, pws, po, plo, pn) = (0, 0, 0, 0, 0, 0, 0);
+                }
+            }
         } else {
             let letter = crate::util::is_ascii_letter(b);
             let digit = crate::util::is_digit(b);
@@ -326,6 +503,21 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
             pn = u64::from(b == b'\n' || b == b'\r');
         }
     }
+
+    // ---- classify this batch's non-ASCII chars ----
+    let uni = if hi & !claimed != 0 {
+        classify_uni::<C>(bytes, scan, hi & !claimed)
+    } else {
+        UniMasks::default()
+    };
+    let defer = uni.defer | (bad & claimed);
+
+    // Merged per-byte effective classes: every byte of a classified char
+    // carries the char's class, so the ASCII shifted-mask algebra applies
+    // unchanged. Deferred bytes belong to no class.
+    let l = m.l | uni.l | claim_l;
+    let d = m.d | uni.d | claim_d;
+    let o = !(m.l | m.d | ws | hi) | uni.o | claim_o;
 
     // ---- content piece-start bits ----
     let mut start = 0u64;
@@ -342,8 +534,11 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     // digits
     match C::DIGIT_MODE {
         DigitMode::Unlimited => start |= d & !((d << 1) | pd),
-        DigitMode::Single => start |= d,
+        // Single: every numeric CHAR is a piece — lead bytes only.
+        DigitMode::Single => start |= m.d | uni.d_lead,
         DigitMode::Chunked3 => {
+            // Unicode numerics are deferred under Chunked3, so d is pure
+            // ASCII here and byte splits equal char splits.
             start |= digit_run_splits3(d);
             // A run carried in from the previous batch has unknown phase.
             if pd == 1 && d & 1 != 0 {
@@ -376,13 +571,13 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     if want_slash && tn >> 63 != 0 {
         bad |= 1 << 63;
     }
-    // A newline directly after a non-ASCII char may or may not start a
-    // trailing tail (the char's punct-ness is unclassified). For
+    // A newline directly after a deferred char may or may not start a
+    // trailing tail (the char's punct-ness is undecided). For
     // newline-only tails both interpretations emit the same bits, but a
     // slash in the chain changes whether the next punct char starts
     // fresh — and with it the single-punct letter absorb one byte later.
     if want_slash {
-        let chain = fill_right(n & (hi << 1), trail);
+        let chain = fill_right(n & (defer << 1), trail);
         if chain != 0 {
             bad |= chain | chain << 1 | chain << 2;
         }
@@ -412,9 +607,12 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     let split_base = if C::WS_PATTERN == WsPattern::Gpt2 { ews } else { ews & !n };
     let mut split = split_base & !(ws >> 1);
     if C::WS_EXCEPTION != WsException::None {
-        // SmolLM: stay whole before a digit; DeepSeek: before digit/CJK
-        // (non-ASCII numerics/CJK are inside the hi bad zone anyway).
+        // SmolLM: stay whole before a numeric (incl. classified unicode
+        // numerics); DeepSeek: before an ASCII digit or a CJK char.
         split &= !(d >> 1);
+        if C::WS_EXCEPTION == WsException::Cjk {
+            split &= !(uni.cjk_lead >> 1);
+        }
     }
     // Bit 63 needs the real lookahead char.
     if split_base >> 63 != 0 {
@@ -452,20 +650,20 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     }
 
     // ---- suppression: space/tab prefixes the following content ----
+    // Only a space that itself starts a piece absorbs what follows; a
+    // run-interior space (possible under ws exceptions, e.g. DeepSeek's
+    // "no split before CJK") does not.
+    let sp_bits = sp & (run_start | split);
     let after_sp_classes =
         l | o | if C::SPACE_PREFIXES_DIGITS { d } else { 0 };
-    let after_sp = ((sp << 1) | psp) & after_sp_classes;
-
-    let mut boundary = (start | wsb_bits) & !after_sp & !tn;
-
-    // ---- apostrophe contractions: scalar territory ----
-    if C::CONTRACTION_MODE != ContractionMode::None && ap != 0 {
-        bad |= ap | ap << 1 | ap << 2 | ap << 3;
-        let edge = ap & (0b111 << 61);
-        if edge != 0 {
-            bad |= u64::MAX << edge.trailing_zeros();
-        }
+    let after_sp = ((sp_bits << 1) | psp) & after_sp_classes;
+    if C::WS_EXCEPTION == WsException::Cjk && psp == 1 && uni.cjk_lead & 1 != 0 {
+        // Whether the previous batch's trailing space started a piece
+        // depends on its own predecessor (the CJK split exception).
+        bad |= 0b11;
     }
+
+    let mut boundary = (start | wsb_bits) & !after_sp & !tn & !edge_kill;
 
     // ---- DeepSeek: ASCII controls are not [\p{P}\p{S}] ----
     if C::PUNCT_CLASS == PunctClass::PunctSymbolOnly {
@@ -475,23 +673,145 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
         }
     }
 
-    // ---- non-ASCII: scalar territory (v1: no in-mask classification) ----
-    if hi != 0 {
-        bad |= hi | hi << 1 | hi >> 1;
+    // ---- deferred chars: scalar territory ----
+    if defer != 0 {
+        bad |= defer | defer << 1 | defer >> 1;
+        // A deferred char inside/adjacent to an ASCII ws run poisons the
+        // run's global split bookkeeping.
+        let wsadj = ((defer << 1) | (defer >> 1)) & ews;
+        if wsadj != 0 {
+            bad |= fill_both(wsadj, ews);
+        }
     }
 
     // ---- punct-prefix configs: single punct absorbs following letters ----
     if C::PUNCT_PREFIX_MODE != PunctPrefixMode::SpaceOnly {
-        // A letter directly after a piece-starting punct char is absorbed.
-        boundary &= !(((o & boundary) << 1) & l);
-        // (hi, punct, letter): whether the punct absorbs depends on the
-        // unclassified char's class.
-        bad |= (hi << 2) & (o << 1) & l;
+        // A letter directly after a piece-starting ASCII punct char is
+        // absorbed (byte- and char-adjacency coincide). DeepSeek's
+        // AsciiOnly prefix takes ASCII letters only ("l'été" → l ' été).
+        let absorb_l = if C::PUNCT_PREFIX_MODE == PunctPrefixMode::AsciiOnly { m.l } else { l };
+        let kill = ((o & boundary) << 1) & absorb_l;
+        boundary &= !kill;
+        if C::PUNCT_PREFIX_MODE == PunctPrefixMode::AsciiOnly {
+            // Core's asymmetry: a unicode letter after non-apostrophe
+            // ASCII punct IS absorbed, with a full unicode letter scan
+            // ("=σλ" is one piece) — only the apostrophe path and the
+            // ASCII-letter prefix scan are ASCII-restricted ("l'été" →
+            // l ' été; "-handâa" → -hand + âa).
+            boundary &= !((((o & !ap) & boundary) << 1) & uni.l_lead);
+            // A unicode letter following an absorbed-prefix ASCII run
+            // starts a fresh piece, while after a plain run it continues.
+            let prefix_runs = fill_right(kill, m.l);
+            boundary |= uni.l_lead & (prefix_runs << 1);
+            // A leading ASCII letter run continued from the previous
+            // batch has unknown prefix-ness; a unicode letter ending it
+            // is scalar territory.
+            if pl == 1 {
+                let k = (!m.l).trailing_zeros();
+                if k < 64 && uni.l_lead >> k & 1 != 0 {
+                    bad |= (0b111u64 << k) >> 1;
+                }
+            }
+        }
+        // Unicode punct chars absorb across their full char length (Any
+        // mode only — DeepSeek's AsciiOnly prefix excludes non-ASCII
+        // punct, see deepseek_nonascii_punct_no_letter_prefix).
+        if C::PUNCT_PREFIX_MODE == PunctPrefixMode::Any {
+            let mut leads = uni.o_lead & boundary;
+            while leads != 0 {
+                let i = leads.trailing_zeros() as usize;
+                leads &= leads - 1;
+                let end = i + utf8_len(bytes[scan + i]);
+                if end < 64 {
+                    boundary &= !((1u64 << end) & l);
+                } else {
+                    // The absorb decision crosses the batch edge.
+                    bad |= 1 << 63;
+                }
+            }
+        }
         // A punct char at bit 63 may absorb a letter in the next batch.
         if o >> 63 != 0 {
             bad |= 1 << 63;
         }
     }
+
+    // ---- apostrophe contractions: in-mask fixup ----
+    // Only apostrophes that START a piece matter (after a word: "don|'t");
+    // run-interior or space-prefixed apostrophes already carry no bit.
+    if C::CONTRACTION_MODE != ContractionMode::None && ap != 0 {
+        let mut cand = ap & boundary;
+        let mut contr_next = 0u64;
+        while cand != 0 {
+            let i = cand.trailing_zeros() as usize;
+            cand &= cand - 1;
+            if i >= 61 {
+                // Suffix reaches past the batch edge; scalar decides.
+                bad |= u64::MAX << i;
+                break;
+            }
+            if C::CONTRACTION_MODE == ContractionMode::Suffix && scan > 0 {
+                // A word straddling in from the previous batch carries
+                // contraction history the masks can't see ("a'll|'ve" must
+                // NOT merge again; "don|'t" must). Defer when the
+                // preceding letter run reaches the batch start.
+                let run_to_start = ((!l).trailing_zeros() as usize) >= i;
+                let pb = bytes[scan - 1];
+                if run_to_start && (pl == 1 || pb == b'\'') {
+                    bad |= 0b1111u64 << i;
+                    continue;
+                }
+            }
+            if C::CONTRACTION_MODE == ContractionMode::Suffix && (bad >> i) & 1 == 1 {
+                // The merge decision depends on scalar territory (e.g. a
+                // deferred-char word before the apostrophe); extend the
+                // zone over the suffix so a chained apostrophe defers too.
+                bad |= 0b1111u64 << i;
+                continue;
+            }
+            let fold = |b: u8| {
+                if C::CONTRACTION_CASE == ContractionCase::Insensitive { b | 0x20 } else { b }
+            };
+            let b1 = fold(bytes[scan + i + 1]);
+            let k = match b1 {
+                b's' | b't' | b'd' | b'm' => 2,
+                b'l' if fold(bytes[scan + i + 2]) == b'l' => 3,
+                b'v' if fold(bytes[scan + i + 2]) == b'e' => 3,
+                b'r' if fold(bytes[scan + i + 2]) == b'e' => 3,
+                _ => 0,
+            };
+            // Suffix mode only merges a contraction into a preceding
+            // LETTER run ("don'ts" → don't s) that didn't itself just end
+            // in a contraction ("a're's" → a're 's); after anything else
+            // the apostrophe is a letter prefix ("5'ts" → 5 'ts).
+            let prev_l = (if i == 0 { pl == 1 } else { (l >> (i - 1)) & 1 == 1 })
+                && (contr_next >> i) & 1 == 0;
+            if k != 0 && (C::CONTRACTION_MODE == ContractionMode::Standalone || prev_l) {
+                // Contraction: the suffix letters merge into "'t"/"'ll"…
+                // and the char after the suffix starts fresh — even a
+                // letter ("don'ts" → don 't s).
+                boundary &= !(1u64 << (i + 1));
+                if C::CONTRACTION_MODE == ContractionMode::Suffix {
+                    // O200K: the contraction continues the word instead.
+                    boundary &= !(1u64 << i);
+                }
+                boundary |= 1u64 << (i + k);
+                contr_next |= 1u64 << (i + k);
+            } else {
+                // No contraction: an immediately following letter is
+                // absorbed by tokie's apostrophe-prefix ("x'y" → x 'y),
+                // which SpaceOnly configs don't get from the general
+                // punct-absorb rule.
+                let nb1 = bytes[scan + i + 1];
+                if crate::util::is_ascii_letter(nb1)
+                    || (nb1 >= 0x80 && (uni.l_lead >> (i + 1)) & 1 == 1)
+                {
+                    boundary &= !(1u64 << (i + 1));
+                }
+            }
+        }
+    }
+
 
     // ---- Chunked3: digit runs touching a bad byte have unknown phase ----
     if C::DIGIT_MODE == DigitMode::Chunked3 {
