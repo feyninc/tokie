@@ -649,13 +649,24 @@ impl BacktrackingBytePairEncoder {
 /// frequency makes self-correcting (hot keys win back their slot).
 pub struct PretokenCache {
     entries: Box<[CacheEntry]>,
+    mask: usize,
 }
 
 const CACHE_KEY_MAX: usize = 15;
-const CACHE_BITS: usize = 17; // 131072 entries * 32 B = 4 MiB
-const CACHE_MASK: usize = (1 << CACHE_BITS) - 1;
+const CACHE_BITS_DEFAULT: usize = 16; // 65536 entries * 32 B = 2 MiB (fits M-series shared L2 alongside 8 workers)
 const CACHE_PROBES: usize = 4;
 const CACHE_MAX_TOKENS: usize = 3;
+
+/// Table size exponent, overridable for tuning via TOKIE_CACHE_BITS.
+fn cache_bits() -> usize {
+    static BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        std::env::var("TOKIE_CACHE_BITS").ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&b| (10..=24).contains(&b))
+            .unwrap_or(CACHE_BITS_DEFAULT)
+    })
+}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -669,7 +680,14 @@ struct CacheEntry {
 impl PretokenCache {
     pub fn new() -> Self {
         let empty = CacheEntry { key: [0; 16], toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
-        Self { entries: vec![empty; 1 << CACHE_BITS].into_boxed_slice() }
+        let n = 1usize << cache_bits();
+        Self { entries: vec![empty; n].into_boxed_slice(), mask: n - 1 }
+    }
+
+    /// Reset every entry to empty (for reuse under a different tokenizer).
+    pub fn clear(&mut self) {
+        let empty = CacheEntry { key: [0; 16], toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
+        self.entries.fill(empty);
     }
 
     #[inline(always)]
@@ -682,20 +700,20 @@ impl PretokenCache {
     }
 
     #[inline(always)]
-    fn slot(k: &[u8; 16]) -> usize {
+    fn slot(&self, k: &[u8; 16]) -> usize {
         let a = u64::from_le_bytes(k[..8].try_into().unwrap());
         let b = u64::from_le_bytes(k[8..].try_into().unwrap());
         let h = (a ^ 0x9E37_79B9_7F4A_7C15)
             .wrapping_mul(0xA076_1D64_78BD_642F)
             ^ b.wrapping_mul(0xE703_7ED1_A0B4_28DB);
-        ((h ^ (h >> 32)) as usize) & CACHE_MASK
+        ((h ^ (h >> 32)) as usize) & self.mask
     }
 
     /// Look up a piece; on hit, append its tokens to `out` and return true.
     #[inline(always)]
     fn get(&self, bytes: &[u8], out: &mut Vec<TokenId>) -> bool {
         let k = Self::key_block(bytes);
-        let mut i = Self::slot(&k);
+        let mut i = self.slot(&k);
         for _ in 0..CACHE_PROBES {
             let e = &self.entries[i];
             if e.key == k {
@@ -705,7 +723,7 @@ impl PretokenCache {
             if e.key[0] == 0 {
                 return false;
             }
-            i = (i + 1) & CACHE_MASK;
+            i = (i + 1) & self.mask;
         }
         false
     }
@@ -716,7 +734,7 @@ impl PretokenCache {
             return;
         }
         let k = Self::key_block(bytes);
-        let home = Self::slot(&k);
+        let home = self.slot(&k);
         let mut i = home;
         let mut target = home;
         for _ in 0..CACHE_PROBES {
@@ -725,7 +743,7 @@ impl PretokenCache {
                 target = i;
                 break;
             }
-            i = (i + 1) & CACHE_MASK;
+            i = (i + 1) & self.mask;
         }
         let e = &mut self.entries[target];
         e.key = k;

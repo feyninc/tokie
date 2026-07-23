@@ -150,6 +150,24 @@ impl Tokenizer {
     ) -> Result<Self, HubError> {
         let repo_id = repo_id.as_ref();
 
+        // Fast path: a fully-local load with zero network round-trips.
+        // If the hub disk cache already has tokenizer.json for this repo, load
+        // the compiled .tkz we stored next to it (~5ms), or compile and store
+        // it now. Network resolution below costs >100ms even fully warm
+        // (etag checks plus a 404 probe for tokenizer.tkz).
+        if options.revision.is_none() {
+            let cache = match &options.cache_dir {
+                Some(dir) => hf_hub::Cache::new(dir.clone()),
+                None => hf_hub::Cache::default(),
+            };
+            let repo = hf_hub::Repo::model(repo_id.to_string());
+            if let Some(local_json) = cache.repo(repo).get("tokenizer.json") {
+                if let Some(tok) = load_or_build_compiled(&local_json) {
+                    return Ok(tok);
+                }
+            }
+        }
+
         // Build the API client
         let mut api_builder = hf_hub::api::sync::ApiBuilder::new();
 
@@ -192,10 +210,86 @@ impl Tokenizer {
             }
         }
 
-        // Fall back to tokenizer.json
+        // Fall back to tokenizer.json (and leave a compiled artifact behind so
+        // the next load takes the fast path)
         let tokenizer_path = repo_api.get("tokenizer.json").map_err(HubError::Download)?;
+        if let Some(tok) = load_or_build_compiled(&tokenizer_path) {
+            return Ok(tok);
+        }
         Self::from_json(tokenizer_path).map_err(HubError::Load)
     }
+}
+
+/// Sidecar metadata stored beside the compiled .tkz (added/special tokens are
+/// not part of the .tkz format).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct CompiledMeta {
+    added: Vec<(crate::types::TokenId, Vec<u8>)>,
+    special: Vec<(String, crate::types::TokenId)>,
+}
+
+/// Load the compiled cache stored next to `json_path`, or build it from the
+/// json and store it. Returns None if the json can't be loaded (caller falls
+/// back to the network path). Cache writes are best-effort: a read-only cache
+/// dir just means the fast path stays cold.
+fn load_or_build_compiled(json_path: &std::path::Path) -> Option<Tokenizer> {
+    let base = format!("tokenizer.compiled-v{}", env!("CARGO_PKG_VERSION"));
+    let tkz = json_path.with_file_name(format!("{base}.tkz"));
+    let meta = json_path.with_file_name(format!("{base}.meta.json"));
+
+    if let Ok(mut tok) = Tokenizer::from_file(&tkz) {
+        if let Ok(bytes) = std::fs::read(&meta) {
+            if let Ok(m) = serde_json::from_slice::<CompiledMeta>(&bytes) {
+                if !m.added.is_empty() {
+                    tok.set_added_tokens(&m.added);
+                }
+                if !m.special.is_empty() {
+                    tok.set_special_tokens(m.special);
+                }
+                return Some(tok);
+            }
+        } else {
+            return Some(tok);
+        }
+    }
+
+    // Build from json; extract added/special tokens from the same parse.
+    let json_bytes = std::fs::read(json_path).ok()?;
+    let mut tok = Tokenizer::from_json(json_path).ok()?;
+    let mut m = CompiledMeta::default();
+    if let Ok(data) = serde_json::from_slice::<serde_json::Value>(&json_bytes) {
+        if let Some(added) = data["added_tokens"].as_array() {
+            for token in added {
+                let (Some(id), Some(content)) = (token["id"].as_u64(), token["content"].as_str()) else {
+                    continue;
+                };
+                let id = id as crate::types::TokenId;
+                if content.len() >= 2 {
+                    m.added.push((id, content.as_bytes().to_vec()));
+                }
+                if token["special"].as_bool().unwrap_or(false) {
+                    m.special.push((content.to_string(), id));
+                }
+            }
+        }
+    }
+    if !m.added.is_empty() {
+        tok.set_added_tokens(&m.added);
+    }
+    if !m.special.is_empty() {
+        tok.set_special_tokens(m.special.clone());
+    }
+
+    // Persist for next time (best effort, atomic-ish via temp + rename)
+    let tmp = tkz.with_extension("tkz.tmp");
+    if tok.to_file(&tmp).is_ok() {
+        let _ = std::fs::rename(&tmp, &tkz);
+        if let Ok(bytes) = serde_json::to_vec(&m) {
+            let _ = std::fs::write(&meta, bytes);
+        }
+    }
+
+    Some(tok)
 }
 
 /// Try to load added tokens from tokenizer.json and set them on the tokenizer.

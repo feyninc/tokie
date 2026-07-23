@@ -41,6 +41,22 @@ fn main() {
     let el = t0.elapsed().as_secs_f64();
     println!("count_tokens 1T  : {:7.1} MB/s  ({} tokens)", nbytes as f64 / 1e6 / el, toks);
 
+    // Single-threaded encode via the batch hot path (PretokenCache)
+    let t0 = Instant::now();
+    let mut cache = tokie::encoder::PretokenCache::new();
+    let mut toks_c = 0usize;
+    let pretok = tok.pretokenizer().expect("pretokenizer");
+    let mut out: Vec<u32> = Vec::new();
+    for d in &docs {
+        out.clear();
+        for piece in pretok.split(d) {
+            tok.encoder().encode_into(piece.as_bytes(), Some(&mut cache), &mut out);
+        }
+        toks_c += out.len();
+    }
+    let el = t0.elapsed().as_secs_f64();
+    println!("count cached 1T  : {:7.1} MB/s  ({} tokens)", nbytes as f64 / 1e6 / el, toks_c);
+
     // Full single-threaded encode (with Encoding build)
     let t0 = Instant::now();
     let mut toks2 = 0usize;
