@@ -13,7 +13,11 @@ use chunk::chunk;
 
 use daggrs::{DoubleArrayAhoCorasick, MatchKind, Trie};
 
-use crate::encoder::{Encoder, EncoderIter, EncoderType};
+use crate::encoder::{Encoder, EncoderIter, EncoderType, PretokenCache};
+
+/// Minimum bytes a thread's work chunk must contain before it pays for a
+/// per-thread `PretokenCache` (4 MiB table; zeroing it costs ~100µs).
+const PRETOKEN_CACHE_MIN_BYTES: usize = 256 * 1024;
 use crate::decoder::{Decoder, DecoderType};
 use crate::hf::{self, JsonLoadError};
 use crate::normalizer::Normalizer;
@@ -118,7 +122,7 @@ impl Tokenizer {
     }
 
     pub fn pretokenizer_type(&self) -> PretokType { self.pretokenizer_type }
-    pub fn normalizer(&self) -> Normalizer { self.normalizer }
+    pub fn normalizer(&self) -> &Normalizer { &self.normalizer }
     pub fn post_processor(&self) -> &PostProcessor { &self.post_processor }
     pub fn encoder_type(&self) -> EncoderType { self.encoder.encoder_type() }
     pub fn decoder_type(&self) -> DecoderType { self.decoder.decoder_type() }
@@ -237,7 +241,17 @@ impl Tokenizer {
     /// println!("{:?}", enc.ids);
     /// ```
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Encoding {
-        let mut tokens = self.encode_raw(text);
+        self.encode_inner(text, add_special_tokens, None)
+    }
+
+    /// Encode with an optional per-thread pretoken cache (batch hot path).
+    fn encode_inner(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+        cache: Option<&mut PretokenCache>,
+    ) -> Encoding {
+        let mut tokens = self.encode_raw_ctx(text, cache);
 
         if let Some(ref trunc) = self.truncation {
             let special = if add_special_tokens {
@@ -372,17 +386,26 @@ impl Tokenizer {
 
     /// Core encoding path: normalize + pretokenize + encode. No special tokens.
     fn encode_raw(&self, text: &str) -> Vec<TokenId> {
+        self.encode_raw_ctx(text, None)
+    }
+
+    fn encode_raw_ctx(&self, text: &str, cache: Option<&mut PretokenCache>) -> Vec<TokenId> {
         // If there are non-special added tokens, split the text at their boundaries first.
         // HuggingFace scans for added tokens BEFORE pretokenization.
         if let Some(ref matcher) = self.added_tokens_matcher {
-            return self.encode_with_added_tokens(text, matcher);
+            return self.encode_with_added_tokens(text, matcher, cache);
         }
 
-        self.encode_raw_inner(text)
+        self.encode_raw_inner(text, cache)
     }
 
     /// Encode text after splitting at added token boundaries.
-    fn encode_with_added_tokens(&self, text: &str, matcher: &DoubleArrayAhoCorasick) -> Vec<TokenId> {
+    fn encode_with_added_tokens(
+        &self,
+        text: &str,
+        matcher: &DoubleArrayAhoCorasick,
+        mut cache: Option<&mut PretokenCache>,
+    ) -> Vec<TokenId> {
         let bytes = text.as_bytes();
         let mut result = Vec::new();
         let mut pos = 0;
@@ -391,7 +414,7 @@ impl Tokenizer {
             // Encode text before this added token
             if m.start > pos {
                 let segment = &text[pos..m.start];
-                result.extend(self.encode_raw_inner(segment));
+                result.extend(self.encode_raw_inner(segment, cache.as_deref_mut()));
             }
             // Insert the added token directly
             result.push(m.pattern_id);
@@ -401,14 +424,14 @@ impl Tokenizer {
         // Encode remaining text after last added token
         if pos < text.len() {
             let segment = &text[pos..];
-            result.extend(self.encode_raw_inner(segment));
+            result.extend(self.encode_raw_inner(segment, cache));
         }
 
         result
     }
 
     /// Inner encoding without added token splitting.
-    fn encode_raw_inner(&self, text: &str) -> Vec<TokenId> {
+    fn encode_raw_inner(&self, text: &str, cache: Option<&mut PretokenCache>) -> Vec<TokenId> {
         // For models without pretokenizer (SentencePiece, Unigram), normalize the full
         // text first and pass directly to the encoder. The encoder handles its own
         // chunking at safe boundaries (metaspace). We must NOT use encode_parallel here
@@ -424,7 +447,7 @@ impl Tokenizer {
             self.encode_parallel(text)
         } else {
             let normalized = self.normalizer.normalize(text);
-            self.encode_sequential(normalized.as_ref())
+            self.encode_sequential(normalized.as_ref(), cache)
         }
     }
 
@@ -517,11 +540,12 @@ impl Tokenizer {
     }
 
     #[inline]
-    fn encode_sequential(&self, text: &str) -> Vec<TokenId> {
-        self.pretokenizer.as_ref().unwrap()
-            .split(text)
-            .flat_map(|piece| self.encoder.encode(piece.as_bytes()))
-            .collect()
+    fn encode_sequential(&self, text: &str, mut cache: Option<&mut PretokenCache>) -> Vec<TokenId> {
+        let mut out = Vec::with_capacity(text.len() / 3);
+        for piece in self.pretokenizer.as_ref().unwrap().split(text) {
+            self.encoder.encode_into(piece.as_bytes(), cache.as_deref_mut(), &mut out);
+        }
+        out
     }
 
     /// Split text into chunks at whitespace, encode each in parallel.
@@ -538,7 +562,7 @@ impl Tokenizer {
 
         if chunks.len() <= 1 {
             let normalized = self.normalizer.normalize(text);
-            return self.encode_sequential(normalized.as_ref());
+            return self.encode_sequential(normalized.as_ref(), None);
         }
 
         let encoder = &self.encoder;
@@ -552,9 +576,13 @@ impl Tokenizer {
                         // SAFETY: Input was valid UTF-8, split at ASCII whitespace.
                         let chunk_str = unsafe { std::str::from_utf8_unchecked(chunk_bytes) };
                         let normalized = normalizer.normalize(chunk_str);
-                        pretok.split(normalized.as_ref())
-                            .flat_map(|piece| encoder.encode(piece.as_bytes()))
-                            .collect()
+                        let mut cache = (chunk_bytes.len() >= PRETOKEN_CACHE_MIN_BYTES)
+                            .then(PretokenCache::new);
+                        let mut out = Vec::with_capacity(chunk_bytes.len() / 3);
+                        for piece in pretok.split(normalized.as_ref()) {
+                            encoder.encode_into(piece.as_bytes(), cache.as_mut(), &mut out);
+                        }
+                        out
                     })
                 })
                 .collect::<Vec<_>>()
@@ -643,8 +671,11 @@ impl Tokenizer {
                 texts.chunks(chunk_size)
                     .map(|text_chunk| {
                         s.spawn(|| {
+                            let chunk_bytes: usize = text_chunk.iter().map(|t| t.len()).sum();
+                            let mut cache = (chunk_bytes >= PRETOKEN_CACHE_MIN_BYTES)
+                                .then(PretokenCache::new);
                             text_chunk.iter()
-                                .map(|t| self.encode(t, add_special_tokens))
+                                .map(|t| self.encode_inner(t, add_special_tokens, cache.as_mut()))
                                 .collect::<Vec<_>>()
                         })
                     })
@@ -676,7 +707,12 @@ impl Tokenizer {
             texts.chunks(chunk_size)
                 .map(|text_chunk| {
                     s.spawn(|| {
-                        text_chunk.iter().map(|t| self.count_tokens(t)).collect::<Vec<_>>()
+                        let chunk_bytes: usize = text_chunk.iter().map(|t| t.len()).sum();
+                        let mut cache = (chunk_bytes >= PRETOKEN_CACHE_MIN_BYTES)
+                            .then(PretokenCache::new);
+                        text_chunk.iter()
+                            .map(|t| self.encode_raw_ctx(t, cache.as_mut()).len())
+                            .collect::<Vec<_>>()
                     })
                 })
                 .collect::<Vec<_>>()

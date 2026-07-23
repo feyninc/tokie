@@ -438,6 +438,42 @@ impl BacktrackingBytePairEncoder {
         self.num_base_tokens
     }
 
+    /// Append the encoding of one pretokenized piece to `out`.
+    ///
+    /// The hot path for corpus encoding: no per-piece Vec, and with a
+    /// `PretokenCache` most pieces resolve to a single 32-byte table probe
+    /// (pretoken frequency is Zipfian — on web text the vast majority of
+    /// pieces repeat, and ~90% encode to a single token).
+    pub fn encode_into(&self, text: &[u8], mut cache: Option<&mut PretokenCache>, out: &mut Vec<TokenId>) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(c) = cache.as_deref_mut() {
+            if text.len() <= CACHE_KEY_MAX && c.get(text, out) {
+                return;
+            }
+        }
+        if text.len() <= MAX_CACHED_TOKEN_LEN {
+            if let Some(&token_id) = self.token_cache.get(text) {
+                if let Some(c) = cache {
+                    c.insert(text, &[token_id]);
+                }
+                out.push(token_id);
+                return;
+            }
+        }
+        if text.len() >= PARALLEL_THRESHOLD {
+            // Degenerate giant piece: fall back to the chunk-parallel path
+            out.extend(self.encode(text));
+            return;
+        }
+        let start = out.len();
+        self.encode_sequential_into(text, out);
+        if let Some(c) = cache {
+            c.insert(text, &out[start..]); // self-guards key/value size limits
+        }
+    }
+
     /// Encode text into BPE tokens.
     pub fn encode(&self, text: &[u8]) -> Vec<TokenId> {
         if text.is_empty() {
@@ -541,6 +577,12 @@ impl BacktrackingBytePairEncoder {
             }
         }
 
+        let mut out = Vec::new();
+        self.encode_sequential_into(text, &mut out);
+        out
+    }
+
+    fn encode_sequential_into(&self, text: &[u8], out: &mut Vec<TokenId>) {
         let n = text.len();
         // Use SmallVec to avoid heap allocation for small pieces
         let mut tokens: SmallVec<[TokenId; 16]> = SmallVec::new();
@@ -579,7 +621,7 @@ impl BacktrackingBytePairEncoder {
             }
         }
 
-        tokens.into_vec()
+        out.extend_from_slice(&tokens);
     }
 
     #[inline]
@@ -598,17 +640,120 @@ impl BacktrackingBytePairEncoder {
     }
 }
 
+/// Per-thread cache of pretoken bytes → encoded token sequence.
+///
+/// Open-addressing table of 32-byte entries: a 16-byte key block
+/// (`[len, bytes...]`, compared as one 16-byte memcmp) plus up to 3 inline
+/// token ids. Sized so a warm chunk's working set stays resident; collisions
+/// beyond the probe window overwrite the home slot, which Zipfian pretoken
+/// frequency makes self-correcting (hot keys win back their slot).
+pub struct PretokenCache {
+    entries: Box<[CacheEntry]>,
+}
+
+const CACHE_KEY_MAX: usize = 15;
+const CACHE_BITS: usize = 17; // 131072 entries * 32 B = 4 MiB
+const CACHE_MASK: usize = (1 << CACHE_BITS) - 1;
+const CACHE_PROBES: usize = 4;
+const CACHE_MAX_TOKENS: usize = 3;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CacheEntry {
+    /// key[0] = piece length (0 = empty slot), key[1..1+len] = piece bytes.
+    key: [u8; 16],
+    toks: [TokenId; CACHE_MAX_TOKENS],
+    ntok: u32,
+}
+
+impl PretokenCache {
+    pub fn new() -> Self {
+        let empty = CacheEntry { key: [0; 16], toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
+        Self { entries: vec![empty; 1 << CACHE_BITS].into_boxed_slice() }
+    }
+
+    #[inline(always)]
+    fn key_block(bytes: &[u8]) -> [u8; 16] {
+        debug_assert!(!bytes.is_empty() && bytes.len() <= CACHE_KEY_MAX);
+        let mut k = [0u8; 16];
+        k[0] = bytes.len() as u8;
+        k[1..1 + bytes.len()].copy_from_slice(bytes);
+        k
+    }
+
+    #[inline(always)]
+    fn slot(k: &[u8; 16]) -> usize {
+        let a = u64::from_le_bytes(k[..8].try_into().unwrap());
+        let b = u64::from_le_bytes(k[8..].try_into().unwrap());
+        let h = (a ^ 0x9E37_79B9_7F4A_7C15)
+            .wrapping_mul(0xA076_1D64_78BD_642F)
+            ^ b.wrapping_mul(0xE703_7ED1_A0B4_28DB);
+        ((h ^ (h >> 32)) as usize) & CACHE_MASK
+    }
+
+    /// Look up a piece; on hit, append its tokens to `out` and return true.
+    #[inline(always)]
+    fn get(&self, bytes: &[u8], out: &mut Vec<TokenId>) -> bool {
+        let k = Self::key_block(bytes);
+        let mut i = Self::slot(&k);
+        for _ in 0..CACHE_PROBES {
+            let e = &self.entries[i];
+            if e.key == k {
+                out.extend_from_slice(&e.toks[..e.ntok as usize]);
+                return true;
+            }
+            if e.key[0] == 0 {
+                return false;
+            }
+            i = (i + 1) & CACHE_MASK;
+        }
+        false
+    }
+
+    #[inline]
+    fn insert(&mut self, bytes: &[u8], toks: &[TokenId]) {
+        if bytes.is_empty() || bytes.len() > CACHE_KEY_MAX || toks.is_empty() || toks.len() > CACHE_MAX_TOKENS {
+            return;
+        }
+        let k = Self::key_block(bytes);
+        let home = Self::slot(&k);
+        let mut i = home;
+        let mut target = home;
+        for _ in 0..CACHE_PROBES {
+            let e = &self.entries[i];
+            if e.key[0] == 0 || e.key == k {
+                target = i;
+                break;
+            }
+            i = (i + 1) & CACHE_MASK;
+        }
+        let e = &mut self.entries[target];
+        e.key = k;
+        e.ntok = toks.len() as u32;
+        e.toks[..toks.len()].copy_from_slice(toks);
+    }
+}
+
+impl Default for PretokenCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Bitfield for tracking reachable positions.
+///
+/// Inline storage for pieces up to 255 bytes (the overwhelmingly common
+/// case) — no heap allocation on the per-piece hot path.
 struct Bitfield {
-    bits: Vec<u64>,
+    bits: SmallVec<[u64; 4]>,
 }
 
 impl Bitfield {
     fn new(size: usize) -> Self {
         let num_words = (size + 63) / 64;
-        Self {
-            bits: vec![u64::MAX; num_words],
-        }
+        let mut bits = SmallVec::new();
+        bits.resize(num_words, u64::MAX);
+        Self { bits }
     }
 
     #[inline]
@@ -630,6 +775,34 @@ impl Bitfield {
 mod tests {
     use super::*;
     use crate::decoder::VocabDecoder;
+
+    #[test]
+    fn test_encode_into_with_cache_matches_encode() {
+        let base_tokens = vec![vec![b'a'], vec![b'b'], vec![b'c']];
+        let merges = vec![(0, 1), (3, 2)]; // ab, abc
+        let (encoder, _) = BacktrackingBytePairEncoder::from_merges(&merges, &base_tokens);
+        let pieces: Vec<&[u8]> = vec![
+            b"abc", b"ab", b"ba", b"cab", b"abcabcabc", b"a", b"",
+            b"cccab", // 4 tokens: too long to cache, must still be correct
+            b"abcabcabcabcabca", // 16 bytes: over the cache key limit
+        ];
+        let mut cache = PretokenCache::new();
+        // Two passes: the second pass reads entries the first pass inserted
+        for pass in 0..2 {
+            for &p in &pieces {
+                let expect = encoder.encode(p);
+                let mut got = Vec::new();
+                encoder.encode_into(p, Some(&mut cache), &mut got);
+                assert_eq!(got, expect, "pass {pass}, piece {:?}", p);
+            }
+        }
+        // And without a cache at all
+        for &p in &pieces {
+            let mut got = Vec::new();
+            encoder.encode_into(p, None, &mut got);
+            assert_eq!(got, encoder.encode(p), "no-cache piece {:?}", p);
+        }
+    }
 
     #[test]
     fn test_from_merges() {

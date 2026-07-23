@@ -366,3 +366,18 @@ def test_unigram_xlmr():
     assert len(enc.ids) > 0
     decoded = t.decode(enc.ids)
     assert "Hello world" in decoded
+
+
+def test_encoding_tokens_and_masks_correct():
+    # tokens/special_tokens_mask are computed lazily from ids — they must stay
+    # consistent with id_to_token regardless of when they're accessed
+    t = tokie.Tokenizer.from_pretrained("bert-base-uncased")
+    enc = t.encode("Hello, world!", add_special_tokens=True)
+    assert enc.tokens[0] == "[CLS]" and enc.tokens[-1] == "[SEP]"
+    assert enc.tokens == [t.id_to_token(i) for i in enc.ids]
+    assert enc.special_tokens_mask[0] == 1 and enc.special_tokens_mask[1] == 0
+    assert len(enc.special_tokens_mask) == len(enc.ids)
+    batch = t.encode_batch(["Hello there", "general Kenobi"], add_special_tokens=False)
+    for e in batch:
+        assert e.tokens == [t.id_to_token(i) for i in e.ids]
+        assert all(m == 0 for m in e.special_tokens_mask)

@@ -15,7 +15,7 @@ mod simple;
 mod unigram;
 mod wordpiece;
 
-pub use backtracking::{BacktrackingBytePairEncoder, EncodeIter};
+pub use backtracking::{BacktrackingBytePairEncoder, EncodeIter, PretokenCache};
 pub use sentencepiece::{EncodeState, SentencePieceBPE};
 pub use simple::BytePairEncoder;
 pub use unigram::UnigramEncoder;
@@ -103,6 +103,16 @@ impl Encoder {
             Encoder::WordPiece(e) => e.encode(text),
             Encoder::SentencePiece(e) => e.encode(text),
             Encoder::Unigram(e) => e.encode(text),
+        }
+    }
+
+    /// Append the encoding of one piece to `out`, using the pretoken cache
+    /// where the encoder supports it (Backtracking only).
+    #[inline]
+    pub fn encode_into(&self, text: &[u8], cache: Option<&mut PretokenCache>, out: &mut Vec<TokenId>) {
+        match self {
+            Encoder::Backtracking(e) => e.encode_into(text, cache, out),
+            _ => out.extend(self.encode(text)),
         }
     }
 

@@ -1,4 +1,4 @@
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use std::collections::HashMap;
 
@@ -13,6 +13,11 @@ fn to_py_err(e: impl std::fmt::Display) -> PyErr {
 }
 
 /// Result of encoding text, with token IDs, attention mask, and type IDs.
+///
+/// `tokens` and `special_tokens_mask` are derived lazily from `ids` on access:
+/// building per-token strings for every encoding is pure overhead for the
+/// common ids-only consumers, and it used to happen under the GIL, serially,
+/// for every batch element.
 #[pyclass(name = "Encoding")]
 #[derive(Clone)]
 struct PyEncoding {
@@ -21,14 +26,29 @@ struct PyEncoding {
     attention_mask_inner: Vec<u8>,
     type_ids_inner: Vec<u8>,
     offsets_inner: Vec<(usize, usize)>,
-    #[pyo3(get)]
-    tokens: Vec<String>,
-    #[pyo3(get)]
-    special_tokens_mask: Vec<u32>,
+    tok: Arc<RwLock<tokie_core::Tokenizer>>,
 }
 
 #[pymethods]
 impl PyEncoding {
+    #[getter]
+    fn tokens(&self) -> Vec<String> {
+        let tokenizer = self.tok.read().unwrap();
+        self.ids.iter().map(|&id| {
+            tokenizer.id_to_token(id)
+                .map(|s| s.into_owned())
+                .unwrap_or_default()
+        }).collect()
+    }
+
+    #[getter]
+    fn special_tokens_mask(&self) -> Vec<u32> {
+        let tokenizer = self.tok.read().unwrap();
+        self.ids.iter().map(|&id| {
+            if tokenizer.post_processor().is_special_token(id) { 1 } else { 0 }
+        }).collect()
+    }
+
     #[getter]
     fn attention_mask(&self) -> Vec<u32> {
         self.attention_mask_inner.iter().map(|&x| x as u32).collect()
@@ -59,24 +79,15 @@ impl PyEncoding {
 }
 
 impl PyEncoding {
-    /// Create from a core Encoding, populating tokens and special_tokens_mask
-    /// using the tokenizer.
-    fn from_encoding(enc: tokie_core::Encoding, tokenizer: &tokie_core::Tokenizer) -> Self {
-        let tokens: Vec<String> = enc.ids.iter().map(|&id| {
-            tokenizer.id_to_token(id)
-                .map(|s| s.into_owned())
-                .unwrap_or_default()
-        }).collect();
-        let special_tokens_mask: Vec<u32> = enc.ids.iter().map(|&id| {
-            if tokenizer.post_processor().is_special_token(id) { 1 } else { 0 }
-        }).collect();
+    /// Create from a core Encoding. O(1) beyond moving the buffers — token
+    /// strings and special-token masks are derived on attribute access.
+    fn from_encoding(enc: tokie_core::Encoding, tok: Arc<RwLock<tokie_core::Tokenizer>>) -> Self {
         Self {
             ids: enc.ids,
             attention_mask_inner: enc.attention_mask,
             type_ids_inner: enc.type_ids,
             offsets_inner: enc.offsets,
-            tokens,
-            special_tokens_mask,
+            tok,
         }
     }
 
@@ -85,7 +96,7 @@ impl PyEncoding {
 /// Fast, correct tokenizer. Supports BPE, WordPiece, and Unigram.
 #[pyclass(name = "Tokenizer")]
 struct PyTokenizer {
-    inner: RwLock<tokie_core::Tokenizer>,
+    inner: Arc<RwLock<tokie_core::Tokenizer>>,
 }
 
 impl PyTokenizer {
@@ -104,14 +115,14 @@ impl PyTokenizer {
     #[staticmethod]
     fn from_json(path: &str) -> PyResult<Self> {
         let inner = tokie_core::Tokenizer::from_json(path).map_err(to_py_err)?;
-        Ok(Self { inner: RwLock::new(inner) })
+        Ok(Self { inner: Arc::new(RwLock::new(inner)) })
     }
 
     /// Load a tokenizer from a .tkz binary file.
     #[staticmethod]
     fn from_file(path: &str) -> PyResult<Self> {
         let inner = tokie_core::Tokenizer::from_file(path).map_err(to_py_err)?;
-        Ok(Self { inner: RwLock::new(inner) })
+        Ok(Self { inner: Arc::new(RwLock::new(inner)) })
     }
 
     /// Download and load a tokenizer from the HuggingFace Hub.
@@ -122,7 +133,7 @@ impl PyTokenizer {
         let inner = py.allow_threads(|| {
             tokie_core::Tokenizer::from_pretrained(&repo).map_err(to_py_err)
         })?;
-        Ok(Self { inner: RwLock::new(inner) })
+        Ok(Self { inner: Arc::new(RwLock::new(inner)) })
     }
 
     /// Call the tokenizer: encode text or a text pair.
@@ -141,13 +152,13 @@ impl PyTokenizer {
                 let b = pair.to_string();
                 let inner = self.read();
                 let enc = py.allow_threads(|| inner.encode_pair(&a, &b, add_special_tokens));
-                PyEncoding::from_encoding(enc, &*inner)
+                PyEncoding::from_encoding(enc, self.inner.clone())
             }
             None => {
                 let text = text.to_string();
                 let inner = self.read();
                 let enc = py.allow_threads(|| inner.encode(&text, add_special_tokens));
-                PyEncoding::from_encoding(enc, &*inner)
+                PyEncoding::from_encoding(enc, self.inner.clone())
             }
         }
     }
@@ -158,7 +169,7 @@ impl PyTokenizer {
         let text = text.to_string();
         let inner = self.read();
         let enc = py.allow_threads(|| inner.encode(&text, add_special_tokens));
-        PyEncoding::from_encoding(enc, &*inner)
+        PyEncoding::from_encoding(enc, self.inner.clone())
     }
 
     /// Encode a pair of texts (e.g. for cross-encoder models).
@@ -174,7 +185,7 @@ impl PyTokenizer {
         let b = text_b.to_string();
         let inner = self.read();
         let enc = py.allow_threads(|| inner.encode_pair(&a, &b, add_special_tokens));
-        PyEncoding::from_encoding(enc, &*inner)
+        PyEncoding::from_encoding(enc, self.inner.clone())
     }
 
     /// Encode text into an Encoding with byte offsets into the (normalized) input.
@@ -183,7 +194,7 @@ impl PyTokenizer {
         let text = text.to_string();
         let inner = self.read();
         let enc = py.allow_threads(|| inner.encode_with_offsets(&text, add_special_tokens));
-        PyEncoding::from_encoding(enc, &*inner)
+        PyEncoding::from_encoding(enc, self.inner.clone())
     }
 
     /// Encode raw bytes into token IDs.
@@ -234,7 +245,7 @@ impl PyTokenizer {
             inner.encode_batch(&text_refs, add_special_tokens)
         });
         encodings.into_iter()
-            .map(|enc| PyEncoding::from_encoding(enc, &*inner))
+            .map(|enc| PyEncoding::from_encoding(enc, self.inner.clone()))
             .collect()
     }
 
