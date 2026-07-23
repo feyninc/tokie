@@ -233,7 +233,7 @@ struct CompiledMeta {
 /// back to the network path). Cache writes are best-effort: a read-only cache
 /// dir just means the fast path stays cold.
 fn load_or_build_compiled(json_path: &std::path::Path) -> Option<Tokenizer> {
-    let base = format!("tokenizer.compiled-v{}", env!("CARGO_PKG_VERSION"));
+    let base = format!("tokenizer.compiled-v{}-f{}", env!("CARGO_PKG_VERSION"), crate::serde::VERSION);
     let tkz = json_path.with_file_name(format!("{base}.tkz"));
     let meta = json_path.with_file_name(format!("{base}.meta.json"));
 

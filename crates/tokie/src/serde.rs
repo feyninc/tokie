@@ -49,7 +49,8 @@ use daggrs::DoubleArrayAhoCorasick;
 use foldhash::HashMap as FoldHashMap;
 
 const MAGIC: &[u8; 4] = b"TOKI";
-const VERSION: u32 = 12; // v12 adds CHARSMAP_DATA section for SentencePiece precompiled charsmaps
+/// Current .tkz format version. Public so cache layers can key artifacts by it.
+pub(crate) const VERSION: u32 = 12; // v12 adds CHARSMAP_DATA section for SentencePiece precompiled charsmaps
 const HEADER_SIZE: usize = 88;
 
 impl PretokType {
