@@ -66,12 +66,8 @@ jobs:
           cargo run --example speed_regression --release --features hf \
             > benchmark_base.json 2>benchmark_base.log || echo '{"results":[]}' > benchmark_base.json
           cat benchmark_base.log
-<<<<<<< HEAD
           git checkout --force - || true
-=======
-          git checkout -f -
           git stash pop || true
->>>>>>> origin/main
 
       - name: Compare results
         if: github.event_name == 'push' || github.event_name == 'pull_request'
