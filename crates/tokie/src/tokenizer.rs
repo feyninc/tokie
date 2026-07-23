@@ -92,6 +92,12 @@ pub struct Tokenizer {
     /// Special token metadata: maps token string -> token ID.
     /// Populated from the `added_tokens` array in tokenizer.json where `special: true`.
     special_tokens: Vec<(String, TokenId)>,
+    /// Raw added-token list backing `added_tokens_matcher`, kept for
+    /// serialization (.tkz v13+ stores added tokens in the file).
+    added_tokens_raw: Vec<(TokenId, Vec<u8>)>,
+    /// True when this tokenizer was loaded from a .tkz that carries the
+    /// added-tokens section — loaders can skip the tokenizer.json fetch.
+    added_tokens_serialized: bool,
     /// Process-unique id tagging pooled pretoken-cache contents (see
     /// `crate::pool`).
     cache_generation: u64,
@@ -119,6 +125,8 @@ impl Tokenizer {
             reverse_vocab: OnceLock::new(),
             added_tokens_matcher: None,
             special_tokens: Vec::new(),
+            added_tokens_raw: Vec::new(),
+            added_tokens_serialized: false,
             cache_generation: crate::pool::next_generation(),
         }
     }
@@ -174,6 +182,7 @@ impl Tokenizer {
         if tokens.is_empty() {
             return;
         }
+        self.added_tokens_raw = tokens.to_vec();
         let mut trie = Trie::new();
         for (id, bytes) in tokens {
             if !bytes.is_empty() {
@@ -182,6 +191,20 @@ impl Tokenizer {
         }
         trie.build(MatchKind::LeftmostLongest);
         self.added_tokens_matcher = Some(trie.compile());
+    }
+
+    /// The raw added-token list (id, bytes) backing the matcher.
+    pub fn added_tokens_raw(&self) -> &[(TokenId, Vec<u8>)] {
+        &self.added_tokens_raw
+    }
+
+    /// Whether this tokenizer came from a .tkz that stores added tokens (v13+).
+    pub fn added_tokens_serialized(&self) -> bool {
+        self.added_tokens_serialized
+    }
+
+    pub(crate) fn mark_added_tokens_serialized(&mut self) {
+        self.added_tokens_serialized = true;
     }
 
     /// Set special token metadata (token string -> ID mapping).

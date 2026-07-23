@@ -196,8 +196,10 @@ impl Tokenizer {
         // clients must keep working when hub artifacts move ahead of them.
         if let Ok(tkz_path) = repo_api.get("tokenizer.tkz") {
             if let Ok(mut tokenizer) = Self::from_file(tkz_path) {
-                // .tkz doesn't store added tokens — try to get them from tokenizer.json
-                load_added_tokens_from_json(&mut tokenizer, &repo_api);
+                // v13+ .tkz stores added tokens; older files need tokenizer.json
+                if !tokenizer.added_tokens_serialized() {
+                    load_added_tokens_from_json(&mut tokenizer, &repo_api);
+                }
                 return Ok(tokenizer);
             }
         }
@@ -208,8 +210,10 @@ impl Tokenizer {
             let tokiers_api = api.repo(tokiers_repo);
             if let Ok(tkz_path) = tokiers_api.get("tokenizer.tkz") {
                 if let Ok(mut tokenizer) = Self::from_file(tkz_path) {
-                    // Try original repo's tokenizer.json for added tokens
-                    load_added_tokens_from_json(&mut tokenizer, &repo_api);
+                    // v13+ .tkz stores added tokens; older files need tokenizer.json
+                    if !tokenizer.added_tokens_serialized() {
+                        load_added_tokens_from_json(&mut tokenizer, &repo_api);
+                    }
                     return Ok(tokenizer);
                 }
             }
@@ -240,22 +244,10 @@ struct CompiledMeta {
 fn load_or_build_compiled(json_path: &std::path::Path) -> Option<Tokenizer> {
     let base = format!("tokenizer.compiled-v{}-f{}", env!("CARGO_PKG_VERSION"), crate::serde::VERSION);
     let tkz = json_path.with_file_name(format!("{base}.tkz"));
-    let meta = json_path.with_file_name(format!("{base}.meta.json"));
 
-    if let Ok(mut tok) = Tokenizer::from_file(&tkz) {
-        if let Ok(bytes) = std::fs::read(&meta) {
-            if let Ok(m) = serde_json::from_slice::<CompiledMeta>(&bytes) {
-                if !m.added.is_empty() {
-                    tok.set_added_tokens(&m.added);
-                }
-                if !m.special.is_empty() {
-                    tok.set_special_tokens(m.special);
-                }
-                return Some(tok);
-            }
-        } else {
-            return Some(tok);
-        }
+    // v13 .tkz is self-contained (added/special tokens included)
+    if let Ok(tok) = Tokenizer::from_file(&tkz) {
+        return Some(tok);
     }
 
     // Build from json; extract added/special tokens from the same parse.
@@ -282,16 +274,13 @@ fn load_or_build_compiled(json_path: &std::path::Path) -> Option<Tokenizer> {
         tok.set_added_tokens(&m.added);
     }
     if !m.special.is_empty() {
-        tok.set_special_tokens(m.special.clone());
+        tok.set_special_tokens(m.special);
     }
 
     // Persist for next time (best effort, atomic-ish via temp + rename)
     let tmp = tkz.with_extension("tkz.tmp");
     if tok.to_file(&tmp).is_ok() {
         let _ = std::fs::rename(&tmp, &tkz);
-        if let Ok(bytes) = serde_json::to_vec(&m) {
-            let _ = std::fs::write(&meta, bytes);
-        }
     }
 
     Some(tok)
