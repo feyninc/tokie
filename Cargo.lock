@@ -1995,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "tokie"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "chunk",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "tokie-python"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "numpy",
  "pyo3",
