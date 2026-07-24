@@ -148,9 +148,23 @@ tokenizer = tokie.Tokenizer.from_file("model.tkz")
 
 `from_pretrained()` automatically tries `.tkz` first, falling back to `tokenizer.json`.
 
+### Bulk File Encoding
+
+For tokenizing large corpora, `encode_files` reads the files in Rust, splits on a separator, and encodes every document across all cores — the text never crosses the Python string boundary. It returns a flat `uint32` array of token ids plus a `uint64` array of per-document offsets (zero-copy numpy):
+
+```python
+ids, offsets = tokenizer.encode_files(["corpus.txt"], separator=b"<|endoftext|>")
+# ids: np.ndarray[uint32]  — all tokens, concatenated
+# offsets: np.ndarray[uint64] — length ndocs+1; doc i is ids[offsets[i]:offsets[i+1]]
+
+n_tokens = tokenizer.count_tokens_files(["corpus.txt"], separator=b"<|endoftext|>")
+```
+
+Output is identical to concatenating `encode_batch_flat` over the same documents; invalid UTF-8 is handled losslessly rather than raising.
+
 ## Benchmarks
 
-All benchmarks run on an Apple M3 with tokie 0.1.0. tokie produces **identical output** to HuggingFace tokenizers — every token matches, every time.
+All benchmarks run on an Apple M3 with tokie 0.1.3. tokie produces **identical output** to HuggingFace tokenizers — every token matches, every time.
 
 ### BPE Encoding (GPT-2, Llama, Qwen, ModernBERT)
 
