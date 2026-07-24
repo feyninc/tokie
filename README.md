@@ -182,6 +182,8 @@ WordPiece tokenizers use a different algorithm — greedy longest-match prefix s
 
 SentencePiece-style models use a different merge algorithm with non-topological rank orders. tokie uses a radix heap with O(1) amortized operations that exploits BPE's monotonic rank property. tokie is **2-3x faster** than HuggingFace on Gemma 3.
 
+Unigram models (T5, XLM-RoBERTa, ALBERT, and other SentencePiece-Unigram vocabularies) run their Viterbi segmentation per metaspace-delimited word unit and memoize the Zipf-frequent units, making single-string encoding **~4x** and batch encoding **~3x** faster than the whole-string Viterbi baseline, with identical output. Vocabularies containing multi-word (interior-metaspace) tokens automatically fall back to exact whole-string Viterbi.
+
 ![SentencePiece BPE speed](assets/benchmark_sentencepiece.png)
 
 ### Python Benchmarks
