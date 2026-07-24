@@ -1194,6 +1194,13 @@ fn rebuild_pair_lookup(
     let mut lookup = FoldHashMap::default();
 
     for (id, split) in splits.iter().enumerate().skip(num_base_tokens) {
+        // Split::base entries (added/special tokens, e.g. gpt2's <|endoftext|>)
+        // point at themselves and are not merges; from_json never puts them in
+        // pair_lookup, and a degenerate (id,id)->id entry would make the rank
+        // table's monotonicity check reject the whole vocab.
+        if split.left == id as TokenId && split.right == id as TokenId {
+            continue;
+        }
         lookup.insert(pack_pair(split.left, split.right), id as TokenId);
     }
 
@@ -1413,6 +1420,54 @@ mod tests {
         let (encoder, token_bytes) = BytePairEncoder::from_merges(&merges, &base_tokens);
         let decoder = Decoder::new(token_bytes);
         Tokenizer::new(Encoder::Simple(encoder), decoder, PretokType::Gpt2, Normalizer::None, PostProcessor::None)
+    }
+
+    #[test]
+    fn test_rank_table_survives_roundtrip_with_added_token() {
+        // Non-merge tokens past the base range (e.g. gpt2's <|endoftext|>) get
+        // self-referential Split::base entries; the pair_lookup rebuild must not
+        // turn those into degenerate (id,id)->id merges, or the rank table's
+        // monotonicity check rejects the whole vocab on every .tkz load.
+        let base_tokens: Vec<Vec<u8>> = (0u16..256).map(|b| vec![b as u8]).collect();
+        let merges: Vec<(TokenId, TokenId)> = vec![
+            (b'a' as u32, b'b' as u32), // 256 "ab"
+            (256, b'c' as u32),         // 257 "abc"
+        ];
+        let added = vec![(258u32, b"<|endoftext|>".to_vec())];
+        let (encoder, token_bytes) = crate::encoder::BacktrackingBytePairEncoder::from_merges_with_added(
+            &merges,
+            &base_tokens,
+            &added,
+        );
+        assert!(encoder.has_rank_merge(), "precondition: fresh build has rank table");
+
+        let decoder = Decoder::new(token_bytes);
+        let tokenizer = Tokenizer::new(
+            Encoder::Backtracking(encoder),
+            decoder,
+            PretokType::Gpt2,
+            Normalizer::None,
+            PostProcessor::None,
+        );
+
+        let mut buf = Vec::new();
+        tokenizer.save(&mut buf).expect("save failed");
+        let mut cursor = std::io::Cursor::new(&buf);
+        let loaded = Tokenizer::load(&mut cursor).expect("load failed");
+
+        match loaded.encoder() {
+            Encoder::Backtracking(enc) => {
+                assert!(
+                    enc.has_rank_merge(),
+                    "rank table must survive .tkz roundtrip when the vocab has added tokens"
+                );
+            }
+            _ => panic!("expected backtracking encoder"),
+        }
+        assert_eq!(
+            tokenizer.encode("abcab", false).ids,
+            loaded.encode("abcab", false).ids
+        );
     }
 
     #[test]
