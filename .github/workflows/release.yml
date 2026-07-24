@@ -3,6 +3,9 @@ name: Release
 on:
   release:
     types: [published]
+  # Manual trigger to (re)publish the crates.io half without rebuilding wheels
+  # or re-uploading to PyPI — the wheel/PyPI jobs are gated to the release event.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,20 +14,52 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    permissions:
+      # Required for crates.io trusted publishing: GitHub mints an OIDC token
+      # that crates-io-auth-action exchanges for a short-lived registry token.
+      # No long-lived CARGO_REGISTRY_TOKEN secret is used.
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Authenticate to crates.io (trusted publishing)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      # tokie depends on the workspace pretokie, so pretokie must reach crates.io
+      # first. We tolerate the "already published" case (idempotent re-runs) but
+      # fail loudly on any other error — a silent continue-on-error once let a
+      # 403 permissions failure pass as a green release.
       - name: Publish pretokie to crates.io
-        # tokie depends on the workspace pretokie; it must be on crates.io
-        # first. continue-on-error covers re-runs where it's already published.
-        continue-on-error: true
-        run: cargo publish -p pretokie --token ${{ secrets.CARGO_REGISTRY_TOKEN }} --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          out=$(cargo publish -p pretokie --allow-dirty 2>&1) && { echo "$out"; exit 0; }
+          echo "$out"
+          echo "$out" | grep -qiE "already (exists|uploaded)|already been uploaded|crate version .* is already" \
+            && { echo "pretokie version already on crates.io; continuing"; exit 0; }
+          echo "::error::pretokie publish failed"; exit 1
       - name: Publish tokie to crates.io
-        continue-on-error: true
-        run: cargo publish -p tokie --token ${{ secrets.CARGO_REGISTRY_TOKEN }} --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        # Retry to ride out crates.io sparse-index propagation of the pretokie
+        # version just published (tokie's dependency requirement must resolve).
+        run: |
+          for attempt in 1 2 3 4 5; do
+            out=$(cargo publish -p tokie --allow-dirty 2>&1) && { echo "$out"; exit 0; }
+            echo "$out"
+            echo "$out" | grep -qiE "already (exists|uploaded)|already been uploaded|crate version .* is already" \
+              && { echo "tokie version already on crates.io; continuing"; exit 0; }
+            if echo "$out" | grep -qiE "failed to select a version for the requirement .pretokie"; then
+              echo "pretokie not yet visible in index (attempt $attempt); retrying in 20s"; sleep 20; continue
+            fi
+            echo "::error::tokie publish failed"; exit 1
+          done
+          echo "::error::tokie publish failed after retries (pretokie never became resolvable)"; exit 1
 
   build-wheels:
+    if: github.event_name == 'release'
     name: Build wheels (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -61,6 +96,7 @@ jobs:
           path: crates/tokie-python/dist
 
   build-pyemscripten:
+    if: github.event_name == 'release'
     name: Build PyEmscripten wheel (Pyodide ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
@@ -107,6 +143,7 @@ jobs:
           path: crates/tokie-python/dist
 
   build-sdist:
+    if: github.event_name == 'release'
     name: Build source distribution
     runs-on: ubuntu-latest
     steps:
@@ -124,6 +161,7 @@ jobs:
           path: crates/tokie-python/dist
 
   upload-pypi:
+    if: github.event_name == 'release'
     name: Upload to PyPI
     needs: [build-wheels, build-pyemscripten, build-sdist]
     runs-on: ubuntu-latest
