@@ -2006,6 +2006,7 @@ dependencies = [
  "foldhash",
  "hf-hub",
  "icu_normalizer 1.5.0",
+ "libc",
  "memchr",
  "pretokie",
  "serde",

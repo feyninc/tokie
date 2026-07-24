@@ -36,6 +36,9 @@ ureq = { version = "2", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 dirs-next = { version = "2", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = "0.5"
 
