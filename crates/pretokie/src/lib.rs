@@ -18,6 +18,11 @@ pub mod util;
 
 pub use core::iter::Core;
 pub use core::mask::Mask;
+
+/// Bench-only stage hooks for the mask pipeline (hidden, semver-exempt).
+#[doc(hidden)]
+#[cfg(target_arch = "aarch64")]
+pub use core::mask::bench_internal;
 pub use configs::{Gpt2Config, Cl100kConfig, O200kConfig, VoyageConfig, SmolLMConfig, DeepSeekConfig, QwenConfig};
 
 pub type Gpt2<'a> = Mask<'a, Gpt2Config>;
