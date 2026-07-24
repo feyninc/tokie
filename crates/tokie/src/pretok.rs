@@ -134,14 +134,16 @@ impl Pretokenizer {
     #[inline]
     pub fn for_each_piece<'a, F: FnMut(&'a str)>(&'a self, text: &'a str, mut f: F) {
         match self {
-            Pretokenizer::Gpt2 => for p in pretokie::Gpt2::new(text) { f(p) },
-            Pretokenizer::Cl100k => for p in pretokie::Cl100k::new(text) { f(p) },
+            // Mask-scanner configs drain trusted boundary runs in a tight
+            // loop (bulk-emit), not one piece per Iterator::next.
+            Pretokenizer::Gpt2 => pretokie::Gpt2::new(text).for_each_piece(f),
+            Pretokenizer::Cl100k => pretokie::Cl100k::new(text).for_each_piece(f),
+            Pretokenizer::O200k => pretokie::O200k::new(text).for_each_piece(f),
+            Pretokenizer::Voyage => pretokie::Voyage::new(text).for_each_piece(f),
+            Pretokenizer::SmolLM => pretokie::SmolLM::new(text).for_each_piece(f),
+            Pretokenizer::DeepSeek => pretokie::DeepSeek::new(text).for_each_piece(f),
+            Pretokenizer::Qwen => pretokie::Qwen::new(text).for_each_piece(f),
             Pretokenizer::Bert => for p in pretokie::Bert::new(text) { f(p) },
-            Pretokenizer::O200k => for p in pretokie::O200k::new(text) { f(p) },
-            Pretokenizer::Voyage => for p in pretokie::Voyage::new(text) { f(p) },
-            Pretokenizer::SmolLM => for p in pretokie::SmolLM::new(text) { f(p) },
-            Pretokenizer::DeepSeek => for p in pretokie::DeepSeek::new(text) { f(p) },
-            Pretokenizer::Qwen => for p in pretokie::Qwen::new(text) { f(p) },
             Pretokenizer::Regex(r) => for p in r.split(text) { f(p) },
         }
     }

@@ -831,6 +831,41 @@ fn batch_masks<C: PretokConfig>(_bytes: &[u8], _scan: usize) -> (u64, u64) {
 }
 
 // =======================================================================
+// Bench-only internal hooks (not public API)
+// =======================================================================
+
+/// Stage-level access to the mask pipeline for the profiling examples.
+/// Hidden from docs; semver-exempt.
+#[doc(hidden)]
+#[cfg(target_arch = "aarch64")]
+pub mod bench_internal {
+    use crate::core::config::*;
+
+    /// Stage (a): NEON classification + movemasks only, folded to a u64
+    /// so the calls cannot be dead-code-eliminated.
+    #[inline(always)]
+    pub fn classify_fold<C: PretokConfig>(bytes: &[u8], scan: usize) -> u64 {
+        let camel = C::LETTER_MODE == LetterMode::CamelCase;
+        let want_slash = C::PUNCT_TRAILING == PunctTrailing::NewlinesAndSlashes;
+        let want_ctl = C::PUNCT_CLASS == PunctClass::PunctSymbolOnly;
+        let m = super::ascii_masks(bytes, scan, camel, want_slash, want_ctl);
+        m.l ^ m.d ^ m.s ^ m.t ^ m.n ^ m.hi ^ m.ap ^ m.lo ^ m.slash ^ m.low_ctl
+    }
+
+    /// Stages (a)+(b): the full per-batch boundary computation.
+    #[inline(always)]
+    pub fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
+        super::batch_masks::<C>(bytes, scan)
+    }
+
+    /// The scalar ground-truth advance (bad-zone executor).
+    #[inline(always)]
+    pub fn scalar_advance<C: PretokConfig>(text: &str, pos: usize) -> usize {
+        super::scalar_advance::<C>(text, pos)
+    }
+}
+
+// =======================================================================
 // The batch walker
 // =======================================================================
 
@@ -974,6 +1009,82 @@ impl MaskState {
             }
         }
     }
+
+    /// Bulk-drain variant of [`Self::next_span`]: emits every piece to `f`
+    /// as `(start, end)` byte offsets, in the same order and with the same
+    /// boundaries `next_span` would yield (identical masks, `load_segment`
+    /// segments, bad-zone re-derivation and tail). The only difference is
+    /// that a freshly loaded run of trusted boundary bits and a scalar gap
+    /// are each drained in a tight local loop instead of one piece per
+    /// call — the per-piece `Iterator::next` re-entry, the pop-vs-refill
+    /// branch retest and the `Option`/`&str` round-trip collapse, which on
+    /// OWT/gpt2 is ~half of the single-thread pretokenize cost (the mask
+    /// compute is the other half, and its one-batch-ahead precompute still
+    /// overlaps these drains). This is the bulk-encode hot loop.
+    #[inline(always)]
+    fn for_each_span<C: PretokConfig, F: FnMut(usize, usize)>(&mut self, text: &str, mut f: F) {
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        loop {
+            // Drain the whole trusted segment: `rem` holds piece-start bits
+            // with no bad byte before the next segment, so every pop is a
+            // real boundary. `pos` chains through the run.
+            while self.rem != 0 {
+                let tz = self.rem.trailing_zeros() as usize;
+                let end = self.mask_base + tz;
+                self.rem &= self.rem - 1;
+                let start = self.pos;
+                self.pos = end;
+                f(start, end);
+            }
+            // Drain the whole scalar gap (bad zone / tail) piece by piece.
+            while self.pos < self.scalar_until {
+                if self.pos >= len {
+                    return;
+                }
+                let start = self.pos;
+                let end = scalar_advance::<C>(text, start);
+                debug_assert!(end > start, "no scalar progress at {start}");
+                self.pos = end;
+                f(start, end);
+            }
+            // ---- refill: identical to next_span's tail ----
+            if self.batch_bad != 0 && self.pos < self.mask_base + 64 {
+                self.load_segment((self.pos - self.mask_base) as u32);
+                continue;
+            }
+            self.batch_bad = 0;
+            while self.scan + 64 <= self.pos {
+                self.scan += 64;
+            }
+            if self.scan + 64 > len {
+                self.scalar_until = usize::MAX;
+                continue;
+            }
+            let (usable, bad) = if self.pre_base == self.scan {
+                (self.pre_usable, self.pre_bad)
+            } else {
+                batch_masks::<C>(bytes, self.scan)
+            };
+            self.mask_base = self.scan;
+            self.scan += 64;
+            self.batch_usable = usable;
+            self.batch_bad = bad;
+            if self.scan + 64 <= len {
+                let (u2, b2) = batch_masks::<C>(bytes, self.scan);
+                self.pre_base = self.scan;
+                self.pre_usable = u2;
+                self.pre_bad = b2;
+            } else {
+                self.pre_base = usize::MAX;
+            }
+            if self.pos > self.mask_base {
+                self.load_segment((self.pos - self.mask_base) as u32);
+            } else {
+                self.load_segment(0);
+            }
+        }
+    }
 }
 
 // =======================================================================
@@ -991,6 +1102,23 @@ impl<'a, C: PretokConfig> Mask<'a, C> {
     #[inline]
     pub fn new(text: &'a str) -> Self {
         Self { text, state: MaskState::new(0), _cfg: PhantomData }
+    }
+
+    /// Visit every piece of `text` via an inline callback, byte-identical
+    /// to iterating this `Mask` to exhaustion. Drains trusted boundary
+    /// runs in a tight loop instead of one piece per `next()` — the
+    /// bulk-encode hot path (see [`MaskState::for_each_span`]). Consumes
+    /// the remaining state, so call on a freshly constructed `Mask`.
+    #[inline]
+    pub fn for_each_piece<F: FnMut(&'a str)>(&mut self, mut f: F) {
+        let text = self.text;
+        let bytes = text.as_bytes();
+        self.state.for_each_span::<C, _>(text, |start, end| {
+            debug_assert!(text.is_char_boundary(start) && text.is_char_boundary(end));
+            // SAFETY: spans come from ASCII-classified boundary bits or
+            // Core's own piece ends; both are char boundaries.
+            f(unsafe { std::str::from_utf8_unchecked(&bytes[start..end]) });
+        });
     }
 }
 
@@ -1018,6 +1146,10 @@ mod tests {
         let scalar: Vec<&str> = Core::<C>::new(text).collect();
         let masked: Vec<&str> = Mask::<C>::new(text).collect();
         assert_eq!(masked, scalar, "mask vs core mismatch on {text:?}");
+        // The bulk-drain callback path must match the iterator exactly.
+        let mut bulk: Vec<&str> = Vec::new();
+        Mask::<C>::new(text).for_each_piece(|p| bulk.push(p));
+        assert_eq!(bulk, scalar, "for_each_piece vs core mismatch on {text:?}");
     }
 
     fn check_all(text: &str) {
@@ -1143,6 +1275,19 @@ mod tests {
                     }
                     i += 1;
                 }
+                // for_each_piece must reproduce the iterator exactly.
+                let mut mask_it = Mask::<$cfg>::new(&text);
+                let mut j = 0usize;
+                Mask::<$cfg>::new(&text).for_each_piece(|b| {
+                    let a = mask_it.next();
+                    assert_eq!(
+                        a, Some(b),
+                        "{} for_each piece {j}: iter {:?} bulk {:?}",
+                        stringify!($cfg), a, b
+                    );
+                    j += 1;
+                });
+                assert_eq!(mask_it.next(), None, "{} for_each short", stringify!($cfg));
             }};
         }
         diff!(Gpt2Config);
