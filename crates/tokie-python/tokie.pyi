@@ -1,5 +1,7 @@
 from typing import Optional
 
+import numpy
+
 class Encoding:
     """Result of encoding text, with token IDs, attention mask, and type IDs."""
 
@@ -79,6 +81,24 @@ class Tokenizer:
         ...
     def count_tokens_batch(self, texts: list[str]) -> list[int]:
         """Count tokens for multiple texts in parallel."""
+        ...
+    def encode_files(
+        self,
+        paths: list[str],
+        separator: bytes = b"<|endoftext|>",
+        add_special_tokens: bool = False,
+    ) -> tuple["numpy.ndarray", "numpy.ndarray"]:
+        """Encode corpus files entirely in Rust: read bytes, split documents on
+        the separator, drop empty documents, encode in parallel. Returns
+        (ids, offsets) numpy arrays — uint32 concatenated ids and uint64
+        document boundaries of length ndocs + 1; document i is
+        ids[offsets[i]:offsets[i + 1]]. Invalid UTF-8 is lossy-converted."""
+        ...
+    def count_tokens_files(
+        self, paths: list[str], separator: bytes = b"<|endoftext|>"
+    ) -> int:
+        """Total token count across corpus files, split and encoded as in
+        encode_files, without materializing ids."""
         ...
     def save(self, path: str) -> None:
         """Save the tokenizer to a .tkz binary file."""

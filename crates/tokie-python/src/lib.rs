@@ -293,6 +293,57 @@ impl PyTokenizer {
         (ids.into_pyarray(py), lens.into_pyarray(py))
     }
 
+    /// Encode corpus files in bulk, entirely in Rust.
+    ///
+    /// Reads each file's bytes in Rust, splits every file on the
+    /// `separator` byte sequence (empty separator: one document per
+    /// file), drops empty documents — matching
+    /// `[d for d in text.split(sep) if d]` — and encodes all documents
+    /// with the parallel bulk pipeline. No text ever crosses the Python
+    /// boundary, so this is the fastest way to tokenize corpora from
+    /// disk. Documents with invalid UTF-8 are lossy-converted (invalid
+    /// sequences become U+FFFD) instead of raising.
+    ///
+    /// Returns `(ids, offsets)` as numpy arrays: `ids` is a uint32 array
+    /// of every document's token ids concatenated in order; `offsets` is
+    /// a uint64 array of `ndocs + 1` boundaries — document `i` is
+    /// `ids[offsets[i]:offsets[i + 1]]`. The Rust buffers are handed to
+    /// numpy without copying. Padding is not applied; truncation and
+    /// special tokens are (special tokens off by default).
+    #[pyo3(signature = (paths, separator=None, add_special_tokens=false))]
+    fn encode_files<'py>(
+        &self,
+        py: Python<'py>,
+        paths: Vec<std::path::PathBuf>,
+        separator: Option<Vec<u8>>,
+        add_special_tokens: bool,
+    ) -> PyResult<(Bound<'py, numpy::PyArray1<u32>>, Bound<'py, numpy::PyArray1<u64>>)> {
+        use numpy::IntoPyArray;
+        let separator = separator.unwrap_or_else(|| b"<|endoftext|>".to_vec());
+        let inner = self.read();
+        let (ids, offsets) = py.allow_threads(|| {
+            inner.encode_files_flat(&paths, &separator, add_special_tokens)
+        })?;
+        Ok((ids.into_pyarray(py), offsets.into_pyarray(py)))
+    }
+
+    /// Count tokens across corpus files without materializing ids.
+    ///
+    /// Same file reading, separator splitting, empty-document filtering,
+    /// and lossy UTF-8 handling as `encode_files`; returns the total
+    /// token count over all documents (no special tokens).
+    #[pyo3(signature = (paths, separator=None))]
+    fn count_tokens_files(
+        &self,
+        py: Python<'_>,
+        paths: Vec<std::path::PathBuf>,
+        separator: Option<Vec<u8>>,
+    ) -> PyResult<usize> {
+        let separator = separator.unwrap_or_else(|| b"<|endoftext|>".to_vec());
+        let inner = self.read();
+        Ok(py.allow_threads(|| inner.count_tokens_files(&paths, &separator))?)
+    }
+
     /// Count the number of tokens in the text.
     fn count_tokens(&self, py: Python<'_>, text: &str) -> usize {
         let text = text.to_string();
