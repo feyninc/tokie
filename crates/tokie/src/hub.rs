@@ -229,11 +229,11 @@ impl Tokenizer {
     }
 }
 
-/// Sidecar metadata stored beside the compiled .tkz (added/special tokens are
-/// not part of the .tkz format).
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+/// Added/special token metadata extracted from tokenizer.json while building
+/// the compiled .tkz.
+#[derive(Default)]
 struct CompiledMeta {
-    added: Vec<(crate::types::TokenId, Vec<u8>)>,
+    added: Vec<crate::tokenizer::AddedTokenSpec>,
     special: Vec<(String, crate::types::TokenId)>,
 }
 
@@ -255,20 +255,13 @@ fn load_or_build_compiled(json_path: &std::path::Path) -> Option<Tokenizer> {
     let mut tok = Tokenizer::from_json(json_path).ok()?;
     let mut m = CompiledMeta::default();
     if let Ok(data) = serde_json::from_slice::<serde_json::Value>(&json_bytes) {
-        if let Some(added) = data["added_tokens"].as_array() {
-            for token in added {
-                let (Some(id), Some(content)) = (token["id"].as_u64(), token["content"].as_str()) else {
-                    continue;
-                };
-                let id = id as crate::types::TokenId;
-                if content.len() >= 2 {
-                    m.added.push((id, content.as_bytes().to_vec()));
-                }
-                if token["special"].as_bool().unwrap_or(false) {
-                    m.special.push((content.to_string(), id));
-                }
-            }
-        }
+        m.added = crate::hf::extract_added_token_specs(&data);
+        m.special = m
+            .added
+            .iter()
+            .filter(|t| t.special)
+            .filter_map(|t| String::from_utf8(t.bytes.clone()).ok().map(|s| (s, t.id)))
+            .collect();
     }
     if !m.added.is_empty() {
         tok.set_added_tokens(&m.added);
@@ -294,28 +287,16 @@ fn load_added_tokens_from_json(tokenizer: &mut Tokenizer, repo_api: &hf_hub::api
     let Ok(json_bytes) = std::fs::read(&json_path) else { return };
     let Ok(data) = serde_json::from_slice::<serde_json::Value>(&json_bytes) else { return };
 
-    let Some(added) = data["added_tokens"].as_array() else { return };
-    let tokens: Vec<(crate::types::TokenId, Vec<u8>)> = added.iter().filter_map(|token| {
-        let id = token["id"].as_u64()? as crate::types::TokenId;
-        let content = token["content"].as_str()?;
-        if content.len() < 2 {
-            return None;
-        }
-        Some((id, content.as_bytes().to_vec()))
-    }).collect();
+    let tokens = crate::hf::extract_added_token_specs(&data);
+    let special: Vec<(String, crate::types::TokenId)> = tokens
+        .iter()
+        .filter(|t| t.special)
+        .filter_map(|t| String::from_utf8(t.bytes.clone()).ok().map(|s| (s, t.id)))
+        .collect();
 
     if !tokens.is_empty() {
         tokenizer.set_added_tokens(&tokens);
     }
-
-    // Also load special token metadata
-    let special: Vec<(String, crate::types::TokenId)> = added.iter().filter_map(|token| {
-        let special = token["special"].as_bool().unwrap_or(false);
-        if !special { return None; }
-        let id = token["id"].as_u64()? as crate::types::TokenId;
-        let content = token["content"].as_str()?;
-        Some((content.to_string(), id))
-    }).collect();
     if !special.is_empty() {
         tokenizer.set_special_tokens(special);
     }

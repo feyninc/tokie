@@ -52,6 +52,105 @@ use crate::types::TokenId;
 /// Backward-compatible alias for [`Encoding`].
 pub type EncodingPair = Encoding;
 
+/// One added-token entry with its HuggingFace matching flags.
+///
+/// HF's `AddedVocabulary` honors per-token flags when scanning for added
+/// tokens (`tokenizers/src/tokenizer/added_vocabulary.rs`):
+/// - `lstrip`/`rstrip`: the match extends over adjacent whitespace, which is
+///   consumed (e.g. roberta's `<mask>` has `lstrip` and swallows the space
+///   before it).
+/// - `normalized`: the token is matched *after* normalization, against the
+///   normalizer-transformed pattern (voyage-2's `</s>` matches as `▁</s>`).
+///   Non-normalized tokens are matched on the raw input first.
+/// - `single_word`: the match is dropped when adjacent to a word character.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddedTokenSpec {
+    pub id: TokenId,
+    pub bytes: Vec<u8>,
+    pub special: bool,
+    pub lstrip: bool,
+    pub rstrip: bool,
+    pub normalized: bool,
+    pub single_word: bool,
+}
+
+impl AddedTokenSpec {
+    /// A plain added token with all flags off (pre-flag behavior).
+    pub fn plain(id: TokenId, bytes: Vec<u8>) -> Self {
+        Self { id, bytes, special: false, lstrip: false, rstrip: false, normalized: false, single_word: false }
+    }
+}
+
+/// Split `text` at added-token matches, honoring per-token flags.
+///
+/// Port of HF's `AddedVocabulary::find_matches`: the DAAC yields
+/// leftmost-longest matches; `single_word` drops matches adjacent to word
+/// characters, `lstrip`/`rstrip` extend the match over neighboring
+/// whitespace (which is consumed — the emitted token is just the id).
+/// Returns `(Some(spec_index), byte_range)` for added tokens and
+/// `(None, byte_range)` for the text in between, covering all of `text`.
+fn split_on_added(
+    text: &str,
+    matcher: &DoubleArrayAhoCorasick,
+    specs: &[AddedTokenSpec],
+) -> Vec<(Option<usize>, std::ops::Range<usize>)> {
+    let bytes = text.as_bytes();
+    let mut splits = Vec::new();
+    let mut pos = 0usize;
+
+    for m in matcher.find_iter(bytes) {
+        let spec = &specs[m.pattern_id as usize];
+        let mut start = m.start;
+        let mut stop = m.end;
+
+        if spec.single_word {
+            let start_ok = start == 0
+                || !text[..start].chars().next_back().is_some_and(is_word_char);
+            let stop_ok = stop == text.len()
+                || !text[stop..].chars().next().is_some_and(is_word_char);
+            if !(start_ok && stop_ok) {
+                continue;
+            }
+        }
+        if spec.lstrip {
+            // Leftmost byte of the whitespace run ending at `start`, clamped
+            // so a previous match's consumed whitespace isn't re-consumed.
+            let ws_start = text[..start]
+                .char_indices()
+                .rev()
+                .take_while(|(_, c)| c.is_whitespace())
+                .last()
+                .map_or(start, |(i, _)| i);
+            start = ws_start.max(pos);
+        }
+        if spec.rstrip {
+            let ws_len = text[stop..]
+                .char_indices()
+                .take_while(|(_, c)| c.is_whitespace())
+                .last()
+                .map_or(0, |(i, c)| i + c.len_utf8());
+            stop += ws_len;
+        }
+
+        if pos < start {
+            splits.push((None, pos..start));
+        }
+        splits.push((Some(m.pattern_id as usize), start..stop));
+        pos = stop;
+    }
+
+    if pos < text.len() {
+        splits.push((None, pos..text.len()));
+    }
+    splits
+}
+
+/// Approximation of the regex `\w` class HF uses for `single_word`
+/// boundaries: alphanumerics plus underscore.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 /// Cached number of available CPU cores.
 fn num_cpus() -> usize {
     static CPUS: OnceLock<usize> = OnceLock::new();
@@ -86,15 +185,20 @@ pub struct Tokenizer {
     /// Runtime config, not serialized.
     truncation: Option<TruncationParams>,
     reverse_vocab: OnceLock<FoldHashMap<String, TokenId>>,
-    /// DAAC matcher for added tokens (special and non-special).
-    /// HF scans for these BEFORE pretokenization, splitting text at their boundaries.
-    added_tokens_matcher: Option<DoubleArrayAhoCorasick>,
+    /// DAAC matcher for non-normalized added tokens, matched on the raw
+    /// input BEFORE normalization/pretokenization, like HF's `split_trie`.
+    /// Pattern values index into `added_tokens_raw`.
+    raw_added_matcher: Option<DoubleArrayAhoCorasick>,
+    /// DAAC matcher for `normalized: true` added tokens, matched on each
+    /// normalized segment like HF's `split_normalized_trie`. Patterns are the
+    /// normalizer-transformed token contents; values index `added_tokens_raw`.
+    norm_added_matcher: Option<DoubleArrayAhoCorasick>,
     /// Special token metadata: maps token string -> token ID.
     /// Populated from the `added_tokens` array in tokenizer.json where `special: true`.
     special_tokens: Vec<(String, TokenId)>,
-    /// Raw added-token list backing `added_tokens_matcher`, kept for
-    /// serialization (.tkz v13+ stores added tokens in the file).
-    added_tokens_raw: Vec<(TokenId, Vec<u8>)>,
+    /// Added-token list backing the matchers, kept for serialization
+    /// (.tkz v13+ stores added tokens in the file).
+    added_tokens_raw: Vec<AddedTokenSpec>,
     /// True when this tokenizer was loaded from a .tkz that carries the
     /// added-tokens section — loaders can skip the tokenizer.json fetch.
     added_tokens_serialized: bool,
@@ -123,7 +227,8 @@ impl Tokenizer {
             padding: None,
             truncation: None,
             reverse_vocab: OnceLock::new(),
-            added_tokens_matcher: None,
+            raw_added_matcher: None,
+            norm_added_matcher: None,
             special_tokens: Vec::new(),
             added_tokens_raw: Vec::new(),
             added_tokens_serialized: false,
@@ -177,24 +282,63 @@ impl Tokenizer {
         results.into_iter().map(|r| r.unwrap()).collect()
     }
 
-    /// Set added tokens matcher. These are matched BEFORE pretokenization, like HuggingFace does.
-    pub fn set_added_tokens(&mut self, tokens: &[(TokenId, Vec<u8>)]) {
+    /// Set added tokens. Non-normalized tokens are matched on the raw input
+    /// before pretokenization; `normalized: true` tokens are matched on each
+    /// normalized segment against their normalizer-transformed pattern, both
+    /// like HuggingFace. Call this after the normalizer is in place — the
+    /// normalized patterns are computed with `self.normalizer`.
+    pub fn set_added_tokens(&mut self, tokens: &[AddedTokenSpec]) {
         if tokens.is_empty() {
             return;
         }
         self.added_tokens_raw = tokens.to_vec();
-        let mut trie = Trie::new();
-        for (id, bytes) in tokens {
-            if !bytes.is_empty() {
-                trie.add(bytes, *id);
+        let mut raw_trie = Trie::new();
+        let mut norm_trie = Trie::new();
+        let (mut raw_count, mut norm_count) = (0usize, 0usize);
+        for (idx, tok) in tokens.iter().enumerate() {
+            if tok.bytes.is_empty() {
+                continue;
+            }
+            // Skip single-byte tokens that plain encoding already maps to
+            // the same id — matching them in the DAAC would add overhead
+            // with no benefit. Single-byte tokens that encode differently
+            // (out-of-vocab remaps) must stay in the matcher.
+            if tok.bytes.len() == 1 && self.encoder.encode(&tok.bytes) == [tok.id] {
+                continue;
+            }
+            if tok.normalized {
+                // HF builds the normalized trie from normalizer(content).
+                // Non-UTF-8 contents can't be normalized; match them raw.
+                match std::str::from_utf8(&tok.bytes) {
+                    Ok(s) => {
+                        let pattern = self.normalizer.normalize(s);
+                        if !pattern.is_empty() {
+                            norm_trie.add(pattern.as_ref().as_bytes(), idx as u32);
+                            norm_count += 1;
+                        }
+                    }
+                    Err(_) => {
+                        raw_trie.add(&tok.bytes, idx as u32);
+                        raw_count += 1;
+                    }
+                }
+            } else {
+                raw_trie.add(&tok.bytes, idx as u32);
+                raw_count += 1;
             }
         }
-        trie.build(MatchKind::LeftmostLongest);
-        self.added_tokens_matcher = Some(trie.compile());
+        self.raw_added_matcher = (raw_count > 0).then(|| {
+            raw_trie.build(MatchKind::LeftmostLongest);
+            raw_trie.compile()
+        });
+        self.norm_added_matcher = (norm_count > 0).then(|| {
+            norm_trie.build(MatchKind::LeftmostLongest);
+            norm_trie.compile()
+        });
     }
 
-    /// The raw added-token list (id, bytes) backing the matcher.
-    pub fn added_tokens_raw(&self) -> &[(TokenId, Vec<u8>)] {
+    /// The added-token list backing the matchers.
+    pub fn added_tokens_raw(&self) -> &[AddedTokenSpec] {
         &self.added_tokens_raw
     }
 
@@ -518,44 +662,100 @@ impl Tokenizer {
     }
 
     fn encode_raw_ctx(&self, text: &str, cache: Option<&mut PretokenCache>) -> Vec<TokenId> {
-        // If there are non-special added tokens, split the text at their boundaries first.
+        // If there are added tokens, split the text at their boundaries first.
         // HuggingFace scans for added tokens BEFORE pretokenization.
-        if let Some(ref matcher) = self.added_tokens_matcher {
-            return self.encode_with_added_tokens(text, matcher, cache);
+        if self.raw_added_matcher.is_some() || self.norm_added_matcher.is_some() {
+            return self.encode_with_added_tokens(text, cache);
         }
 
         self.encode_raw_inner(text, cache)
     }
 
     /// Encode text after splitting at added token boundaries.
+    ///
+    /// Mirrors HF's `AddedVocabulary::extract_and_normalize` two-stage split:
+    /// 1. the raw input is split on non-normalized added tokens;
+    /// 2. each remaining segment is normalized (position-aware for the
+    ///    metaspace prepend) and split on the normalized-token patterns;
+    ///    the leftover pieces are encoded without being normalized again.
     fn encode_with_added_tokens(
         &self,
         text: &str,
-        matcher: &DoubleArrayAhoCorasick,
         mut cache: Option<&mut PretokenCache>,
     ) -> Vec<TokenId> {
-        let bytes = text.as_bytes();
         let mut result = Vec::new();
-        let mut pos = 0;
 
-        for m in matcher.find_iter(bytes) {
-            // Encode text before this added token
-            if m.start > pos {
-                let segment = &text[pos..m.start];
-                result.extend(self.encode_raw_inner(segment, cache.as_deref_mut()));
+        let raw_splits = match &self.raw_added_matcher {
+            Some(matcher) => split_on_added(text, matcher, &self.added_tokens_raw),
+            None => vec![(None, 0..text.len())],
+        };
+
+        for (spec_idx, range) in raw_splits {
+            if let Some(idx) = spec_idx {
+                result.push(self.added_tokens_raw[idx].id);
+                continue;
             }
-            // Insert the added token directly
-            result.push(m.pattern_id);
-            pos = m.end;
-        }
+            let segment = &text[range.clone()];
+            if segment.is_empty() {
+                continue;
+            }
+            // Only the segment at byte 0 of the original input counts as
+            // "first" (HF Metaspace prepend_scheme=first checks the
+            // original offset).
+            let first_segment = range.start == 0;
 
-        // Encode remaining text after last added token
-        if pos < text.len() {
-            let segment = &text[pos..];
-            result.extend(self.encode_raw_inner(segment, cache));
+            match &self.norm_added_matcher {
+                None => {
+                    result.extend(self.encode_segment(segment, first_segment, cache.as_deref_mut()));
+                }
+                Some(matcher) => {
+                    let normalized = self.normalizer.normalize_segment(segment, first_segment);
+                    for (nidx, nrange) in
+                        split_on_added(normalized.as_ref(), matcher, &self.added_tokens_raw)
+                    {
+                        if let Some(idx) = nidx {
+                            result.push(self.added_tokens_raw[idx].id);
+                            continue;
+                        }
+                        let piece = &normalized[nrange];
+                        if !piece.is_empty() {
+                            result.extend(self.encode_prenormalized(piece, cache.as_deref_mut()));
+                        }
+                    }
+                }
+            }
         }
 
         result
+    }
+
+    /// Encode one raw segment of an added-token split, normalizing it with
+    /// segment-position awareness.
+    fn encode_segment(
+        &self,
+        segment: &str,
+        first_segment: bool,
+        cache: Option<&mut PretokenCache>,
+    ) -> Vec<TokenId> {
+        if self.pretokenizer.is_none() {
+            let normalized = self.normalizer.normalize_segment(segment, first_segment);
+            return self.encoder.encode(normalized.as_ref().as_bytes());
+        }
+        // Models with a pretokenizer never use position-aware metaspace
+        // prepending, so the standard path (with its parallel branch for
+        // large segments) is equivalent.
+        self.encode_raw_inner(segment, cache)
+    }
+
+    /// Encode an already-normalized piece (stage 2 of the added-token split).
+    fn encode_prenormalized(&self, piece: &str, cache: Option<&mut PretokenCache>) -> Vec<TokenId> {
+        if self.pretokenizer.is_none() {
+            return self.encoder.encode(piece.as_bytes());
+        }
+        // Pretokenizer models pair with idempotent normalizers (None, NFC,
+        // Bert clean-text), so re-normalizing in the standard path is a
+        // no-op and keeps the parallel branch for large pieces.
+        self.encode_raw_inner(piece, cache)
     }
 
     /// Inner encoding without added token splitting.
@@ -730,6 +930,19 @@ impl Tokenizer {
     /// Encode raw bytes directly (bypasses pretokenizer and normalizer).
     pub fn encode_bytes(&self, bytes: &[u8]) -> Vec<TokenId> {
         self.encoder.encode(bytes)
+    }
+
+    /// Split `text` at added-token matches, honoring per-token flags.
+    /// Exposed for tests; see [`split_on_added`].
+    #[doc(hidden)]
+    pub fn debug_split_added(&self, text: &str) -> Vec<(Option<TokenId>, std::ops::Range<usize>)> {
+        match &self.raw_added_matcher {
+            Some(m) => split_on_added(text, m, &self.added_tokens_raw)
+                .into_iter()
+                .map(|(idx, r)| (idx.map(|i| self.added_tokens_raw[i].id), r))
+                .collect(),
+            None => vec![(None, 0..text.len())],
+        }
     }
 
     /// Streaming iterator over encoded tokens.

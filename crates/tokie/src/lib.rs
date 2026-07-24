@@ -77,12 +77,12 @@ pub use hf::JsonLoadError;
 pub use hub::{FromPretrainedOptions, HubError};
 #[cfg(feature = "build")]
 pub use build::{BuildError, ConvertResult, VerifyResult, Mismatch};
-pub use normalizer::{bert_uncased_normalize, clean_text, fnr, metaspace_normalize, strip_accents, FnrFinder, Normalizer};
+pub use normalizer::{bert_uncased_normalize, clean_text, fnr, metaspace_normalize, strip_accents, FnrFinder, MetaspacePrepend, Normalizer};
 pub use padding::{Encoding, PaddingParams, PaddingStrategy, PaddingDirection, TruncationParams, TruncationStrategy, TruncationDirection};
 pub use postprocessor::PostProcessor;
 pub use pretok::{PretokType, Pretokenizer, RegexPretok};
 pub use serde::SerdeError;
-pub use tokenizer::{EncodingPair, TokenCount, Tokenizer, TokenizeIter};
+pub use tokenizer::{AddedTokenSpec, EncodingPair, TokenCount, Tokenizer, TokenizeIter};
 pub use types::TokenId;
 
 // Backward compatibility aliases

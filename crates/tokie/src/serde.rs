@@ -43,7 +43,7 @@ use crate::decoder::{Decoder, DecoderType, VocabDecoder};
 use crate::normalizer::Normalizer;
 use crate::postprocessor::PostProcessor;
 use crate::pretok::PretokType;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{AddedTokenSpec, Tokenizer};
 use crate::types::{Split, TokenId};
 use daggrs::DoubleArrayAhoCorasick;
 use foldhash::HashMap as FoldHashMap;
@@ -75,42 +75,51 @@ impl PretokType {
 }
 
 impl Normalizer {
-    /// Type id 8 (SentencePiecePrecompiled) is not constructible here — it
-    /// needs the CHARSMAP_DATA section, handled in `Tokenizer::load`.
+    /// Charsmap-backed ids (8, 9, 12) are not constructible here — they
+    /// need the CHARSMAP_DATA section, handled in `Tokenizer::load`.
     fn from_u32(v: u32) -> Option<Self> {
+        use crate::normalizer::MetaspacePrepend;
         match v {
             0 => Some(Self::None),
             1 => Some(Self::BertUncased),
             2 => Some(Self::BertCased),
             3 => Some(Self::Nfc),
-            4 => Some(Self::Metaspace),
+            4 => Some(Self::Metaspace(MetaspacePrepend::Unconditional)),
             5 => Some(Self::SentencePiece),
             6 => Some(Self::SentencePieceLowercase),
             7 => Some(Self::MetaspaceReplace),
+            10 => Some(Self::Metaspace(MetaspacePrepend::IfNotSpaceLed)),
+            11 => Some(Self::Metaspace(MetaspacePrepend::FirstSegment)),
             _ => None,
         }
     }
 
     fn to_u32(&self) -> u32 {
+        use crate::normalizer::MetaspacePrepend;
         match self {
             Self::None => 0,
             Self::BertUncased => 1,
             Self::BertCased => 2,
             Self::Nfc => 3,
-            Self::Metaspace => 4,
+            Self::Metaspace(MetaspacePrepend::Unconditional) => 4,
             Self::SentencePiece => 5,
             Self::SentencePieceLowercase => 6,
             Self::MetaspaceReplace => 7,
             Self::SentencePiecePrecompiled { whitespace_split: true, .. } => 8,
             Self::SentencePiecePrecompiled { whitespace_split: false, .. } => 9,
+            Self::Metaspace(MetaspacePrepend::IfNotSpaceLed) => 10,
+            Self::Metaspace(MetaspacePrepend::FirstSegment) => 11,
+            Self::SentencePiecePunctPad { .. } => 12,
         }
     }
 }
 
 /// Precompiled-charsmap normalizer ids (need the CHARSMAP_DATA section):
-/// 8 = with WhitespaceSplit (XLM-R/T5), 9 = Metaspace-only (bge-m3 family).
+/// 8 = with WhitespaceSplit (XLM-R/T5), 9 = Metaspace-only (bge-m3 family),
+/// 12 = punctuation-padding chain (potion-multilingual).
 const NORMALIZER_SP_PRECOMPILED_WS: u32 = 8;
 const NORMALIZER_SP_PRECOMPILED_META: u32 = 9;
+const NORMALIZER_SP_PUNCT_PAD: u32 = 12;
 
 impl PostProcessor {
     fn type_id(&self) -> u32 {
@@ -324,7 +333,8 @@ impl Tokenizer {
 
         // Serialize charsmap (raw precompiled_charsmap blob, v12+)
         let charsmap_data: &[u8] = match normalizer {
-            Normalizer::SentencePiecePrecompiled { charsmap, .. } => charsmap.blob(),
+            Normalizer::SentencePiecePrecompiled { charsmap, .. }
+            | Normalizer::SentencePiecePunctPad { charsmap } => charsmap.blob(),
             _ => &[],
         };
 
@@ -440,9 +450,10 @@ impl Tokenizer {
             .ok_or(SerdeError::InvalidPretokenizer(pretokenizer_type))?;
 
         let normalizer_type = u32::from_le_bytes(data[16..20].try_into().unwrap());
-        // SentencePiecePrecompiled needs the CHARSMAP_DATA section; built below.
+        // Charsmap-backed normalizers need the CHARSMAP_DATA section; built below.
         let normalizer = if normalizer_type == NORMALIZER_SP_PRECOMPILED_WS
             || normalizer_type == NORMALIZER_SP_PRECOMPILED_META
+            || normalizer_type == NORMALIZER_SP_PUNCT_PAD
         {
             None
         } else {
@@ -546,9 +557,14 @@ impl Tokenizer {
             None => {
                 let charsmap = PrecompiledCharsmap::from_blob(charsmap_data)
                     .map_err(|_| SerdeError::InvalidData("invalid precompiled charsmap"))?;
-                Normalizer::SentencePiecePrecompiled {
-                    charsmap: std::sync::Arc::new(charsmap),
-                    whitespace_split: normalizer_type == NORMALIZER_SP_PRECOMPILED_WS,
+                let charsmap = std::sync::Arc::new(charsmap);
+                if normalizer_type == NORMALIZER_SP_PUNCT_PAD {
+                    Normalizer::SentencePiecePunctPad { charsmap }
+                } else {
+                    Normalizer::SentencePiecePrecompiled {
+                        charsmap,
+                        whitespace_split: normalizer_type == NORMALIZER_SP_PRECOMPILED_WS,
+                    }
                 }
             }
         };
@@ -718,21 +734,44 @@ impl Tokenizer {
 
 /// Serialize added/special tokens (v13 ADDED_TOKENS section).
 ///
-/// Entries: added tokens (flags bit0 = special), plus any special tokens that
-/// are not in the added list (flags bit1 = metadata-only, excluded from the
-/// matcher).
+/// Entries: added tokens, plus any special tokens that are not in the added
+/// list (flags bit1 = metadata-only, excluded from the matcher).
+///
+/// Flags byte: bit0 = special, bit1 = metadata-only, bit2 = lstrip,
+/// bit3 = rstrip, bit4 = normalized, bit5 = single_word. Files written
+/// before the flag bits existed have bits 2-5 zero, which deserializes to
+/// the pre-flag matching behavior.
 fn serialize_added_tokens(
-    added: &[(TokenId, Vec<u8>)],
+    added: &[AddedTokenSpec],
     specials: &[(String, TokenId)],
 ) -> Vec<u8> {
-    let is_special =
-        |id: TokenId, bytes: &[u8]| specials.iter().any(|(s, sid)| *sid == id && s.as_bytes() == bytes);
+    let is_special = |id: TokenId, bytes: &[u8]| {
+        specials.iter().any(|(s, sid)| *sid == id && s.as_bytes() == bytes)
+    };
     let mut entries: Vec<(TokenId, &[u8], u8)> = added
         .iter()
-        .map(|(id, b)| (*id, b.as_slice(), if is_special(*id, b) { 0b01 } else { 0 }))
+        .map(|t| {
+            let mut flags = 0u8;
+            if t.special || is_special(t.id, &t.bytes) {
+                flags |= 0b0000_0001;
+            }
+            if t.lstrip {
+                flags |= 0b0000_0100;
+            }
+            if t.rstrip {
+                flags |= 0b0000_1000;
+            }
+            if t.normalized {
+                flags |= 0b0001_0000;
+            }
+            if t.single_word {
+                flags |= 0b0010_0000;
+            }
+            (t.id, t.bytes.as_slice(), flags)
+        })
         .collect();
     for (s, id) in specials {
-        if !added.iter().any(|(aid, ab)| aid == id && ab.as_slice() == s.as_bytes()) {
+        if !added.iter().any(|t| t.id == *id && t.bytes == s.as_bytes()) {
             entries.push((*id, s.as_bytes(), 0b11));
         }
     }
@@ -750,7 +789,7 @@ fn serialize_added_tokens(
 #[allow(clippy::type_complexity)]
 fn deserialize_added_tokens(
     data: &[u8],
-) -> Result<(Vec<(TokenId, Vec<u8>)>, Vec<(String, TokenId)>), SerdeError> {
+) -> Result<(Vec<AddedTokenSpec>, Vec<(String, TokenId)>), SerdeError> {
     if data.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -774,10 +813,19 @@ fn deserialize_added_tokens(
         }
         let bytes = data[pos..pos + len].to_vec();
         pos += len;
-        if flags & 0b10 == 0 {
-            added.push((id, bytes.clone()));
+        let special = flags & 0b0000_0001 != 0;
+        if flags & 0b0000_0010 == 0 {
+            added.push(AddedTokenSpec {
+                id,
+                bytes: bytes.clone(),
+                special,
+                lstrip: flags & 0b0000_0100 != 0,
+                rstrip: flags & 0b0000_1000 != 0,
+                normalized: flags & 0b0001_0000 != 0,
+                single_word: flags & 0b0010_0000 != 0,
+            });
         }
-        if flags & 0b01 != 0 {
+        if special {
             if let Ok(s) = String::from_utf8(bytes) {
                 specials.push((s, id));
             }
@@ -1288,7 +1336,16 @@ mod tests {
     #[test]
     fn test_added_tokens_roundtrip() {
         let mut tok = make_test_tokenizer();
-        tok.set_added_tokens(&[(300, b"<|special|>".to_vec()), (301, b"<mask>".to_vec())]);
+        tok.set_added_tokens(&[
+            AddedTokenSpec { special: true, ..AddedTokenSpec::plain(300, b"<|special|>".to_vec()) },
+            AddedTokenSpec {
+                lstrip: true,
+                rstrip: true,
+                normalized: false,
+                single_word: true,
+                ..AddedTokenSpec::plain(301, b"<mask>".to_vec())
+            },
+        ]);
         tok.set_special_tokens(vec![("<|special|>".to_string(), 300)]);
         let path = std::env::temp_dir().join("tokie_added_tokens_roundtrip.tkz");
         tok.to_file(&path).unwrap();

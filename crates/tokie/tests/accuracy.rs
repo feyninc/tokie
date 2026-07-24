@@ -229,6 +229,102 @@ accuracy_test!(qwen3_5_0_8b,            "tokiers/Qwen3.5-0.8B",                 
 accuracy_test!(qwen3_5_4b,              "tokiers/Qwen3.5-4B",                       "Qwen/Qwen3.5-4B");
 
 // ============================================================================
+// Added-token probe accuracy — interleaves every added token with plain text,
+// exercising the per-token flags (lstrip/rstrip/normalized/single_word), the
+// HF id reassignment, and the per-segment metaspace prepend semantics. These
+// held 13 repos out of the v13 regeneration; keep them loud.
+// ============================================================================
+
+/// A probe string interleaving the model's added tokens with normal text,
+/// mirroring scripts/regen_tokiers_v13.py.
+fn added_token_probe(hf: &HfTokenizer) -> String {
+    let mut added: Vec<(u32, String)> = hf
+        .get_added_tokens_decoder()
+        .into_iter()
+        .map(|(id, tok)| (id, tok.content))
+        .collect();
+    added.sort();
+    let mut parts = vec!["The quick brown fox".to_string()];
+    for (_, content) in added.into_iter().take(40) {
+        parts.push(content);
+        parts.push("jumps over 123 dogs".to_string());
+    }
+    parts.join(" ")
+}
+
+/// Compare tokie against HF on the added-token probe plus a set of edge-case
+/// strings around the first special token.
+fn compare_added_token_probe(hf_model: &str) {
+    let tok = Tokenizer::from_pretrained(hf_model)
+        .unwrap_or_else(|e| panic!("Failed to load tokie {hf_model}: {e}"));
+    let mut hf = HfTokenizer::from_pretrained(hf_model, None)
+        .unwrap_or_else(|e| panic!("Failed to load HF {hf_model}: {e}"));
+    let _ = hf.with_truncation(None);
+    hf.with_padding(None);
+
+    let mut cases = vec![added_token_probe(&hf), " leading space".into(), "trailing space ".into()];
+    if let Some((_, first_special)) = hf
+        .get_added_tokens_decoder()
+        .into_iter()
+        .filter(|(_, t)| t.special)
+        .map(|(id, t)| (id, t.content))
+        .min()
+    {
+        let s = first_special;
+        cases.extend([
+            format!("Hello {s} world"),
+            format!("Hello {s}world"),
+            format!("Hello{s} world"),
+            format!("{s} lead"),
+            format!("tail {s}"),
+            format!("a  {s}  b"),
+            s,
+        ]);
+    }
+    for text in &cases {
+        let tokie_ids = tok.encode(text, false).ids;
+        let hf_enc = hf
+            .encode(text.as_str(), false)
+            .unwrap_or_else(|e| panic!("HF encode failed for {hf_model}: {e}"));
+        assert_eq!(
+            tokie_ids.as_slice(),
+            hf_enc.get_ids(),
+            "added-token probe mismatch for {hf_model} on {text:?}"
+        );
+    }
+}
+
+macro_rules! probe_test {
+    ($name:ident, $hf:expr) => {
+        #[test]
+        #[ignore] // Requires network
+        fn $name() {
+            compare_added_token_probe($hf);
+        }
+    };
+}
+
+// The 13 repos held back from the v13 regeneration:
+probe_test!(probe_roberta_base,        "FacebookAI/roberta-base");                       // <mask> lstrip
+probe_test!(probe_modernbert_base,     "answerdotai/ModernBERT-base");                   // <mask> lstrip + NFC
+probe_test!(probe_jina_v2_base_code,   "jinaai/jina-embeddings-v2-base-code");           // <mask> lstrip
+probe_test!(probe_bge_m3,              "BAAI/bge-m3");                                   // <mask> lstrip, SP
+probe_test!(probe_snowflake_arctic_v2, "Snowflake/snowflake-arctic-embed-l-v2.0");       // <mask> lstrip, SP
+probe_test!(probe_mxbai_de,            "mixedbread-ai/deepset-mxbai-embed-de-large-v1"); // stale ids remapped by HF
+probe_test!(probe_mistral_7b,          "mistralai/Mistral-7B-v0.1");                     // Metaspace prepend_scheme=first
+probe_test!(probe_phi_3_mini,          "microsoft/Phi-3-mini-4k-instruct");              // rstrip specials
+probe_test!(probe_voyage_code_2,       "voyageai/voyage-code-2");                        // normalized specials (▁-fused)
+probe_test!(probe_voyage_law_2,        "voyageai/voyage-law-2");                         // normalized specials (▁-fused)
+probe_test!(probe_voyage_finance_2,    "voyageai/voyage-finance-2");                     // mixed normalized specials
+probe_test!(probe_voyage_multi_2,      "voyageai/voyage-multilingual-2");                // mixed normalized specials
+probe_test!(probe_potion_multilingual, "minishlab/potion-multilingual-128M");            // punct-pad normalizer chain
+
+// Regression guards: models whose current behavior must survive the flag work.
+probe_test!(probe_tinyllama,           "TinyLlama/TinyLlama-1.1B-Chat-v1.0");            // unconditional ▁ per segment
+probe_test!(probe_xlm_roberta,         "FacebookAI/xlm-roberta-base");                   // SP precompiled, no flags
+probe_test!(probe_all_mpnet,           "sentence-transformers/all-mpnet-base-v2");       // lstrip no-op under Bert pretok
+
+// ============================================================================
 // Web-text (OpenWebText) per-document accuracy — one representative per
 // pretokenizer family / algorithm, loaded from the ORIGINAL HF repo so the
 // tokenizer.json detection path is exercised (tokiers/*.tkz bypasses it).

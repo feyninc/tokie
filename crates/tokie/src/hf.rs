@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::encoder::{BacktrackingBytePairEncoder, BytePairEncoder, Encoder, EncoderType, SentencePieceBPE, UnigramEncoder, WordPieceEncoder};
 use crate::decoder::Decoder;
-use crate::normalizer::Normalizer;
+use crate::normalizer::{MetaspacePrepend, Normalizer};
 use crate::postprocessor::PostProcessor;
 use crate::pretok::{PretokType, Pretokenizer};
 use crate::tokenizer::Tokenizer;
@@ -432,7 +432,7 @@ fn load_vocab_defined_bpe(
     // Use SentencePiece encoder if explicitly requested or if Metaspace-style normalizer detected
     // Both Metaspace (Mistral) and MetaspaceReplace (Gemma) indicate SentencePiece tokenizers
     let use_sentencepiece = encoder_type == EncoderType::SentencePiece
-        || matches!(normalizer, Normalizer::Metaspace | Normalizer::MetaspaceReplace);
+        || matches!(normalizer, Normalizer::Metaspace(_) | Normalizer::MetaspaceReplace);
 
     // For ByteLevel vocab-defined BPE (Llama 3, Qwen), use Simple encoder
     // because Backtracking's is_valid_pair doesn't work with non-sequential IDs
@@ -667,7 +667,7 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
     // Handle null/missing normalizer - check for Metaspace pre_tokenizer
     if normalizer.is_null() {
         if has_metaspace {
-            return Normalizer::Metaspace;
+            return metaspace_normalizer_from_pretok(data);
         }
         return Normalizer::None;
     }
@@ -700,6 +700,13 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
             "Sequence" => {
                 // Check sequence normalizers for specific patterns
                 if let Some(normalizers) = normalizer["normalizers"].as_array() {
+                    // potion-multilingual pattern: [Seq[Precompiled, collapse],
+                    // 32× Replace(punct → " punct "), Replace(\s+→" "), Strip]
+                    // + Metaspace pre-tokenizer.
+                    if let Some(n) = detect_punct_pad_chain(normalizers, has_metaspace) {
+                        return n;
+                    }
+
                     let has_lowercase = normalizers.iter().any(|n| {
                         n["type"].as_str() == Some("Lowercase")
                     });
@@ -734,9 +741,12 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
                             .unwrap_or(Normalizer::SentencePiece);
                     }
 
-                    // Mixtral pattern: Prepend "▁" + Replace " " → "▁"
+                    // Mixtral pattern: Prepend "▁" + Replace " " → "▁".
+                    // As a *normalizer* this applies per added-token segment
+                    // and prepends unconditionally (TinyLlama, Phi-3,
+                    // voyage-2 family) — unlike the Metaspace pre-tokenizer.
                     if has_prepend_metaspace && has_replace_space_metaspace {
-                        return Normalizer::Metaspace;
+                        return Normalizer::Metaspace(MetaspacePrepend::Unconditional);
                     }
 
                     // Check for NFC or BertNormalizer in sequence
@@ -779,10 +789,124 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
 
     // Even if normalizer exists, check for Metaspace pre_tokenizer
     if has_metaspace {
-        return Normalizer::Metaspace;
+        return metaspace_normalizer_from_pretok(data);
     }
 
     Normalizer::None
+}
+
+/// Detect the potion-multilingual punctuation-padding normalizer chain:
+/// a (possibly nested) sequence of `Precompiled`, space-collapse `Replace`
+/// rules, per-punctuation `Replace(p → " p ")` rules, and a both-sides
+/// `Strip` — combined with a Metaspace pre-tokenizer.
+///
+/// The fused implementation pads every ASCII punctuation char, so this only
+/// matches when the rules cover exactly that set; anything else falls through
+/// to the generic detection paths.
+fn detect_punct_pad_chain(
+    normalizers: &[serde_json::Value],
+    has_metaspace: bool,
+) -> Option<Normalizer> {
+    if !has_metaspace {
+        return None;
+    }
+    // Flatten one level of nested Sequence (potion nests [Precompiled, Replace]).
+    let mut flat: Vec<&serde_json::Value> = Vec::new();
+    for n in normalizers {
+        if n["type"].as_str() == Some("Sequence") {
+            flat.extend(n["normalizers"].as_array()?.iter());
+        } else {
+            flat.push(n);
+        }
+    }
+
+    let mut precompiled: Option<&serde_json::Value> = None;
+    let mut padded: Vec<char> = Vec::new();
+    let mut has_strip = false;
+    for n in &flat {
+        match n["type"].as_str()? {
+            "Precompiled" => precompiled = Some(n),
+            "Strip" => {
+                has_strip = n["strip_left"].as_bool().unwrap_or(false)
+                    && n["strip_right"].as_bool().unwrap_or(false);
+            }
+            "Replace" => {
+                let content = n["content"].as_str()?;
+                if let Some(pat) = n["pattern"]["String"].as_str() {
+                    // Punctuation-pad rule: single char c with content " c ".
+                    let mut chars = pat.chars();
+                    let (Some(c), None) = (chars.next(), chars.next()) else {
+                        return None;
+                    };
+                    if content == format!(" {c} ") {
+                        padded.push(c);
+                    } else {
+                        return None;
+                    }
+                } else {
+                    // Whitespace-collapse rules subsumed by the fused pass.
+                    let pat = n["pattern"]["Regex"].as_str()?;
+                    if !((pat == " {2,}" || pat == r"\s+") && content == " ") {
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    let padded: std::collections::BTreeSet<char> = padded.into_iter().collect();
+    if !has_strip || padded.len() != 32 || !padded.iter().all(|c| c.is_ascii_punctuation()) {
+        return None;
+    }
+    let node = precompiled?;
+    use base64::Engine as _;
+    let b64 = node["precompiled_charsmap"].as_str()?;
+    let blob = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let charsmap = crate::charsmap::PrecompiledCharsmap::from_blob(&blob).ok()?;
+    Some(Normalizer::SentencePiecePunctPad {
+        charsmap: std::sync::Arc::new(charsmap),
+    })
+}
+
+/// Map a Metaspace *pre-tokenizer* to the fused normalizer variant.
+///
+/// Unlike the `Prepend("▁")` normalizer, HF's Metaspace pre-tokenizer only
+/// prepends `▁` when the segment doesn't already start with it, and the
+/// `prepend_scheme` controls which segments qualify at all:
+/// - `"always"` (also the default, and what `add_prefix_space: true` means)
+///   → every added-token segment
+/// - `"first"` → only the segment at offset 0 of the input (Mistral-7B-v0.1)
+/// - `"never"` (or `add_prefix_space: false`) → no prepend at all
+fn metaspace_normalizer_from_pretok(data: &serde_json::Value) -> Normalizer {
+    let node = find_metaspace_pretok_node(data);
+    let scheme = node
+        .and_then(|n| n["prepend_scheme"].as_str())
+        .unwrap_or("always");
+    let add_prefix = node
+        .and_then(|n| n["add_prefix_space"].as_bool())
+        .unwrap_or(true);
+    if !add_prefix || scheme == "never" {
+        return Normalizer::MetaspaceReplace;
+    }
+    match scheme {
+        "first" => Normalizer::Metaspace(MetaspacePrepend::FirstSegment),
+        _ => Normalizer::Metaspace(MetaspacePrepend::IfNotSpaceLed),
+    }
+}
+
+/// Find the Metaspace pre-tokenizer JSON node (direct or inside a Sequence).
+fn find_metaspace_pretok_node(data: &serde_json::Value) -> Option<&serde_json::Value> {
+    let pre_tokenizer = &data["pre_tokenizer"];
+    if pre_tokenizer["type"].as_str() == Some("Metaspace") {
+        return Some(pre_tokenizer);
+    }
+    if let Some(pretokenizers) = pre_tokenizer["pretokenizers"].as_array() {
+        return pretokenizers
+            .iter()
+            .find(|p| p["type"].as_str() == Some("Metaspace"));
+    }
+    None
 }
 
 /// Parse the base64 `precompiled_charsmap` blob from a Precompiled normalizer
@@ -1206,50 +1330,97 @@ fn extract_pad_token_id(data: &serde_json::Value) -> Option<TokenId> {
     None
 }
 
-/// Extract added tokens from HuggingFace tokenizer.json.
+/// Extract added tokens (with HF matching flags) from tokenizer.json.
 ///
-/// HuggingFace tokenizers match ALL added tokens (both special and non-special)
-/// before pretokenization. This ensures tokens like `<|im_start|>`, `<think>`,
-/// and multi-space sequences are recognized as single tokens.
-/// Returns (token_id, bytes) pairs.
-fn extract_added_tokens(data: &serde_json::Value) -> Vec<(TokenId, Vec<u8>)> {
+/// HuggingFace tokenizers match ALL added tokens (both special and
+/// non-special) before pretokenization, and each entry carries
+/// `lstrip`/`rstrip`/`normalized`/`single_word` flags that shape the match.
+///
+/// IDs are NOT taken from the file: HF's deserializer discards the declared
+/// ids and reassigns them via `AddedVocabulary::add_tokens` — a token whose
+/// content is in the model vocab gets the vocab id, anything else gets
+/// sequential ids starting at the vocab size, in file order. Most exports
+/// declare exactly these ids, but some (deepset-mxbai-embed-de-large-v1)
+/// shrank the vocab without rewriting `added_tokens`, so the declared ids
+/// point past the embedding table while HF silently remaps them.
+pub(crate) fn extract_added_token_specs(data: &serde_json::Value) -> Vec<crate::tokenizer::AddedTokenSpec> {
+    use crate::tokenizer::AddedTokenSpec;
     let Some(added) = data["added_tokens"].as_array() else {
         return Vec::new();
     };
 
-    added.iter().filter_map(|token| {
-        let id = token["id"].as_u64()? as TokenId;
-        let content = token["content"].as_str()?;
-        if content.is_empty() {
-            return None;
+    // Content -> id view of the model vocab (BPE/WordPiece object, or
+    // Unigram [piece, score] list). Missing vocab (tiktoken-style exports)
+    // falls back to the declared ids.
+    let vocab_obj = data["model"]["vocab"].as_object();
+    let vocab_arr_map: Option<std::collections::HashMap<&str, TokenId>> =
+        data["model"]["vocab"].as_array().map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(i, e)| e[0].as_str().map(|s| (s, i as TokenId)))
+                .collect()
+        });
+    let vocab_lookup = |content: &str| -> Option<TokenId> {
+        if let Some(obj) = vocab_obj {
+            return obj.get(content).and_then(|v| v.as_u64()).map(|v| v as TokenId);
         }
-        // Skip single-byte tokens — they're already in the BPE vocab and
-        // matching them in the DAAC would add overhead with no benefit.
-        if content.len() == 1 {
-            return None;
+        vocab_arr_map.as_ref().and_then(|m| m.get(content).copied())
+    };
+    let vocab_size = vocab_obj
+        .map(|o| o.len())
+        .or(data["model"]["vocab"].as_array().map(|a| a.len()));
+    let mut next_id = vocab_size.map(|s| s as TokenId);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut specs = Vec::new();
+    for token in added {
+        let Some(content) = token["content"].as_str() else { continue };
+        if content.is_empty() || !seen.insert(content.to_string()) {
+            continue;
         }
-        Some((id, content.as_bytes().to_vec()))
-    }).collect()
+        let declared = token["id"].as_u64().map(|v| v as TokenId);
+        let id = match (vocab_size, vocab_lookup(content)) {
+            // HF resolution: content in vocab -> vocab id.
+            (Some(_), Some(vid)) => vid,
+            // Out of vocab -> sequential from vocab_size, in file order.
+            (Some(_), None) => {
+                let next = next_id.as_mut().unwrap();
+                let id = *next;
+                *next += 1;
+                id
+            }
+            // No parseable vocab: trust the declared id.
+            (None, _) => match declared {
+                Some(d) => d,
+                None => continue,
+            },
+        };
+        specs.push(AddedTokenSpec {
+            id,
+            bytes: content.as_bytes().to_vec(),
+            special: token["special"].as_bool().unwrap_or(false),
+            lstrip: token["lstrip"].as_bool().unwrap_or(false),
+            rstrip: token["rstrip"].as_bool().unwrap_or(false),
+            normalized: token["normalized"].as_bool().unwrap_or(false),
+            single_word: token["single_word"].as_bool().unwrap_or(false),
+        });
+    }
+    specs
 }
 
 /// Set up added tokens and special token metadata on a tokenizer from HF JSON data.
 fn setup_added_tokens(tokenizer: &mut Tokenizer, data: &serde_json::Value) {
-    let added = extract_added_tokens(data);
-    if !added.is_empty() {
-        tokenizer.set_added_tokens(&added);
+    let specs = extract_added_token_specs(data);
+    let special: Vec<(String, TokenId)> = specs
+        .iter()
+        .filter(|t| t.special)
+        .filter_map(|t| String::from_utf8(t.bytes.clone()).ok().map(|s| (s, t.id)))
+        .collect();
+    if !specs.is_empty() {
+        tokenizer.set_added_tokens(&specs);
     }
-    // Extract special token metadata (string -> ID mapping)
-    if let Some(added_arr) = data["added_tokens"].as_array() {
-        let special: Vec<(String, TokenId)> = added_arr.iter().filter_map(|token| {
-            let special = token["special"].as_bool().unwrap_or(false);
-            if !special { return None; }
-            let id = token["id"].as_u64()? as TokenId;
-            let content = token["content"].as_str()?;
-            Some((content.to_string(), id))
-        }).collect();
-        if !special.is_empty() {
-            tokenizer.set_special_tokens(special);
-        }
+    if !special.is_empty() {
+        tokenizer.set_special_tokens(special);
     }
 }
 
