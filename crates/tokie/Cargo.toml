@@ -116,6 +116,10 @@ name = "bench_vs_hf"
 required-features = ["build"]
 
 [[example]]
+name = "owt_compare"
+required-features = ["build"]
+
+[[example]]
 name = "check_models"
 required-features = ["build"]
 
