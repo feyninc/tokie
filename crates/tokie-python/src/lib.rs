@@ -18,7 +18,7 @@ fn to_py_err(e: impl std::fmt::Display) -> PyErr {
 /// building per-token strings for every encoding is pure overhead for the
 /// common ids-only consumers, and it used to happen under the GIL, serially,
 /// for every batch element.
-#[pyclass(name = "Encoding")]
+#[pyclass(name = "Encoding", skip_from_py_object)]
 #[derive(Clone)]
 struct PyEncoding {
     #[pyo3(get)]
@@ -139,7 +139,7 @@ impl PyTokenizer {
     #[staticmethod]
     fn from_pretrained(py: Python<'_>, repo_id: &str) -> PyResult<Self> {
         let repo = repo_id.to_string();
-        let inner = py.allow_threads(|| {
+        let inner = py.detach(|| {
             tokie_core::Tokenizer::from_pretrained(&repo).map_err(to_py_err)
         })?;
         Ok(Self { inner: Arc::new(RwLock::new(inner)) })
@@ -160,13 +160,13 @@ impl PyTokenizer {
                 let a = text.to_string();
                 let b = pair.to_string();
                 let inner = self.read();
-                let enc = py.allow_threads(|| inner.encode_pair(&a, &b, add_special_tokens));
+                let enc = py.detach(|| inner.encode_pair(&a, &b, add_special_tokens));
                 PyEncoding::from_encoding(enc, self.inner.clone())
             }
             None => {
                 let text = text.to_string();
                 let inner = self.read();
-                let enc = py.allow_threads(|| inner.encode(&text, add_special_tokens));
+                let enc = py.detach(|| inner.encode(&text, add_special_tokens));
                 PyEncoding::from_encoding(enc, self.inner.clone())
             }
         }
@@ -179,7 +179,7 @@ impl PyTokenizer {
         let inner = self.read();
         if inner.padding().is_none() {
             // Fast path: bare ids; masks are synthesized lazily on access
-            let ids = py.allow_threads(|| inner.encode_ids(&text, add_special_tokens));
+            let ids = py.detach(|| inner.encode_ids(&text, add_special_tokens));
             return PyEncoding {
                 ids,
                 attention_mask_inner: Vec::new(),
@@ -188,7 +188,7 @@ impl PyTokenizer {
                 tok: self.inner.clone(),
             };
         }
-        let enc = py.allow_threads(|| inner.encode(&text, add_special_tokens));
+        let enc = py.detach(|| inner.encode(&text, add_special_tokens));
         PyEncoding::from_encoding(enc, self.inner.clone())
     }
 
@@ -204,7 +204,7 @@ impl PyTokenizer {
         let a = text_a.to_string();
         let b = text_b.to_string();
         let inner = self.read();
-        let enc = py.allow_threads(|| inner.encode_pair(&a, &b, add_special_tokens));
+        let enc = py.detach(|| inner.encode_pair(&a, &b, add_special_tokens));
         PyEncoding::from_encoding(enc, self.inner.clone())
     }
 
@@ -213,7 +213,7 @@ impl PyTokenizer {
     fn encode_with_offsets(&self, py: Python<'_>, text: &str, add_special_tokens: bool) -> PyEncoding {
         let text = text.to_string();
         let inner = self.read();
-        let enc = py.allow_threads(|| inner.encode_with_offsets(&text, add_special_tokens));
+        let enc = py.detach(|| inner.encode_with_offsets(&text, add_special_tokens));
         PyEncoding::from_encoding(enc, self.inner.clone())
     }
 
@@ -251,7 +251,7 @@ impl PyTokenizer {
     /// Decode multiple token ID sequences in parallel.
     fn decode_batch(&self, py: Python<'_>, sequences: Vec<Vec<u32>>) -> Vec<Option<String>> {
         let inner = self.read();
-        py.allow_threads(|| {
+        py.detach(|| {
             sequences.iter().map(|tokens| inner.decode(tokens)).collect()
         })
     }
@@ -260,7 +260,7 @@ impl PyTokenizer {
     #[pyo3(signature = (texts, add_special_tokens=true))]
     fn encode_batch(&self, py: Python<'_>, texts: Vec<String>, add_special_tokens: bool) -> Vec<PyEncoding> {
         let inner = self.read();
-        let encodings = py.allow_threads(|| {
+        let encodings = py.detach(|| {
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
             inner.encode_batch(&text_refs, add_special_tokens)
         });
@@ -286,7 +286,7 @@ impl PyTokenizer {
     ) -> (Bound<'py, numpy::PyArray1<u32>>, Bound<'py, numpy::PyArray1<u64>>) {
         use numpy::IntoPyArray;
         let inner = self.read();
-        let (ids, lens) = py.allow_threads(|| {
+        let (ids, lens) = py.detach(|| {
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
             inner.encode_batch_flat(&text_refs, add_special_tokens)
         });
@@ -321,7 +321,7 @@ impl PyTokenizer {
         use numpy::IntoPyArray;
         let separator = separator.unwrap_or_else(|| b"<|endoftext|>".to_vec());
         let inner = self.read();
-        let (ids, offsets) = py.allow_threads(|| {
+        let (ids, offsets) = py.detach(|| {
             inner.encode_files_flat(&paths, &separator, add_special_tokens)
         })?;
         Ok((ids.into_pyarray(py), offsets.into_pyarray(py)))
@@ -341,20 +341,20 @@ impl PyTokenizer {
     ) -> PyResult<usize> {
         let separator = separator.unwrap_or_else(|| b"<|endoftext|>".to_vec());
         let inner = self.read();
-        Ok(py.allow_threads(|| inner.count_tokens_files(&paths, &separator))?)
+        Ok(py.detach(|| inner.count_tokens_files(&paths, &separator))?)
     }
 
     /// Count the number of tokens in the text.
     fn count_tokens(&self, py: Python<'_>, text: &str) -> usize {
         let text = text.to_string();
         let inner = self.read();
-        py.allow_threads(|| inner.count_tokens(&text))
+        py.detach(|| inner.count_tokens(&text))
     }
 
     /// Count tokens for multiple texts in parallel.
     fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<String>) -> Vec<usize> {
         let inner = self.read();
-        py.allow_threads(|| {
+        py.detach(|| {
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
             inner.count_tokens_batch(&text_refs)
         })
@@ -439,8 +439,8 @@ impl PyTokenizer {
 
     /// Get current padding configuration, or None if disabled.
     #[getter]
-    fn padding(&self) -> Option<HashMap<String, PyObject>> {
-        Python::with_gil(|py| {
+    fn padding(&self) -> Option<HashMap<String, Py<PyAny>>> {
+        Python::attach(|py| {
             self.read().padding().map(|p| {
                 let mut d = HashMap::new();
                 match p.strategy {
@@ -466,8 +466,8 @@ impl PyTokenizer {
 
     /// Get current truncation configuration, or None if disabled.
     #[getter]
-    fn truncation(&self) -> Option<HashMap<String, PyObject>> {
-        Python::with_gil(|py| {
+    fn truncation(&self) -> Option<HashMap<String, Py<PyAny>>> {
+        Python::attach(|py| {
             self.read().truncation().map(|t| {
                 let mut d = HashMap::new();
                 d.insert("max_length".to_string(), t.max_length.into_pyobject(py).unwrap().into_any().unbind());
