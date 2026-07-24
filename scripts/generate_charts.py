@@ -156,6 +156,22 @@ def chart_sentencepiece():
     )
 
 
+def chart_unigram():
+    """Unigram (SentencePiece Unigram) encoding speed (T5, MB/s).
+    No kitoken — it produces incorrect output on SentencePiece models.
+    tokie runs Viterbi per metaspace unit and memoizes Zipf-frequent units."""
+    _horiz_chart(
+        "Unigram encoding speed",
+        [
+            ("tokie",          97.5,  TOKIE_COLOR, ""),
+            ("HF tokenizers",  3.2,   GRAY_COLOR,  "30x slower"),
+        ],
+        "MB/s",
+        "T5-base, 900KB text, Apple M3, tokie 0.1.4",
+        "benchmark_unigram",
+    )
+
+
 def chart_tiktoken():
     """tiktoken comparison (cl100k/o200k, ms — vertical bars, dark bg)."""
     fig, ax = plt.subplots(figsize=(7, 5.5))
@@ -225,6 +241,7 @@ if __name__ == "__main__":
     chart_bpe()
     chart_wordpiece()
     chart_sentencepiece()
+    chart_unigram()
     chart_tiktoken()
     chart_loading()
     print("Done.")

@@ -186,6 +186,8 @@ Unigram models (T5, XLM-RoBERTa, ALBERT, and other SentencePiece-Unigram vocabul
 
 ![SentencePiece BPE speed](assets/benchmark_sentencepiece.png)
 
+![Unigram encoding speed](assets/benchmark_unigram.png)
+
 ### Python Benchmarks
 
 All results on Apple M3, single-string encode, median of 10 runs.
