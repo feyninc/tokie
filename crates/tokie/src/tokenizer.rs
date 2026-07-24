@@ -37,6 +37,35 @@ fn byte_balanced_chunks<'a, 'b>(texts: &'b [&'a str], parts: usize) -> Vec<&'b [
     }
     chunks
 }
+/// Split raw file buffers into documents on `separator`, dropping empty
+/// documents (Python-`if d`-filter semantics). Valid-UTF-8 documents are
+/// borrowed from the buffers (`from_utf8_lossy` returns `Cow::Borrowed`
+/// after one SIMD validation pass); documents with invalid bytes are
+/// lossy-converted per document so bad bytes can never panic. An empty
+/// separator means one document per file.
+fn split_file_docs<'a>(buffers: &'a [Vec<u8>], separator: &[u8]) -> Vec<Cow<'a, str>> {
+    let mut docs: Vec<Cow<'a, str>> = Vec::new();
+    for buf in buffers {
+        if separator.is_empty() {
+            if !buf.is_empty() {
+                docs.push(String::from_utf8_lossy(buf));
+            }
+            continue;
+        }
+        let mut start = 0usize;
+        for pos in memchr::memmem::find_iter(buf, separator) {
+            if pos > start {
+                docs.push(String::from_utf8_lossy(&buf[start..pos]));
+            }
+            start = pos + separator.len();
+        }
+        if start < buf.len() {
+            docs.push(String::from_utf8_lossy(&buf[start..]));
+        }
+    }
+    docs
+}
+
 use crate::decoder::{Decoder, DecoderType};
 use crate::hf::{self, JsonLoadError};
 use crate::normalizer::Normalizer;
@@ -1126,6 +1155,70 @@ impl Tokenizer {
         (ids, lens)
     }
 
+    /// Encode corpus files in bulk into one contiguous id buffer.
+    ///
+    /// Reads each file's bytes in Rust, splits every file on the
+    /// `separator` byte sequence (documents never span files; an empty
+    /// separator treats each file as a single document), drops empty
+    /// documents — matching the usual Python
+    /// `[d for d in text.split(sep) if d]` pre-split — and encodes all
+    /// documents with the parallel bulk pipeline. No text ever crosses a
+    /// binding boundary, so this is the fastest way to tokenize corpora
+    /// from disk.
+    ///
+    /// Each document is UTF-8-validated once; documents containing invalid
+    /// UTF-8 fall back to lossy conversion (invalid sequences become
+    /// U+FFFD) instead of failing, so arbitrary bytes are safe. Valid
+    /// documents are borrowed straight from the read buffer — no copies.
+    ///
+    /// Returns `(ids, offsets)`: every document's token ids concatenated
+    /// in order, plus document boundaries with `offsets.len() == ndocs + 1`
+    /// — document `i` is `ids[offsets[i] as usize..offsets[i + 1] as usize]`.
+    /// Truncation and special tokens apply as in [`Self::encode_batch_flat`];
+    /// padding does not.
+    pub fn encode_files_flat<P: AsRef<Path>>(
+        &self,
+        paths: &[P],
+        separator: &[u8],
+        add_special_tokens: bool,
+    ) -> std::io::Result<(Vec<TokenId>, Vec<u64>)> {
+        let buffers: Vec<Vec<u8>> = paths
+            .iter()
+            .map(|p| std::fs::read(p.as_ref()))
+            .collect::<std::io::Result<_>>()?;
+        let docs = split_file_docs(&buffers, separator);
+        let refs: Vec<&str> = docs.iter().map(|d| d.as_ref()).collect();
+        let (ids, lens) = self.encode_batch_flat(&refs, add_special_tokens);
+        let mut offsets = Vec::with_capacity(lens.len() + 1);
+        let mut acc = 0u64;
+        offsets.push(0);
+        for l in lens {
+            acc += l;
+            offsets.push(acc);
+        }
+        Ok((ids, offsets))
+    }
+
+    /// Count tokens across corpus files without materializing ids.
+    ///
+    /// Same file reading, separator splitting, empty-document filtering,
+    /// and lossy UTF-8 handling as [`Self::encode_files_flat`]; returns the
+    /// total token count over all documents (no special tokens, as in
+    /// [`Self::count_tokens`]).
+    pub fn count_tokens_files<P: AsRef<Path>>(
+        &self,
+        paths: &[P],
+        separator: &[u8],
+    ) -> std::io::Result<usize> {
+        let buffers: Vec<Vec<u8>> = paths
+            .iter()
+            .map(|p| std::fs::read(p.as_ref()))
+            .collect::<std::io::Result<_>>()?;
+        let docs = split_file_docs(&buffers, separator);
+        let refs: Vec<&str> = docs.iter().map(|d| d.as_ref()).collect();
+        Ok(self.count_tokens_batch(&refs).iter().sum())
+    }
+
     /// Count tokens for multiple texts in parallel.
     pub fn count_tokens_batch(&self, texts: &[&str]) -> Vec<usize> {
         let cpus = num_cpus();
@@ -1522,6 +1615,161 @@ mod tests {
         let tokenizer = make_tokenizer();
         let result = tokenizer.count_tokens_batch(&[]);
         assert!(result.is_empty());
+    }
+
+    // --- encode_files_flat tests ---
+
+    /// Write bytes to a unique temp file and return its path.
+    fn tmp_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("tokie_files_test_{}_{}", std::process::id(), name));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// Reference result: split on `sep`, drop empties, lossy-convert,
+    /// encode each doc with `encode_batch` and concatenate.
+    fn reference_files(
+        tokenizer: &Tokenizer,
+        contents: &[&[u8]],
+        sep: &[u8],
+    ) -> (Vec<TokenId>, Vec<u64>) {
+        let mut docs: Vec<String> = Vec::new();
+        for buf in contents {
+            let pieces: Vec<&[u8]> = if sep.is_empty() {
+                vec![&buf[..]]
+            } else {
+                let mut out = Vec::new();
+                let mut start = 0;
+                for pos in memchr::memmem::find_iter(buf, sep) {
+                    out.push(&buf[start..pos]);
+                    start = pos + sep.len();
+                }
+                out.push(&buf[start..]);
+                out
+            };
+            for p in pieces {
+                if !p.is_empty() {
+                    docs.push(String::from_utf8_lossy(p).into_owned());
+                }
+            }
+        }
+        let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+        let encs = tokenizer.encode_batch(&refs, false);
+        let mut ids = Vec::new();
+        let mut offsets = vec![0u64];
+        for e in encs {
+            ids.extend_from_slice(&e.ids);
+            offsets.push(ids.len() as u64);
+        }
+        (ids, offsets)
+    }
+
+    fn assert_files_match(name: &str, contents: &[&[u8]], sep: &[u8]) {
+        let tokenizer = make_pretok_tokenizer();
+        let paths: Vec<std::path::PathBuf> = contents
+            .iter()
+            .enumerate()
+            .map(|(i, c)| tmp_file(&format!("{name}_{i}"), c))
+            .collect();
+        let (ids, offsets) = tokenizer.encode_files_flat(&paths, sep, false).unwrap();
+        let (want_ids, want_offsets) = reference_files(&tokenizer, contents, sep);
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+        assert_eq!(ids, want_ids, "{name}: ids mismatch");
+        assert_eq!(offsets, want_offsets, "{name}: offsets mismatch");
+    }
+
+    #[test]
+    fn test_encode_files_multi_doc() {
+        assert_files_match(
+            "multi",
+            &[b"Hello world<SEP>second doc here<SEP>and a third"],
+            b"<SEP>",
+        );
+    }
+
+    #[test]
+    fn test_encode_files_separator_at_edges() {
+        // Separator at file start and end: leading/trailing empty docs are
+        // dropped, matching Python's `[d for d in text.split(sep) if d]`.
+        assert_files_match("edges", &[b"<SEP>middle doc<SEP>"], b"<SEP>");
+    }
+
+    #[test]
+    fn test_encode_files_consecutive_separators() {
+        assert_files_match("consecutive", &[b"one<SEP><SEP><SEP>two"], b"<SEP>");
+    }
+
+    #[test]
+    fn test_encode_files_no_separator() {
+        assert_files_match("nosep", &[b"just one document, no separator"], b"<SEP>");
+    }
+
+    #[test]
+    fn test_encode_files_non_utf8() {
+        // Invalid UTF-8 must take the lossy path (U+FFFD), never panic.
+        assert_files_match(
+            "nonutf8",
+            &[b"good doc<SEP>bad \xff\xfe bytes<SEP>trailing ok"],
+            b"<SEP>",
+        );
+    }
+
+    #[test]
+    fn test_encode_files_multiple_files() {
+        assert_files_match(
+            "multifile",
+            &[
+                b"file one doc a<SEP>file one doc b<SEP>",
+                b"file two doc a",
+                b"<SEP>file three doc a<SEP>file three doc b",
+            ],
+            b"<SEP>",
+        );
+    }
+
+    #[test]
+    fn test_encode_files_empty_file() {
+        assert_files_match("emptyfile", &[b"", b"only doc"], b"<SEP>");
+    }
+
+    #[test]
+    fn test_encode_files_empty_separator() {
+        // Empty separator: each file is a single doc.
+        assert_files_match("emptysep", &[b"whole file is one doc"], b"");
+    }
+
+    #[test]
+    fn test_encode_files_many_docs_parallel() {
+        // Enough docs to force the steal_batches worker path.
+        let mut content = Vec::new();
+        for i in 0..200 {
+            content.extend_from_slice(
+                format!("document number {i} with some text abc").as_bytes(),
+            );
+            content.extend_from_slice(b"<SEP>");
+        }
+        assert_files_match("parallel", &[&content], b"<SEP>");
+    }
+
+    #[test]
+    fn test_encode_files_missing_file_errors() {
+        let tokenizer = make_pretok_tokenizer();
+        let missing = std::env::temp_dir().join("tokie_files_test_does_not_exist_xyz");
+        assert!(tokenizer.encode_files_flat(&[missing], b"<SEP>", false).is_err());
+    }
+
+    #[test]
+    fn test_count_tokens_files() {
+        let tokenizer = make_pretok_tokenizer();
+        let content: &[u8] = b"Hello world<SEP>second doc<SEP>third one here";
+        let path = tmp_file("count", content);
+        let total = tokenizer.count_tokens_files(&[&path], b"<SEP>").unwrap();
+        let (ids, _) = tokenizer.encode_files_flat(&[&path], b"<SEP>", false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(total, ids.len());
     }
 
     #[test]
