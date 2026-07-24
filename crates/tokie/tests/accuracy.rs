@@ -346,6 +346,7 @@ owt_accuracy_test!(owt_qwen3,       "Qwen/Qwen3-0.6B");                // Qwen p
 owt_accuracy_test!(owt_smollm2,     "HuggingFaceTB/SmolLM2-135M");     // SmolLM pretok
 owt_accuracy_test!(owt_deepseek_v3, "deepseek-ai/DeepSeek-V3");        // DeepSeek pretok
 owt_accuracy_test!(owt_bert,        "google-bert/bert-base-uncased");  // WordPiece
+owt_accuracy_test!(owt_t5_base,      "google-t5/t5-base");            // SP-Unigram (metaspace + unit-split fast path)
 owt_accuracy_test!(owt_xlm_roberta,  "FacebookAI/xlm-roberta-base");  // SP-Unigram (precompiled charsmap)
 owt_accuracy_test!(owt_mistral_7b,  "mistralai/Mistral-7B-v0.1");      // SP-BPE
 

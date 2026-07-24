@@ -18,8 +18,36 @@ mod wordpiece;
 pub use backtracking::{BacktrackingBytePairEncoder, EncodeIter, PretokenCache};
 pub use sentencepiece::{EncodeState, SentencePieceBPE};
 pub use simple::BytePairEncoder;
-pub use unigram::UnigramEncoder;
+pub use unigram::{UnigramEncoder, UnigramPieceCache};
 pub use wordpiece::WordPieceEncoder;
+
+/// Per-worker caches leased by batch encoding: the BPE pretoken cache and
+/// the Unigram `▁`-unit cache live together so one pooled lease warms both
+/// encoder families (a given tokenizer only ever touches one of them).
+pub struct WorkerCaches {
+    pub pretok: PretokenCache,
+    pub unigram: UnigramPieceCache,
+}
+
+impl WorkerCaches {
+    pub fn new() -> Self {
+        Self {
+            pretok: PretokenCache::new(),
+            unigram: UnigramPieceCache::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.pretok.clear();
+        self.unigram.clear();
+    }
+}
+
+impl Default for WorkerCaches {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 use crate::types::{Split, TokenId};
 
@@ -106,22 +134,37 @@ impl Encoder {
         }
     }
 
-    /// Append the encoding of one piece to `out`, using the pretoken cache
-    /// where the encoder supports it (Backtracking only).
+    /// Append the encoding of one piece to `out`, using worker caches where
+    /// the encoder supports them (Backtracking pretok + Unigram `▁` units).
     #[inline]
-    pub fn encode_into(&self, text: &[u8], cache: Option<&mut PretokenCache>, out: &mut Vec<TokenId>) {
+    pub fn encode_into(&self, text: &[u8], cache: Option<&mut WorkerCaches>, out: &mut Vec<TokenId>) {
         match self {
-            Encoder::Backtracking(e) => e.encode_into(text, cache, out),
+            Encoder::Backtracking(e) => match cache {
+                Some(c) => e.encode_into(text, Some(&mut c.pretok), out),
+                None => e.encode_into(text, None, out),
+            },
+            Encoder::Unigram(e) => match cache {
+                Some(c) => e.encode_into(text, Some(&mut c.unigram), out),
+                None => e.encode_into(text, None, out),
+            },
             _ => out.extend(self.encode(text)),
         }
     }
 
     /// Like [`Self::encode_into`], for a `piece` that is a subslice of `doc`
     /// (lets the Backtracking cache build its key with one masked load).
+    ///
+    /// Only the Backtracking encoder pairs with a pretokenizer, so this is
+    /// the BPE fused-loop entry point; other encoders ignore the subslice
+    /// hint. Unigram (no pretokenizer) reaches its unit cache through
+    /// [`Self::encode_into`] instead.
     #[inline]
-    pub fn encode_piece_into(&self, doc: &[u8], piece: &[u8], cache: Option<&mut PretokenCache>, out: &mut Vec<TokenId>) {
+    pub fn encode_piece_into(&self, doc: &[u8], piece: &[u8], cache: Option<&mut WorkerCaches>, out: &mut Vec<TokenId>) {
         match self {
-            Encoder::Backtracking(e) => e.encode_piece_into(doc, piece, cache, out),
+            Encoder::Backtracking(e) => match cache {
+                Some(c) => e.encode_piece_into(doc, piece, Some(&mut c.pretok), out),
+                None => e.encode_piece_into(doc, piece, None, out),
+            },
             _ => out.extend(self.encode(piece)),
         }
     }

@@ -181,12 +181,13 @@ fn main() {
     println!("D  encode-only replay, warm       : {:5.2} ns/piece  {:7.1} MB/s  [toks {}]", perp(ns), mbps(ns), chk);
 
     // --- E: fused naive, enum pretok + Encoder enum (current pipeline) ---
+    let mut wcache = tokie::encoder::WorkerCaches::new();
     let (ns, chk) = best_ns(|| {
         out.clear();
         for d in &docs {
             let db = d.as_bytes();
             for p in pretok.split(d) {
-                encoder_enum.encode_piece_into(db, p.as_bytes(), Some(&mut cache), &mut out);
+                encoder_enum.encode_piece_into(db, p.as_bytes(), Some(&mut wcache), &mut out);
             }
         }
         black_box(out.len() as u64)

@@ -13,7 +13,7 @@ use chunk::chunk;
 
 use daggrs::{DoubleArrayAhoCorasick, MatchKind, Trie};
 
-use crate::encoder::{Encoder, EncoderIter, EncoderType, PretokenCache};
+use crate::encoder::{Encoder, EncoderIter, EncoderType, WorkerCaches};
 
 /// Byte-length of a batch element: lets the work-stealing scaffold serve
 /// both `&str` batches (Python-boundary path) and `&[u8]` document slices
@@ -409,7 +409,7 @@ impl Tokenizer {
     where
         T: ByteLen + ?Sized + Sync,
         R: Send,
-        F: Fn(&'b [&'a T], &mut PretokenCache) -> R + Sync,
+        F: Fn(&'b [&'a T], &mut WorkerCaches) -> R + Sync,
     {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let cpus = num_cpus();
@@ -432,7 +432,7 @@ impl Tokenizer {
                             if i >= chunks.len() {
                                 break;
                             }
-                            out.push((i, work(chunks[i], lease.cache())));
+                            out.push((i, work(chunks[i], lease.caches())));
                         }
                         out
                     })
@@ -671,7 +671,7 @@ impl Tokenizer {
         &self,
         text: &str,
         add_special_tokens: bool,
-        cache: Option<&mut PretokenCache>,
+        cache: Option<&mut WorkerCaches>,
     ) -> Vec<TokenId> {
         let mut tokens = self.encode_raw_ctx(text, cache);
         if let Some(ref trunc) = self.truncation {
@@ -695,7 +695,7 @@ impl Tokenizer {
         &self,
         text: &str,
         add_special_tokens: bool,
-        cache: Option<&mut PretokenCache>,
+        cache: Option<&mut WorkerCaches>,
     ) -> Encoding {
         let mut tokens = self.encode_raw_ctx(text, cache);
 
@@ -837,7 +837,7 @@ impl Tokenizer {
 
     /// Cache-first: when no per-thread cache is supplied and the model is
     /// BPE-with-pretokenizer, check out a pooled, process-lived
-    /// [`PretokenCache`], so repeated pieces resolve to a single table probe
+    /// [`WorkerCaches`], so repeated pieces resolve to a single table probe
     /// even across single-document calls.
     /// A caller-supplied cache marks a batch-worker context: the batch is
     /// already running one worker per CPU, so per-document parallel
@@ -845,16 +845,16 @@ impl Tokenizer {
     /// costs ~100us on macOS — phase-1 profile_spawn_cost) and is
     /// disabled. Standalone calls check out a pooled lease and keep the
     /// parallel path for large documents.
-    fn encode_raw_ctx(&self, text: &str, cache: Option<&mut PretokenCache>) -> Vec<TokenId> {
+    fn encode_raw_ctx(&self, text: &str, cache: Option<&mut WorkerCaches>) -> Vec<TokenId> {
         let allow_parallel = cache.is_none();
         if cache.is_none() && self.encoder.as_backtracking().is_some() && self.pretokenizer.is_some() {
             let mut lease = crate::pool::CacheLease::checkout(self.cache_generation);
-            return self.encode_raw_dispatch(text, Some(lease.cache()), allow_parallel);
+            return self.encode_raw_dispatch(text, Some(lease.caches()), allow_parallel);
         }
         self.encode_raw_dispatch(text, cache, allow_parallel)
     }
 
-    fn encode_raw_dispatch(&self, text: &str, cache: Option<&mut PretokenCache>, allow_parallel: bool) -> Vec<TokenId> {
+    fn encode_raw_dispatch(&self, text: &str, cache: Option<&mut WorkerCaches>, allow_parallel: bool) -> Vec<TokenId> {
         // If there are added tokens, split the text at their boundaries first.
         // HuggingFace scans for added tokens BEFORE pretokenization.
         if self.raw_added_matcher.is_some() || self.norm_added_matcher.is_some() {
@@ -874,7 +874,7 @@ impl Tokenizer {
     fn encode_with_added_tokens(
         &self,
         text: &str,
-        mut cache: Option<&mut PretokenCache>,
+        mut cache: Option<&mut WorkerCaches>,
         allow_parallel: bool,
     ) -> Vec<TokenId> {
         let mut result = Vec::new();
@@ -929,12 +929,15 @@ impl Tokenizer {
         &self,
         segment: &str,
         first_segment: bool,
-        cache: Option<&mut PretokenCache>,
+        cache: Option<&mut WorkerCaches>,
         allow_parallel: bool,
     ) -> Vec<TokenId> {
         if self.pretokenizer.is_none() {
             let normalized = self.normalizer.normalize_segment(segment, first_segment);
-            return self.encoder.encode(normalized.as_ref().as_bytes());
+            let mut out = Vec::with_capacity(normalized.as_ref().len() / 3);
+            self.encoder
+                .encode_into(normalized.as_ref().as_bytes(), cache, &mut out);
+            return out;
         }
         // Models with a pretokenizer never use position-aware metaspace
         // prepending, so the standard path (with its parallel branch for
@@ -943,9 +946,11 @@ impl Tokenizer {
     }
 
     /// Encode an already-normalized piece (stage 2 of the added-token split).
-    fn encode_prenormalized(&self, piece: &str, cache: Option<&mut PretokenCache>, allow_parallel: bool) -> Vec<TokenId> {
+    fn encode_prenormalized(&self, piece: &str, cache: Option<&mut WorkerCaches>, allow_parallel: bool) -> Vec<TokenId> {
         if self.pretokenizer.is_none() {
-            return self.encoder.encode(piece.as_bytes());
+            let mut out = Vec::with_capacity(piece.len() / 3);
+            self.encoder.encode_into(piece.as_bytes(), cache, &mut out);
+            return out;
         }
         // Pretokenizer models pair with idempotent normalizers (None, NFC,
         // Bert clean-text), so re-normalizing in the standard path is a
@@ -954,7 +959,7 @@ impl Tokenizer {
     }
 
     /// Inner encoding without added token splitting.
-    fn encode_raw_inner(&self, text: &str, cache: Option<&mut PretokenCache>, allow_parallel: bool) -> Vec<TokenId> {
+    fn encode_raw_inner(&self, text: &str, cache: Option<&mut WorkerCaches>, allow_parallel: bool) -> Vec<TokenId> {
         // For models without pretokenizer (SentencePiece, Unigram), normalize the full
         // text first and pass directly to the encoder. The encoder handles its own
         // chunking at safe boundaries (metaspace). We must NOT use encode_parallel here
@@ -963,7 +968,10 @@ impl Tokenizer {
         // - Metaspace sequence merging (Voyage-code-2, Voyage-law-2)
         if self.pretokenizer.is_none() {
             let normalized = self.normalizer.normalize(text);
-            return self.encoder.encode(normalized.as_ref().as_bytes());
+            let mut out = Vec::with_capacity(normalized.as_ref().len() / 3);
+            self.encoder
+                .encode_into(normalized.as_ref().as_bytes(), cache, &mut out);
+            return out;
         }
 
         if allow_parallel && text.len() >= Self::PARALLEL_CHUNK_THRESHOLD {
@@ -1071,7 +1079,7 @@ impl Tokenizer {
     /// profiling (profile_glue_costs, gpt2/OWT) put the two enum taxes at
     /// ~1 ns/piece of a ~16 ns/piece loop.
     #[inline]
-    fn encode_sequential(&self, text: &str, cache: Option<&mut PretokenCache>) -> Vec<TokenId> {
+    fn encode_sequential(&self, text: &str, cache: Option<&mut WorkerCaches>) -> Vec<TokenId> {
         let mut out = Vec::with_capacity(text.len() / 3);
         self.encode_sequential_into(text, cache, &mut out);
         out
@@ -1084,16 +1092,21 @@ impl Tokenizer {
     fn encode_sequential_into(
         &self,
         text: &str,
-        mut cache: Option<&mut PretokenCache>,
+        mut cache: Option<&mut WorkerCaches>,
         out: &mut Vec<TokenId>,
     ) {
         let pretok = self.pretokenizer.as_ref().unwrap();
         let db = text.as_bytes();
         if let Some(bt) = self.encoder.as_backtracking() {
             match cache {
-                Some(c) => pretok.for_each_piece(text, |p| {
-                    bt.encode_piece_into(db, p.as_bytes(), Some(&mut *c), out)
-                }),
+                // Only the BPE pretoken half of the worker caches is used on
+                // the Backtracking fused path.
+                Some(c) => {
+                    let pc = &mut c.pretok;
+                    pretok.for_each_piece(text, |p| {
+                        bt.encode_piece_into(db, p.as_bytes(), Some(&mut *pc), out)
+                    })
+                }
                 None => pretok.for_each_piece(text, |p| {
                     bt.encode_piece_into(db, p.as_bytes(), None, out)
                 }),
@@ -1138,7 +1151,7 @@ impl Tokenizer {
                         // chunks over 256 KiB — smaller chunks ran fully
                         // uncached).
                         let mut lease = crate::pool::CacheLease::checkout(generation);
-                        self.encode_sequential(normalized.as_ref(), Some(lease.cache()))
+                        self.encode_sequential(normalized.as_ref(), Some(lease.caches()))
                     })
                 })
                 .collect::<Vec<_>>()

@@ -6,15 +6,16 @@
 //! module keeps one cache per CPU alive for the process and leases them
 //! to batch workers for the duration of one call.
 //!
-//! Cache entries map piece bytes to token ids for a specific tokenizer,
-//! so each lease is tagged with the owning tokenizer's generation id; a
-//! lease checked out under a different generation clears the table first
-//! (the same cost as the old fresh build, paid only on tokenizer switch).
+//! Cache entries map piece/unit bytes to token ids for a specific
+//! tokenizer, so each lease is tagged with the owning tokenizer's
+//! generation id; a lease checked out under a different generation clears
+//! the tables first (the same cost as the old fresh build, paid only on
+//! tokenizer switch).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use crate::encoder::PretokenCache;
+use crate::encoder::WorkerCaches;
 
 /// Monotonic tokenizer generation source (one id per constructed
 /// `Tokenizer`).
@@ -25,8 +26,8 @@ pub(crate) fn next_generation() -> u64 {
 }
 
 struct Slot {
-    cache: Option<PretokenCache>,
-    /// Generation of the tokenizer whose entries the cache holds.
+    caches: Option<WorkerCaches>,
+    /// Generation of the tokenizer whose entries the caches hold.
     generation: u64,
 }
 
@@ -35,28 +36,29 @@ fn slots() -> &'static [Mutex<Slot>] {
     SLOTS.get_or_init(|| {
         let n = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
         (0..n)
-            .map(|_| Mutex::new(Slot { cache: None, generation: 0 }))
+            .map(|_| Mutex::new(Slot { caches: None, generation: 0 }))
             .collect()
     })
 }
 
-/// A leased long-lived cache; returns to the pool on drop. If every slot
-/// is busy (concurrent batch calls), holds a private fresh cache instead.
+/// A leased long-lived set of worker caches; returns to the pool on drop.
+/// If every slot is busy (concurrent batch calls), holds private fresh
+/// caches instead.
 pub(crate) struct CacheLease {
     guard: Option<MutexGuard<'static, Slot>>,
-    private: Option<PretokenCache>,
+    private: Option<WorkerCaches>,
 }
 
 impl CacheLease {
-    /// Check out a cache valid for `generation`, building or clearing it
+    /// Check out caches valid for `generation`, building or clearing them
     /// as needed. Prefers a slot already warm for this generation so that
     /// tokenizers alternating in one process each keep their own warm
-    /// table instead of clearing each other's on every checkout.
+    /// tables instead of clearing each other's on every checkout.
     pub(crate) fn checkout(generation: u64) -> Self {
         // First pass: a slot whose entries are already this tokenizer's.
         for slot in slots() {
             if let Ok(guard) = slot.try_lock() {
-                if guard.generation == generation && guard.cache.is_some() {
+                if guard.generation == generation && guard.caches.is_some() {
                     return Self { guard: Some(guard), private: None };
                 }
             }
@@ -65,8 +67,8 @@ impl CacheLease {
         let mut stale_guard = None;
         for slot in slots() {
             if let Ok(mut guard) = slot.try_lock() {
-                if guard.cache.is_none() {
-                    guard.cache = Some(PretokenCache::new());
+                if guard.caches.is_none() {
+                    guard.caches = Some(WorkerCaches::new());
                     guard.generation = generation;
                     return Self { guard: Some(guard), private: None };
                 }
@@ -76,17 +78,17 @@ impl CacheLease {
             }
         }
         if let Some(mut guard) = stale_guard {
-            guard.cache.as_mut().unwrap().clear();
+            guard.caches.as_mut().unwrap().clear();
             guard.generation = generation;
             return Self { guard: Some(guard), private: None };
         }
-        Self { guard: None, private: Some(PretokenCache::new()) }
+        Self { guard: None, private: Some(WorkerCaches::new()) }
     }
 
     #[inline]
-    pub(crate) fn cache(&mut self) -> &mut PretokenCache {
+    pub(crate) fn caches(&mut self) -> &mut WorkerCaches {
         match self.guard {
-            Some(ref mut g) => g.cache.as_mut().unwrap(),
+            Some(ref mut g) => g.caches.as_mut().unwrap(),
             None => self.private.as_mut().unwrap(),
         }
     }

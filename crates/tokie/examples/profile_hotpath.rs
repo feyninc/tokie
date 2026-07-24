@@ -41,9 +41,9 @@ fn main() {
     let el = t0.elapsed().as_secs_f64();
     println!("count_tokens 1T  : {:7.1} MB/s  ({} tokens)", nbytes as f64 / 1e6 / el, toks);
 
-    // Single-threaded encode via the batch hot path (PretokenCache)
+    // Single-threaded encode via the batch hot path (WorkerCaches)
     let t0 = Instant::now();
-    let mut cache = tokie::encoder::PretokenCache::new();
+    let mut cache = tokie::encoder::WorkerCaches::new();
     let mut toks_c = 0usize;
     let pretok = tok.pretokenizer().expect("pretokenizer");
     let mut out: Vec<u32> = Vec::new();
@@ -61,7 +61,7 @@ fn main() {
     // Single-threaded encode via the bulk for_each_piece drain (the path
     // encode_sequential_into now takes for backtracking encoders).
     let t0 = Instant::now();
-    let mut cache_b = tokie::encoder::PretokenCache::new();
+    let mut cache_b = tokie::encoder::WorkerCaches::new();
     let mut toks_b = 0usize;
     let mut out_b: Vec<u32> = Vec::new();
     for d in &docs {

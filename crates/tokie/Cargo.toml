@@ -55,6 +55,10 @@ name = "from_pretrained"
 required-features = ["hf"]
 
 [[example]]
+name = "bench_unigram_throughput"
+required-features = ["hf"]
+
+[[example]]
 name = "test_gpt2"
 required-features = ["hf"]
 
