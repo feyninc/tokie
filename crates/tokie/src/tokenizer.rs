@@ -661,7 +661,19 @@ impl Tokenizer {
         self.encode_raw_ctx(text, None)
     }
 
+    /// Cache-first: when no per-thread cache is supplied and the model is
+    /// BPE-with-pretokenizer, check out a pooled, process-lived
+    /// [`PretokenCache`], so repeated pieces resolve to a single table probe
+    /// even across single-document calls.
     fn encode_raw_ctx(&self, text: &str, cache: Option<&mut PretokenCache>) -> Vec<TokenId> {
+        if cache.is_none() && self.encoder.as_backtracking().is_some() && self.pretokenizer.is_some() {
+            let mut lease = crate::pool::CacheLease::checkout(self.cache_generation);
+            return self.encode_raw_dispatch(text, Some(lease.cache()));
+        }
+        self.encode_raw_dispatch(text, cache)
+    }
+
+    fn encode_raw_dispatch(&self, text: &str, cache: Option<&mut PretokenCache>) -> Vec<TokenId> {
         // If there are added tokens, split the text at their boundaries first.
         // HuggingFace scans for added tokens BEFORE pretokenization.
         if self.raw_added_matcher.is_some() || self.norm_added_matcher.is_some() {
@@ -871,7 +883,7 @@ impl Tokenizer {
     fn encode_sequential(&self, text: &str, mut cache: Option<&mut PretokenCache>) -> Vec<TokenId> {
         let mut out = Vec::with_capacity(text.len() / 3);
         for piece in self.pretokenizer.as_ref().unwrap().split(text) {
-            self.encoder.encode_into(piece.as_bytes(), cache.as_deref_mut(), &mut out);
+            self.encoder.encode_piece_into(text.as_bytes(), piece.as_bytes(), cache.as_deref_mut(), &mut out);
         }
         out
     }
@@ -907,8 +919,9 @@ impl Tokenizer {
                         let mut cache = (chunk_bytes.len() >= PRETOKEN_CACHE_MIN_BYTES)
                             .then(PretokenCache::new);
                         let mut out = Vec::with_capacity(chunk_bytes.len() / 3);
+                        let norm_bytes = normalized.as_ref().as_bytes();
                         for piece in pretok.split(normalized.as_ref()) {
-                            encoder.encode_into(piece.as_bytes(), cache.as_mut(), &mut out);
+                            encoder.encode_piece_into(norm_bytes, piece.as_bytes(), cache.as_mut(), &mut out);
                         }
                         out
                     })

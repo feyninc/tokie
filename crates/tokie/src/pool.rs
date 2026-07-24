@@ -49,19 +49,36 @@ pub(crate) struct CacheLease {
 
 impl CacheLease {
     /// Check out a cache valid for `generation`, building or clearing it
-    /// as needed.
+    /// as needed. Prefers a slot already warm for this generation so that
+    /// tokenizers alternating in one process each keep their own warm
+    /// table instead of clearing each other's on every checkout.
     pub(crate) fn checkout(generation: u64) -> Self {
+        // First pass: a slot whose entries are already this tokenizer's.
+        for slot in slots() {
+            if let Ok(guard) = slot.try_lock() {
+                if guard.generation == generation && guard.cache.is_some() {
+                    return Self { guard: Some(guard), private: None };
+                }
+            }
+        }
+        // Second pass: any free slot, preferring empty over stale ones.
+        let mut stale_guard = None;
         for slot in slots() {
             if let Ok(mut guard) = slot.try_lock() {
-                let stale = guard.generation != generation;
-                match guard.cache {
-                    Some(ref mut c) if stale => c.clear(),
-                    None => guard.cache = Some(PretokenCache::new()),
-                    _ => {}
+                if guard.cache.is_none() {
+                    guard.cache = Some(PretokenCache::new());
+                    guard.generation = generation;
+                    return Self { guard: Some(guard), private: None };
                 }
-                guard.generation = generation;
-                return Self { guard: Some(guard), private: None };
+                if stale_guard.is_none() {
+                    stale_guard = Some(guard);
+                }
             }
+        }
+        if let Some(mut guard) = stale_guard {
+            guard.cache.as_mut().unwrap().clear();
+            guard.generation = generation;
+            return Self { guard: Some(guard), private: None };
         }
         Self { guard: None, private: Some(PretokenCache::new()) }
     }

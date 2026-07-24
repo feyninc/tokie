@@ -444,20 +444,58 @@ impl BacktrackingBytePairEncoder {
     /// `PretokenCache` most pieces resolve to a single 32-byte table probe
     /// (pretoken frequency is Zipfian — on web text the vast majority of
     /// pieces repeat, and ~90% encode to a single token).
-    pub fn encode_into(&self, text: &[u8], mut cache: Option<&mut PretokenCache>, out: &mut Vec<TokenId>) {
-        if text.is_empty() {
+    #[inline]
+    pub fn encode_into(&self, text: &[u8], cache: Option<&mut PretokenCache>, out: &mut Vec<TokenId>) {
+        self.encode_piece_into(text, text, cache, out)
+    }
+
+    /// Like [`Self::encode_into`], but `piece` is known to be a subslice of
+    /// `doc` (e.g. a pretokenizer split of the document being encoded). The
+    /// surrounding document lets the cache key be built with one masked
+    /// 16-byte load instead of length-dependent partial loads. Passing a
+    /// `piece` that is not inside `doc` is safe — it just loses that fast
+    /// path (and `encode_into` does exactly that with `doc == piece`).
+    #[inline]
+    pub fn encode_piece_into(&self, doc: &[u8], piece: &[u8], cache: Option<&mut PretokenCache>, out: &mut Vec<TokenId>) {
+        if piece.is_empty() {
             return;
         }
-        if let Some(c) = cache.as_deref_mut() {
-            if text.len() <= CACHE_KEY_MAX && c.get(text, out) {
-                return;
+        if let Some(c) = cache {
+            if piece.len() <= CACHE_KEY_MAX {
+                let (lo, hi) = key_words_within(doc, piece);
+                if c.get_with_key(lo, hi, out) {
+                    return;
+                }
+                return self.encode_cache_miss(piece, lo, hi, c, out);
             }
         }
+        self.encode_uncached(piece, out)
+    }
+
+    /// Cache-miss slow path: outlined so the hit path stays tight.
+    /// `lo`/`hi` are the piece's already-computed key words.
+    #[inline(never)]
+    fn encode_cache_miss(&self, text: &[u8], lo: u64, hi: u64, cache: &mut PretokenCache, out: &mut Vec<TokenId>) {
+        debug_assert!(text.len() <= CACHE_KEY_MAX);
+        if let Some(&token_id) = self.token_cache.get(text) {
+            cache.insert_with_key(lo, hi, &[token_id]);
+            out.push(token_id);
+            return;
+        }
+        let start = out.len();
+        self.encode_sequential_into(text, out);
+        let toks = &out[start..];
+        if !toks.is_empty() && toks.len() <= CACHE_MAX_TOKENS {
+            cache.insert_with_key(lo, hi, toks);
+        }
+    }
+
+    /// No-cache / long-piece path (pieces over the cache key limit never
+    /// interact with the pretoken cache).
+    #[inline(never)]
+    fn encode_uncached(&self, text: &[u8], out: &mut Vec<TokenId>) {
         if text.len() <= MAX_CACHED_TOKEN_LEN {
             if let Some(&token_id) = self.token_cache.get(text) {
-                if let Some(c) = cache {
-                    c.insert(text, &[token_id]);
-                }
                 out.push(token_id);
                 return;
             }
@@ -467,11 +505,7 @@ impl BacktrackingBytePairEncoder {
             out.extend(self.encode(text));
             return;
         }
-        let start = out.len();
         self.encode_sequential_into(text, out);
-        if let Some(c) = cache {
-            c.insert(text, &out[start..]); // self-guards key/value size limits
-        }
     }
 
     /// Encode text into BPE tokens.
@@ -624,6 +658,20 @@ impl BacktrackingBytePairEncoder {
         out.extend_from_slice(&tokens);
     }
 
+    /// Profiling hook: direct single-token lookup in the token byte cache.
+    #[doc(hidden)]
+    #[inline]
+    pub fn token_cache_get(&self, text: &[u8]) -> Option<TokenId> {
+        self.token_cache.get(text).copied()
+    }
+
+    /// Profiling hook: run the full backtracking path, bypassing all caches.
+    #[doc(hidden)]
+    #[inline]
+    pub fn encode_backtrack_into(&self, text: &[u8], out: &mut Vec<TokenId>) {
+        self.encode_sequential_into(text, out);
+    }
+
     #[inline]
     fn next_match(&self, text: &[u8]) -> Option<TokenId> {
         self.matcher.find_iter(text).next().map(|m| m.pattern_id)
@@ -642,9 +690,10 @@ impl BacktrackingBytePairEncoder {
 
 /// Per-thread cache of pretoken bytes → encoded token sequence.
 ///
-/// Open-addressing table of 32-byte entries: a 16-byte key block
-/// (`[len, bytes...]`, compared as one 16-byte memcmp) plus up to 3 inline
-/// token ids. Sized so a warm chunk's working set stays resident; collisions
+/// Open-addressing table of 32-byte entries: a 16-byte inline key held as
+/// two u64 words (piece bytes zero-padded, length in the top byte — built
+/// with overlapping loads, no memcpy) plus up to 3 inline token ids. Sized
+/// so a warm chunk's working set stays resident; collisions
 /// beyond the probe window overwrite the home slot, which Zipfian pretoken
 /// frequency makes self-correcting (hot keys win back their slot).
 pub struct PretokenCache {
@@ -671,56 +720,159 @@ fn cache_bits() -> usize {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct CacheEntry {
-    /// key[0] = piece length (0 = empty slot), key[1..1+len] = piece bytes.
-    key: [u8; 16],
+    /// Canonical key: `lo` = first 8 piece bytes (LE, zero-padded), `hi` =
+    /// remaining bytes (LE, zero-padded) with the piece length in the top
+    /// byte. A real key always has `hi != 0` (len >= 1), so `hi == 0` marks
+    /// an empty slot.
+    key_lo: u64,
+    key_hi: u64,
     toks: [TokenId; CACHE_MAX_TOKENS],
     ntok: u32,
 }
 
+/// Zero-padded little-endian load of 1..=7 bytes, branch-light.
+///
+/// Uses overlapping reads: each byte lands at its own bit position, and
+/// overlapped bytes OR with themselves, so the result is exact.
+#[inline(always)]
+fn load_le_partial(p: &[u8]) -> u64 {
+    let len = p.len();
+    debug_assert!((1..=7).contains(&len));
+    if len >= 4 {
+        let a = u32::from_le_bytes(p[..4].try_into().unwrap()) as u64;
+        let b = u32::from_le_bytes(p[len - 4..].try_into().unwrap()) as u64;
+        a | (b << ((len - 4) * 8))
+    } else {
+        let a = p[0] as u64;
+        let b = (p[len / 2] as u64) << ((len / 2) * 8);
+        let c = (p[len - 1] as u64) << ((len - 1) * 8);
+        a | b | c
+    }
+}
+
+/// Build the canonical (lo, hi) key words for `piece` (1..=15 bytes) when
+/// `piece` is a subslice of `doc`: a single unconditional 16-byte load from
+/// `doc` masked down to `len` bytes — no length-dependent branches. Falls
+/// back to [`key_words`] near the end of `doc` or when `piece` is not
+/// inside `doc` (detected by the bounds check; distinct live allocations
+/// are disjoint, so an in-bounds offset proves the bytes are the piece's).
+#[inline(always)]
+fn key_words_within(doc: &[u8], piece: &[u8]) -> (u64, u64) {
+    let len = piece.len();
+    debug_assert!((1..=CACHE_KEY_MAX).contains(&len));
+    let start = (piece.as_ptr() as usize).wrapping_sub(doc.as_ptr() as usize);
+    if start <= doc.len() && doc.len() - start >= 16 {
+        let raw = u128::from_le_bytes(doc[start..start + 16].try_into().unwrap());
+        let masked = raw & (u128::MAX >> (128 - 8 * len));
+        (masked as u64, (masked >> 64) as u64 | ((len as u64) << 56))
+    } else {
+        key_words(piece)
+    }
+}
+
+/// Build the canonical (lo, hi) key words for a piece of 1..=15 bytes.
+#[inline(always)]
+fn key_words(bytes: &[u8]) -> (u64, u64) {
+    let len = bytes.len();
+    debug_assert!((1..=CACHE_KEY_MAX).contains(&len));
+    let (lo, mut hi) = if len >= 8 {
+        let lo = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let hi = if len > 8 { load_le_partial(&bytes[8..]) } else { 0 };
+        (lo, hi)
+    } else {
+        (load_le_partial(bytes), 0)
+    };
+    hi |= (len as u64) << 56;
+    (lo, hi)
+}
+
 impl PretokenCache {
+    /// Longest piece (in bytes) the cache can key on.
+    pub const KEY_MAX: usize = CACHE_KEY_MAX;
+    /// Most tokens a cached entry can hold.
+    pub const MAX_TOKENS: usize = CACHE_MAX_TOKENS;
+
     pub fn new() -> Self {
-        let empty = CacheEntry { key: [0; 16], toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
+        let empty = CacheEntry { key_lo: 0, key_hi: 0, toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
         let n = 1usize << cache_bits();
-        Self { entries: vec![empty; n].into_boxed_slice(), mask: n - 1 }
+        let entries = vec![empty; n].into_boxed_slice();
+        // Advise transparent huge pages for the table on Linux: the default
+        // table is exactly one 2 MiB page, and probes are uniform-random, so
+        // THP removes almost all TLB misses on the probe path. Advisory only
+        // (errors ignored). NOTE: wired but not benchmarked locally — the
+        // development machine is macOS, which has no madvise(MADV_HUGEPAGE).
+        #[cfg(target_os = "linux")]
+        {
+            const MADV_HUGEPAGE: i32 = 14;
+            unsafe extern "C" {
+                fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
+            }
+            // SAFETY: the pointer/length describe the live `entries`
+            // allocation; madvise(MADV_HUGEPAGE) does not alter contents.
+            unsafe {
+                madvise(
+                    entries.as_ptr() as *mut core::ffi::c_void,
+                    n * std::mem::size_of::<CacheEntry>(),
+                    MADV_HUGEPAGE,
+                );
+            }
+        }
+        Self { entries, mask: n - 1 }
     }
 
     /// Reset every entry to empty (for reuse under a different tokenizer).
     pub fn clear(&mut self) {
-        let empty = CacheEntry { key: [0; 16], toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
+        let empty = CacheEntry { key_lo: 0, key_hi: 0, toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
         self.entries.fill(empty);
     }
 
     #[inline(always)]
-    fn key_block(bytes: &[u8]) -> [u8; 16] {
-        debug_assert!(!bytes.is_empty() && bytes.len() <= CACHE_KEY_MAX);
-        let mut k = [0u8; 16];
-        k[0] = bytes.len() as u8;
-        k[1..1 + bytes.len()].copy_from_slice(bytes);
-        k
-    }
-
-    #[inline(always)]
-    fn slot(&self, k: &[u8; 16]) -> usize {
-        let a = u64::from_le_bytes(k[..8].try_into().unwrap());
-        let b = u64::from_le_bytes(k[8..].try_into().unwrap());
-        let h = (a ^ 0x9E37_79B9_7F4A_7C15)
+    fn slot(&self, lo: u64, hi: u64) -> usize {
+        let h = (lo ^ 0x9E37_79B9_7F4A_7C15)
             .wrapping_mul(0xA076_1D64_78BD_642F)
-            ^ b.wrapping_mul(0xE703_7ED1_A0B4_28DB);
+            ^ hi.wrapping_mul(0xE703_7ED1_A0B4_28DB);
         ((h ^ (h >> 32)) as usize) & self.mask
     }
 
     /// Look up a piece; on hit, append its tokens to `out` and return true.
+    ///
+    /// Public for profiling harnesses; `encode_into` is the normal entry point.
     #[inline(always)]
-    fn get(&self, bytes: &[u8], out: &mut Vec<TokenId>) -> bool {
-        let k = Self::key_block(bytes);
-        let mut i = self.slot(&k);
+    pub fn get(&self, bytes: &[u8], out: &mut Vec<TokenId>) -> bool {
+        let (lo, hi) = key_words(bytes);
+        self.get_with_key(lo, hi, out)
+    }
+
+    /// Profiling hook: build the canonical key words for a piece.
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn key_of(bytes: &[u8]) -> (u64, u64) {
+        key_words(bytes)
+    }
+
+    /// Probe with precomputed key words (profiling hook + batch path).
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn get_with_key(&self, lo: u64, hi: u64, out: &mut Vec<TokenId>) -> bool {
+        let mut i = self.slot(lo, hi);
         for _ in 0..CACHE_PROBES {
             let e = &self.entries[i];
-            if e.key == k {
-                out.extend_from_slice(&e.toks[..e.ntok as usize]);
+            if e.key_lo == lo && e.key_hi == hi {
+                // Emit via a fixed-width store: always copy all 3 slots, then
+                // advance len by the real count. Avoids the variable-length
+                // memcpy branch on the hottest path in the crate.
+                out.reserve(CACHE_MAX_TOKENS);
+                // SAFETY: reserve guarantees capacity for CACHE_MAX_TOKENS
+                // more elements; ntok <= CACHE_MAX_TOKENS by construction,
+                // and the first ntok slots are initialized token ids.
+                unsafe {
+                    let len = out.len();
+                    std::ptr::copy_nonoverlapping(e.toks.as_ptr(), out.as_mut_ptr().add(len), CACHE_MAX_TOKENS);
+                    out.set_len(len + e.ntok as usize);
+                }
                 return true;
             }
-            if e.key[0] == 0 {
+            if e.key_hi == 0 {
                 return false;
             }
             i = (i + 1) & self.mask;
@@ -728,25 +880,37 @@ impl PretokenCache {
         false
     }
 
+    /// Insert a piece → token mapping (self-guards key/value size limits).
+    ///
+    /// Public for profiling harnesses; `encode_into` is the normal entry point.
     #[inline]
-    fn insert(&mut self, bytes: &[u8], toks: &[TokenId]) {
+    pub fn insert(&mut self, bytes: &[u8], toks: &[TokenId]) {
         if bytes.is_empty() || bytes.len() > CACHE_KEY_MAX || toks.is_empty() || toks.len() > CACHE_MAX_TOKENS {
             return;
         }
-        let k = Self::key_block(bytes);
-        let home = self.slot(&k);
+        let (lo, hi) = key_words(bytes);
+        self.insert_with_key(lo, hi, toks);
+    }
+
+    /// Insert with precomputed key words. `toks` must be non-empty and at
+    /// most [`Self::MAX_TOKENS`] long (checked in debug builds).
+    #[inline]
+    pub fn insert_with_key(&mut self, lo: u64, hi: u64, toks: &[TokenId]) {
+        debug_assert!(!toks.is_empty() && toks.len() <= CACHE_MAX_TOKENS);
+        let home = self.slot(lo, hi);
         let mut i = home;
         let mut target = home;
         for _ in 0..CACHE_PROBES {
             let e = &self.entries[i];
-            if e.key[0] == 0 || e.key == k {
+            if e.key_hi == 0 || (e.key_lo == lo && e.key_hi == hi) {
                 target = i;
                 break;
             }
             i = (i + 1) & self.mask;
         }
         let e = &mut self.entries[target];
-        e.key = k;
+        e.key_lo = lo;
+        e.key_hi = hi;
         e.ntok = toks.len() as u32;
         e.toks[..toks.len()].copy_from_slice(toks);
     }
@@ -819,6 +983,70 @@ mod tests {
             let mut got = Vec::new();
             encoder.encode_into(p, None, &mut got);
             assert_eq!(got, encoder.encode(p), "no-cache piece {:?}", p);
+        }
+    }
+
+    #[test]
+    fn test_key_words_within_matches_standalone() {
+        // Every length 1..=15, at every offset of a small doc, including the
+        // tail (< 16 bytes left, fallback path) — the contextual masked-load
+        // key must equal the standalone key.
+        let doc: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        for start in 0..doc.len() {
+            for len in 1..=CACHE_KEY_MAX {
+                if start + len > doc.len() {
+                    break;
+                }
+                let piece = &doc[start..start + len];
+                assert_eq!(
+                    key_words_within(&doc, piece),
+                    key_words(piece),
+                    "start {start} len {len}"
+                );
+            }
+        }
+        // A piece that is not a subslice of doc must fall back safely.
+        let outside = vec![0xABu8; 7];
+        assert_eq!(key_words_within(&doc, &outside), key_words(&outside));
+        // All-0xFF piece: masking must not leak neighboring bytes.
+        let doc2 = [0xFFu8; 32];
+        for len in 1..=CACHE_KEY_MAX {
+            assert_eq!(key_words_within(&doc2, &doc2[3..3 + len]), key_words(&doc2[3..3 + len]));
+        }
+    }
+
+    #[test]
+    fn test_encode_piece_into_doc_context_matches_encode() {
+        let base_tokens = vec![vec![b'a'], vec![b'b'], vec![b'c']];
+        let merges = vec![(0, 1), (3, 2)]; // ab, abc
+        let (encoder, _) = BacktrackingBytePairEncoder::from_merges(&merges, &base_tokens);
+        // Build a doc and carve pieces out of it: single-token, multi-token,
+        // repeats, a >15-byte piece, and pieces at the very end of the doc.
+        let doc: Vec<u8> = b"abcabbacababcabcabcabcabcababcacab".to_vec();
+        let ranges: Vec<(usize, usize)> = vec![
+            (0, 3),   // abc — single token
+            (3, 5),   // ab — single token
+            (5, 8),   // bac — multi token
+            (8, 11),  // aba
+            (11, 14), (14, 17), (11, 14), // repeats
+            (5, 25),  // 20 bytes — over the cache key limit
+            (doc.len() - 2, doc.len()),   // tail: fallback key path
+            (doc.len() - 1, doc.len()),   // last byte
+            (7, 7),   // empty
+        ];
+        let mut cache = PretokenCache::new();
+        for pass in 0..2 {
+            for &(s, e) in &ranges {
+                let piece = &doc[s..e];
+                let expect = encoder.encode(piece);
+                let mut got = Vec::new();
+                encoder.encode_piece_into(&doc, piece, Some(&mut cache), &mut got);
+                assert_eq!(got, expect, "pass {pass}, range {s}..{e}");
+                // And uncached
+                let mut got2 = Vec::new();
+                encoder.encode_piece_into(&doc, piece, None, &mut got2);
+                assert_eq!(got2, expect, "no-cache, range {s}..{e}");
+            }
         }
     }
 

@@ -116,6 +116,16 @@ impl Encoder {
         }
     }
 
+    /// Like [`Self::encode_into`], for a `piece` that is a subslice of `doc`
+    /// (lets the Backtracking cache build its key with one masked load).
+    #[inline]
+    pub fn encode_piece_into(&self, doc: &[u8], piece: &[u8], cache: Option<&mut PretokenCache>, out: &mut Vec<TokenId>) {
+        match self {
+            Encoder::Backtracking(e) => e.encode_piece_into(doc, piece, cache, out),
+            _ => out.extend(self.encode(piece)),
+        }
+    }
+
     /// Get the vocabulary size.
     pub fn vocab_size(&self) -> usize {
         match self {

@@ -49,8 +49,9 @@ fn main() {
     let mut out: Vec<u32> = Vec::new();
     for d in &docs {
         out.clear();
+        let db = d.as_bytes();
         for piece in pretok.split(d) {
-            tok.encoder().encode_into(piece.as_bytes(), Some(&mut cache), &mut out);
+            tok.encoder().encode_piece_into(db, piece.as_bytes(), Some(&mut cache), &mut out);
         }
         toks_c += out.len();
     }
