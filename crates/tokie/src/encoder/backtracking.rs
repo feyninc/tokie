@@ -29,6 +29,159 @@ fn pack_pair(left: TokenId, right: TokenId) -> u64 {
     ((left as u64) << 32) | (right as u64)
 }
 
+/// Maximum piece length routed to the rank-merge core on the cache-miss path.
+/// Longer pieces (rare) keep the DAAC backtracking walk.
+const RANK_MERGE_MAX_LEN: usize = 32;
+
+/// Direct-index dense sub-table bound: pairs with both ids below this use a
+/// flat array lookup instead of the hash probe. 512*512*4 B = 1 MiB.
+const DENSE_PAIR_BOUND: u32 = 512;
+
+/// Empty-slot sentinel for the open-addressed pair table. No valid packed
+/// pair can equal this (both halves would need to be u32::MAX, which is
+/// never a token id).
+const PAIR_EMPTY_KEY: u64 = u64::MAX;
+
+/// Rank/merge lookup for BPE pairs, gigatoken-style.
+///
+/// Open-addressed flat table of inline 16-byte entries mapping a packed
+/// (left, right) u64 to the merged token id, plus a dense direct-indexed
+/// sub-table for pairs where both ids are below [`DENSE_PAIR_BOUND`]
+/// (which covers every first-round byte-pair lookup).
+///
+/// The merge *rank* is the merged token id itself: tokie's backtracking
+/// encoder already defines canonical order by merged id (`is_valid_pair`
+/// compares `combined < limit`), so using the id keeps the rank-merge loop
+/// consistent with the DAAC walk by construction. A construction-time check
+/// verifies every merge produces an id greater than both parts (true for
+/// well-formed BPE vocabs); otherwise the rank-merge path is disabled.
+#[derive(Clone)]
+struct RankPairTable {
+    /// Open-addressed table; slot count is a power of two.
+    entries: Box<[PairEntry]>,
+    mask: usize,
+    /// Dense sub-table: `dense[(l << 9) | r]` = merged id or u32::MAX.
+    dense: Box<[u32]>,
+    /// byte value -> base token id for that single byte.
+    byte_to_base: [TokenId; 256],
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PairEntry {
+    key: u64,
+    merged: TokenId,
+    _pad: u32,
+}
+
+impl RankPairTable {
+    /// Build the table, or return None when the vocab lacks the required
+    /// structure (missing single-byte base tokens, or a merge whose id is
+    /// not greater than both parts).
+    fn build(pair_lookup: &FoldHashMap<u64, TokenId>, token_bytes: &[Vec<u8>]) -> Option<Self> {
+        if pair_lookup.is_empty() {
+            return None;
+        }
+
+        // Byte -> base token map: lowest id single-byte token wins.
+        let mut byte_to_base = [u32::MAX; 256];
+        for (id, bytes) in token_bytes.iter().enumerate() {
+            if bytes.len() == 1 && byte_to_base[bytes[0] as usize] == u32::MAX {
+                byte_to_base[bytes[0] as usize] = id as TokenId;
+            }
+        }
+        if byte_to_base.iter().any(|&id| id == u32::MAX) {
+            return None; // not a byte-complete vocab; keep DAAC everywhere
+        }
+
+        // Merge-monotonicity check: rank-merge merges the lowest merged id
+        // first and assumes newly created pairs always rank later.
+        for (&key, &merged) in pair_lookup.iter() {
+            let left = (key >> 32) as u32;
+            let right = key as u32;
+            if merged <= left || merged <= right {
+                return None;
+            }
+        }
+
+        let slots = (pair_lookup.len() * 2).next_power_of_two();
+        let mut entries = vec![
+            PairEntry { key: PAIR_EMPTY_KEY, merged: 0, _pad: 0 };
+            slots
+        ]
+        .into_boxed_slice();
+        let mask = slots - 1;
+
+        let dense_len = (DENSE_PAIR_BOUND * DENSE_PAIR_BOUND) as usize;
+        let mut dense = vec![u32::MAX; dense_len].into_boxed_slice();
+
+        for (&key, &merged) in pair_lookup.iter() {
+            let left = (key >> 32) as u32;
+            let right = key as u32;
+            if left < DENSE_PAIR_BOUND && right < DENSE_PAIR_BOUND {
+                let idx = ((left << 9) | right) as usize;
+                // Duplicate pairs (same bytes, several ids) keep the lowest id,
+                // matching the min-rank selection the merge loop performs.
+                if merged < dense[idx] {
+                    dense[idx] = merged;
+                }
+            }
+            let mut i = Self::home_slot(key, mask);
+            loop {
+                let e = &mut entries[i];
+                if e.key == PAIR_EMPTY_KEY {
+                    e.key = key;
+                    e.merged = merged;
+                    break;
+                }
+                if e.key == key {
+                    if merged < e.merged {
+                        e.merged = merged;
+                    }
+                    break;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+
+        Some(Self { entries, mask, dense, byte_to_base })
+    }
+
+    #[inline(always)]
+    fn home_slot(key: u64, mask: usize) -> usize {
+        // Fibonacci multiplicative hash on the packed pair; the pair ids are
+        // small so the high bits need the multiply to get mixed.
+        let h = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        ((h >> 32) as usize) & mask
+    }
+
+    /// Merged id for (left, right), or u32::MAX when the pair never merges.
+    #[inline(always)]
+    fn merged_id(&self, left: TokenId, right: TokenId) -> u32 {
+        if left < DENSE_PAIR_BOUND && right < DENSE_PAIR_BOUND {
+            return self.dense[((left << 9) | right) as usize];
+        }
+        self.merged_id_flat(left, right)
+    }
+
+    /// Flat-table probe only (used to measure whether the dense table pays).
+    #[inline(always)]
+    fn merged_id_flat(&self, left: TokenId, right: TokenId) -> u32 {
+        let key = pack_pair(left, right);
+        let mut i = Self::home_slot(key, self.mask);
+        loop {
+            let e = self.entries[i];
+            if e.key == key {
+                return e.merged;
+            }
+            if e.key == PAIR_EMPTY_KEY {
+                return u32::MAX;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 /// Split text into chunks at boundary characters (space/newline).
 #[inline]
 fn split_at_boundaries(text: &[u8]) -> Vec<&[u8]> {
@@ -155,6 +308,10 @@ pub struct BacktrackingBytePairEncoder {
     /// Maps byte sequence -> token ID for early exit.
     /// Uses foldhash for fast lookups.
     token_cache: FoldHashMap<Vec<u8>, TokenId>,
+    /// Rank-based merge table for the short-piece cache-miss path.
+    /// None when the vocab lacks byte-complete base tokens or monotone
+    /// merge ids; those vocabs keep the DAAC walk everywhere.
+    rank_table: Option<RankPairTable>,
 }
 
 impl BacktrackingBytePairEncoder {
@@ -213,6 +370,7 @@ impl BacktrackingBytePairEncoder {
             }
         }
 
+        let rank_table = RankPairTable::build(&pair_lookup, &token_bytes);
         let encoder = Self {
             split_table,
             pair_lookup,
@@ -221,6 +379,7 @@ impl BacktrackingBytePairEncoder {
             matcher,
             next_prefix_match,
             token_cache,
+            rank_table,
         };
 
         (encoder, token_bytes)
@@ -285,6 +444,7 @@ impl BacktrackingBytePairEncoder {
             }
         }
 
+        let rank_table = RankPairTable::build(&pair_lookup, &token_bytes);
         let encoder = Self {
             split_table,
             pair_lookup,
@@ -293,6 +453,7 @@ impl BacktrackingBytePairEncoder {
             matcher,
             next_prefix_match,
             token_cache,
+            rank_table,
         };
 
         (encoder, token_bytes)
@@ -316,6 +477,7 @@ impl BacktrackingBytePairEncoder {
             }
         }
 
+        let rank_table = RankPairTable::build(&pair_lookup, token_bytes);
         Self {
             split_table,
             pair_lookup,
@@ -324,6 +486,7 @@ impl BacktrackingBytePairEncoder {
             matcher,
             next_prefix_match,
             token_cache,
+            rank_table,
         }
     }
 
@@ -483,7 +646,14 @@ impl BacktrackingBytePairEncoder {
             return;
         }
         let start = out.len();
-        self.encode_sequential_into(text, out);
+        // Pieces here are at most CACHE_KEY_MAX (15) bytes, well under
+        // RANK_MERGE_MAX_LEN, so the rank-merge core applies whenever the
+        // vocab supports it; otherwise fall back to the DAAC walk.
+        if self.rank_table.is_some() {
+            self.encode_rank_merge(text, out);
+        } else {
+            self.encode_sequential_into(text, out);
+        }
         let toks = &out[start..];
         if !toks.is_empty() && toks.len() <= CACHE_MAX_TOKENS {
             cache.insert_with_key(lo, hi, toks);
@@ -505,7 +675,88 @@ impl BacktrackingBytePairEncoder {
             out.extend(self.encode(text));
             return;
         }
+        if text.len() <= RANK_MERGE_MAX_LEN && self.rank_table.is_some() {
+            return self.encode_rank_merge(text, out);
+        }
         self.encode_sequential_into(text, out);
+    }
+
+    /// Whether the rank-merge core is available for this vocab.
+    pub fn has_rank_merge(&self) -> bool {
+        self.rank_table.is_some()
+    }
+
+    /// Encode one piece with the rank-based BPE merge loop.
+    ///
+    /// Starts from per-byte base tokens and repeatedly merges the
+    /// lowest-ranked adjacent pair (rank = merged token id, see
+    /// [`RankPairTable`]) until no pair in the table applies. All
+    /// occurrences of the winning pair are merged left-to-right in one
+    /// pass, which is equivalent to one-at-a-time lowest-rank merging
+    /// because merges are id-monotone (checked at construction).
+    ///
+    /// Panics if the rank table is unavailable; callers must check
+    /// [`Self::has_rank_merge`] first.
+    #[doc(hidden)]
+    pub fn encode_rank_merge(&self, text: &[u8], out: &mut Vec<TokenId>) {
+        self.encode_rank_merge_impl::<true>(text, out)
+    }
+
+    /// Flat-probe-only variant, used to measure whether the dense
+    /// direct-index sub-table pays for itself.
+    #[doc(hidden)]
+    pub fn encode_rank_merge_flat(&self, text: &[u8], out: &mut Vec<TokenId>) {
+        self.encode_rank_merge_impl::<false>(text, out)
+    }
+
+    #[inline(always)]
+    fn encode_rank_merge_impl<const DENSE: bool>(&self, text: &[u8], out: &mut Vec<TokenId>) {
+        let table = self.rank_table.as_ref().expect("rank table unavailable");
+
+        let mut toks: SmallVec<[TokenId; RANK_MERGE_MAX_LEN]> = text
+            .iter()
+            .map(|&b| table.byte_to_base[b as usize])
+            .collect();
+
+        while toks.len() > 1 {
+            // Find the lowest-rank adjacent pair (leftmost on ties).
+            let mut best_rank = u32::MAX;
+            let mut best_i = usize::MAX;
+            for i in 0..toks.len() - 1 {
+                let m = if DENSE {
+                    table.merged_id(toks[i], toks[i + 1])
+                } else {
+                    table.merged_id_flat(toks[i], toks[i + 1])
+                };
+                if m < best_rank {
+                    best_rank = m;
+                    best_i = i;
+                }
+            }
+            if best_i == usize::MAX {
+                break;
+            }
+
+            // Merge every occurrence of that exact pair, left to right.
+            let left = toks[best_i];
+            let right = toks[best_i + 1];
+            let mut w = best_i;
+            let mut i = best_i;
+            let n = toks.len();
+            while i < n {
+                if i + 1 < n && toks[i] == left && toks[i + 1] == right {
+                    toks[w] = best_rank;
+                    i += 2;
+                } else {
+                    toks[w] = toks[i];
+                    i += 1;
+                }
+                w += 1;
+            }
+            toks.truncate(w);
+        }
+
+        out.extend_from_slice(&toks);
     }
 
     /// Encode text into BPE tokens.
@@ -616,7 +867,11 @@ impl BacktrackingBytePairEncoder {
         out
     }
 
-    fn encode_sequential_into(&self, text: &[u8], out: &mut Vec<TokenId>) {
+    /// DAAC greedy-longest-match walk with validity backtracking.
+    /// Public (hidden) so differential tests can compare it against
+    /// [`Self::encode_rank_merge`] directly, bypassing caches.
+    #[doc(hidden)]
+    pub fn encode_sequential_into(&self, text: &[u8], out: &mut Vec<TokenId>) {
         let n = text.len();
         // Use SmallVec to avoid heap allocation for small pieces
         let mut tokens: SmallVec<[TokenId; 16]> = SmallVec::new();
@@ -1118,6 +1373,83 @@ mod tests {
             let decoded = decoder.decode(&encoded);
             assert_eq!(decoded, text);
         }
+    }
+
+    /// Byte-complete vocab (all 256 single-byte base tokens) with a few
+    /// merges. The merge list is self-consistent (every merge is reachable
+    /// under classic lowest-rank-first merging), as real trained BPE vocabs
+    /// are — an inconsistent list makes greedy-longest-match and canonical
+    /// merge order legitimately diverge.
+    fn byte_complete_encoder() -> BacktrackingBytePairEncoder {
+        let base_tokens: Vec<Vec<u8>> = (0u16..256).map(|b| vec![b as u8]).collect();
+        let a = b'a' as TokenId;
+        let merges = vec![
+            (a, a + 1),        // 256 "ab"
+            (256, a + 2),      // 257 "abc"
+            (b'l' as u32, b'l' as u32), // 258 "ll"
+            (b'h' as u32, b'e' as u32), // 259 "he"
+            (258, b'o' as u32), // 260 "llo"
+            (259, 260),        // 261 "hello"
+            (b' ' as u32, b't' as u32), // 262 " t"
+            (262, 259),         // 263 " the" (" t" + "he")
+        ];
+        let (encoder, _) = BacktrackingBytePairEncoder::from_merges(&merges, &base_tokens);
+        encoder
+    }
+
+    #[test]
+    fn test_rank_merge_matches_backtracking() {
+        let encoder = byte_complete_encoder();
+        assert!(encoder.has_rank_merge());
+
+        let cases: Vec<&[u8]> = vec![
+            b"abc", b"ab", b"hello", b"hhello", b"llllll", b"aaabbb",
+            b" the", b" the the", b"abcabcabc", b"xyz", b"\x00\xff\xfe",
+        ];
+        for text in cases {
+            let mut daac = Vec::new();
+            encoder.encode_sequential_into(text, &mut daac);
+            let mut rank = Vec::new();
+            encoder.encode_rank_merge(text, &mut rank);
+            assert_eq!(rank, daac, "piece {:?}", text);
+            let mut flat = Vec::new();
+            encoder.encode_rank_merge_flat(text, &mut flat);
+            assert_eq!(flat, daac, "flat probe, piece {:?}", text);
+        }
+    }
+
+    #[test]
+    fn test_rank_merge_fuzz_matches_backtracking() {
+        let encoder = byte_complete_encoder();
+        let mut state = 0x853C_49E6_748F_EA9Bu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..5000 {
+            let len = 1 + (next() as usize) % 40;
+            let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let mut daac = Vec::new();
+            encoder.encode_sequential_into(&bytes, &mut daac);
+            let mut rank = Vec::new();
+            encoder.encode_rank_merge(&bytes, &mut rank);
+            assert_eq!(rank, daac, "fuzz bytes {:?}", bytes);
+        }
+    }
+
+    #[test]
+    fn test_rank_merge_disabled_for_non_byte_vocab() {
+        // 3-letter vocab: not byte-complete, rank merge must be disabled
+        // and encode_into must still produce correct output via DAAC.
+        let base_tokens = vec![vec![b'a'], vec![b'b'], vec![b'c']];
+        let merges = vec![(0, 1), (3, 2)];
+        let (encoder, _) = BacktrackingBytePairEncoder::from_merges(&merges, &base_tokens);
+        assert!(!encoder.has_rank_merge());
+        let mut out = Vec::new();
+        encoder.encode_into(b"abcab", None, &mut out);
+        assert_eq!(out, encoder.encode(b"abcab"));
     }
 
     #[test]
