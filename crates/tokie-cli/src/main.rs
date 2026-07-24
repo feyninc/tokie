@@ -42,6 +42,23 @@ enum Commands {
         #[arg(long)]
         tkz: Option<PathBuf>,
     },
+    /// Manage tokie's local caches
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommands {
+    /// Delete compiled tokenizer artifacts (tokenizer.compiled-*.tkz) from the
+    /// HuggingFace hub cache. Downloaded tokenizer.json files are untouched;
+    /// artifacts are rebuilt on the next load.
+    Clear {
+        /// Cache directory to scan (defaults to the HuggingFace hub cache)
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
 }
 
 const MAX_MISMATCHES_SHOWN: usize = 5;
@@ -107,6 +124,91 @@ fn main() {
         Commands::Verify { repo_id, tkz } => {
             cmd_verify(&repo_id, tkz);
         }
+        Commands::Cache { command } => match command {
+            CacheCommands::Clear { cache_dir } => {
+                cmd_cache_clear(cache_dir);
+            }
+        },
+    }
+}
+
+fn cmd_cache_clear(cache_dir: Option<PathBuf>) {
+    let root = cache_dir.unwrap_or_else(|| hf_hub::Cache::default().path().clone());
+    if !root.exists() {
+        println!("cache directory {} does not exist, nothing to do", root.display());
+        return;
+    }
+
+    let mut removed = 0usize;
+    let mut bytes = 0u64;
+    remove_compiled_artifacts(&root, &mut removed, &mut bytes);
+    println!(
+        "removed {removed} compiled artifact(s), freed {:.1} MiB from {}",
+        bytes as f64 / (1024.0 * 1024.0),
+        root.display()
+    );
+}
+
+/// Recursively delete compiled tokenizer artifacts under `dir`. Symlinks are
+/// never followed: compiled artifacts are always regular files (written via
+/// temp + rename), and hub snapshot dirs symlink everything else to blobs.
+fn remove_compiled_artifacts(dir: &std::path::Path, removed: &mut usize, bytes: &mut u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        if file_type.is_dir() {
+            remove_compiled_artifacts(&entry.path(), removed, bytes);
+        } else if file_type.is_file() && is_compiled_artifact(&entry.file_name().to_string_lossy()) {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if std::fs::remove_file(entry.path()).is_ok() {
+                *removed += 1;
+                *bytes += size;
+            }
+        }
+    }
+}
+
+fn is_compiled_artifact(name: &str) -> bool {
+    name.starts_with("tokenizer.compiled-") && (name.ends_with(".tkz") || name.ends_with(".tkz.tmp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_compiled_artifact() {
+        assert!(is_compiled_artifact("tokenizer.compiled-v0.1.1-f13.tkz"));
+        assert!(is_compiled_artifact("tokenizer.compiled-v0.1.1-f13-b1a2b3c4d5e6f708.tkz"));
+        assert!(is_compiled_artifact("tokenizer.compiled-v0.1.1-f13.tkz.tmp"));
+        assert!(!is_compiled_artifact("tokenizer.json"));
+        assert!(!is_compiled_artifact("tokenizer.tkz"));
+        assert!(!is_compiled_artifact("model.compiled-v1.tkz"));
+    }
+
+    #[test]
+    fn test_remove_compiled_artifacts() {
+        let root = std::env::temp_dir().join(format!("tokie-cache-clear-test-{}", std::process::id()));
+        let snapshot = root.join("models--gpt2/snapshots/abc123");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let stale = snapshot.join("tokenizer.compiled-v0.1.0-f12.tkz");
+        let tmp = snapshot.join("tokenizer.compiled-v0.1.0-f12.tkz.tmp");
+        let json = snapshot.join("tokenizer.json");
+        std::fs::write(&stale, b"stale").unwrap();
+        std::fs::write(&tmp, b"tmp").unwrap();
+        std::fs::write(&json, b"{}").unwrap();
+
+        let mut removed = 0;
+        let mut bytes = 0;
+        remove_compiled_artifacts(&root, &mut removed, &mut bytes);
+
+        assert_eq!(removed, 2);
+        assert_eq!(bytes, 8);
+        assert!(!stale.exists());
+        assert!(!tmp.exists());
+        assert!(json.exists(), "tokenizer.json must be untouched");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 

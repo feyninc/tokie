@@ -237,17 +237,44 @@ struct CompiledMeta {
     special: Vec<(String, crate::types::TokenId)>,
 }
 
+/// Basename of the compiled artifact cached next to a downloaded
+/// tokenizer.json. The key must change whenever the artifact contents could:
+/// crate version, .tkz format version, and — for builds from a git checkout —
+/// a hash of this crate's sources (TOKIE_BUILD_DISCRIMINATOR, emitted by
+/// build.rs; empty for crates.io builds, whose version already changes).
+fn compiled_cache_basename() -> String {
+    format!(
+        "tokenizer.compiled-v{}-f{}{}",
+        env!("CARGO_PKG_VERSION"),
+        crate::serde::VERSION,
+        env!("TOKIE_BUILD_DISCRIMINATOR"),
+    )
+}
+
+/// TOKIE_NO_COMPILED_CACHE disables reading and writing compiled artifacts
+/// (loads still work, straight from tokenizer.json). Unset, "" and "0" mean
+/// enabled.
+fn compiled_cache_disabled() -> bool {
+    disables_compiled_cache(std::env::var("TOKIE_NO_COMPILED_CACHE").ok().as_deref())
+}
+
+fn disables_compiled_cache(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.is_empty() && v != "0")
+}
+
 /// Load the compiled cache stored next to `json_path`, or build it from the
 /// json and store it. Returns None if the json can't be loaded (caller falls
 /// back to the network path). Cache writes are best-effort: a read-only cache
 /// dir just means the fast path stays cold.
 fn load_or_build_compiled(json_path: &std::path::Path) -> Option<Tokenizer> {
-    let base = format!("tokenizer.compiled-v{}-f{}", env!("CARGO_PKG_VERSION"), crate::serde::VERSION);
-    let tkz = json_path.with_file_name(format!("{base}.tkz"));
+    let cache_disabled = compiled_cache_disabled();
+    let tkz = json_path.with_file_name(format!("{}.tkz", compiled_cache_basename()));
 
     // v13 .tkz is self-contained (added/special tokens included)
-    if let Ok(tok) = Tokenizer::from_file(&tkz) {
-        return Some(tok);
+    if !cache_disabled {
+        if let Ok(tok) = Tokenizer::from_file(&tkz) {
+            return Some(tok);
+        }
     }
 
     // Build from json; extract added/special tokens from the same parse.
@@ -271,9 +298,11 @@ fn load_or_build_compiled(json_path: &std::path::Path) -> Option<Tokenizer> {
     }
 
     // Persist for next time (best effort, atomic-ish via temp + rename)
-    let tmp = tkz.with_extension("tkz.tmp");
-    if tok.to_file(&tmp).is_ok() {
-        let _ = std::fs::rename(&tmp, &tkz);
+    if !cache_disabled {
+        let tmp = tkz.with_extension("tkz.tmp");
+        if tok.to_file(&tmp).is_ok() {
+            let _ = std::fs::rename(&tmp, &tkz);
+        }
     }
 
     Some(tok)
@@ -378,6 +407,29 @@ fn tokiers_repo_name(repo_id: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compiled_cache_basename() {
+        let base = compiled_cache_basename();
+        let expected_prefix =
+            format!("tokenizer.compiled-v{}-f{}", env!("CARGO_PKG_VERSION"), crate::serde::VERSION);
+        assert!(base.starts_with(&expected_prefix), "unexpected basename: {base}");
+        // The optional build discriminator is the only allowed suffix.
+        let suffix = &base[expected_prefix.len()..];
+        assert!(
+            suffix.is_empty() || (suffix.starts_with("-b") && suffix.len() == 18),
+            "unexpected discriminator suffix: {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn test_disables_compiled_cache() {
+        assert!(!disables_compiled_cache(None));
+        assert!(!disables_compiled_cache(Some("")));
+        assert!(!disables_compiled_cache(Some("0")));
+        assert!(disables_compiled_cache(Some("1")));
+        assert!(disables_compiled_cache(Some("true")));
+    }
 
     #[test]
     fn test_tokiers_repo_name() {
