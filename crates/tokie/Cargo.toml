@@ -137,3 +137,11 @@ required-features = ["build"]
 [[example]]
 name = "regenerate_precompiled_v12"
 required-features = ["hf"]
+
+[[example]]
+name = "x1_miss"
+required-features = ["hf"]
+
+[[example]]
+name = "hf_diff"
+required-features = ["build"]

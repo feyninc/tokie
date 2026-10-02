@@ -847,7 +847,7 @@ impl Tokenizer {
     /// parallel path for large documents.
     fn encode_raw_ctx(&self, text: &str, cache: Option<&mut WorkerCaches>) -> Vec<TokenId> {
         let allow_parallel = cache.is_none();
-        if cache.is_none() && self.encoder.as_backtracking().is_some() && self.pretokenizer.is_some() {
+        if cache.is_none() && (self.encoder.as_backtracking().is_some() || self.encoder.as_simple().is_some() || self.encoder.as_wordpiece().is_some()) && self.pretokenizer.is_some() {
             let mut lease = crate::pool::CacheLease::checkout(self.cache_generation);
             return self.encode_raw_dispatch(text, Some(lease.caches()), allow_parallel);
         }
@@ -1111,6 +1111,16 @@ impl Tokenizer {
                     bt.encode_piece_into(db, p.as_bytes(), None, out)
                 }),
             }
+        } else if let Some(wp) = self.encoder.as_wordpiece() {
+            let mut pc = cache.map(|c| &mut c.pretok);
+            pretok.for_each_piece(text, |p| {
+                wp.encode_piece_into(db, p.as_bytes(), pc.as_deref_mut(), out)
+            })
+        } else if let Some(se) = self.encoder.as_simple() {
+            let mut pc = cache.map(|c| &mut c.pretok);
+            pretok.for_each_piece(text, |p| {
+                se.encode_piece_into(db, p.as_bytes(), pc.as_deref_mut(), out)
+            })
         } else {
             for piece in pretok.split(text) {
                 self.encoder.encode_piece_into(db, piece.as_bytes(), cache.as_deref_mut(), out);

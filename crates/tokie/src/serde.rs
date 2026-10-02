@@ -10,7 +10,8 @@
 //!   - magic: "TOKI" (4 bytes)
 //!   - version: u32 (4 bytes) - currently v12
 //!   - encoder_type: u32 (4 bytes) - 0=Backtracking, 1=Simple, 2=WordPiece
-//!   - pretokenizer_type: u32 (4 bytes) - 0=None, 1=GPT2, 2=CL100K, 3=O200K, 4=BERT, 5=Voyage
+//!   - pretokenizer_type: u32 (4 bytes) - 0=None, 1=GPT2, 2=CL100K, 3=O200K, 4=BERT, 5=Voyage,
+//!     6=DeepSeek, 7=SmolLM, 8=Qwen3.5, 9=Tekken
 //!   - normalizer_type: u32 (4 bytes) - 0=None, 1=BertUncased, 2=BertCased, 3=Nfc
 //!   - post_processor_type: u32 (4 bytes) - 0=None, 1=Bert, 2=Prefix, 3=Template
 //!   - vocab_size: u32 (4 bytes)
@@ -69,6 +70,7 @@ impl PretokType {
             6 => Some(Self::DeepSeek),
             7 => Some(Self::SmolLM),
             8 => Some(Self::Qwen35),
+            9 => Some(Self::Tekken),
             _ => None,
         }
     }
@@ -596,7 +598,7 @@ impl Tokenizer {
                 let next_prefix_match = deserialize_prefix_match(prefix_data)?;
 
                 // Rebuild pair_lookup from split_table
-                let pair_lookup = rebuild_pair_lookup(&split_table, num_base_tokens);
+                let pair_lookup = rebuild_pair_lookup(&split_table, num_base_tokens, &token_bytes);
 
                 // Extract token lengths from decoder offsets
                 let token_lengths: Vec<u8> = (0..vocab_size)
@@ -621,7 +623,8 @@ impl Tokenizer {
             EncoderType::Simple => {
                 // OPTIMIZED: Build lookups directly from decoder (single copy)
                 // Simple encoder doesn't use token_lengths, so we ignore it
-                let (byte_lut, token_cache, _, _) = build_token_lookups(&decoder_offsets, &decoder_data, vocab_size);
+                // Simple's whole-piece early exit covers tokens of any length.
+                let (byte_lut, token_cache, _, _) = build_token_lookups(&decoder_offsets, &decoder_data, vocab_size, usize::MAX);
                 let merges = deserialize_merges(merge_data)?;
 
                 let enc = BytePairEncoder::from_parts(
@@ -659,7 +662,7 @@ impl Tokenizer {
             }
             EncoderType::SentencePiece => {
                 // OPTIMIZED: Build lookups directly from decoder (single copy)
-                let (mut byte_lut, mut token_cache, token_lengths, byte_tokens) = build_token_lookups(&decoder_offsets, &decoder_data, vocab_size);
+                let (mut byte_lut, mut token_cache, token_lengths, byte_tokens) = build_token_lookups(&decoder_offsets, &decoder_data, vocab_size, MAX_CACHED_TOKEN_LEN);
                 let merges = deserialize_merges(merge_data)?;
 
                 // Fix byte_lut/token_cache for byte-fallback collisions.
@@ -681,6 +684,10 @@ impl Tokenizer {
                     token_lengths,
                     vocab_size,
                     num_base_tokens,
+                    |id| {
+                        let i = id as usize;
+                        &decoder_data[decoder_offsets[i] as usize..decoder_offsets[i + 1] as usize]
+                    },
                 );
                 Encoder::SentencePiece(enc)
             }
@@ -869,6 +876,7 @@ fn build_token_lookups(
     decoder_offsets: &[u32],
     decoder_data: &[u8],
     vocab_size: usize,
+    max_cached_len: usize,
 ) -> ([TokenId; 256], FoldHashMap<Vec<u8>, TokenId>, Vec<u16>, [Vec<TokenId>; 256]) {
     let mut byte_lut = [u32::MAX; 256];
     let mut byte_tokens: [Vec<TokenId>; 256] = std::array::from_fn(|_| Vec::new());
@@ -877,7 +885,7 @@ fn build_token_lookups(
     let short_count: usize = (0..vocab_size)
         .filter(|&i| {
             let len = (decoder_offsets[i + 1] - decoder_offsets[i]) as usize;
-            len <= MAX_CACHED_TOKEN_LEN
+            len <= max_cached_len
         })
         .count();
 
@@ -903,7 +911,7 @@ fn build_token_lookups(
             }
             // First-wins for token_cache
             token_cache.entry(bytes.to_vec()).or_insert(i as TokenId);
-        } else if len <= MAX_CACHED_TOKEN_LEN {
+        } else if len <= max_cached_len {
             token_cache.insert(bytes.to_vec(), i as TokenId);
         }
     }
@@ -1190,16 +1198,26 @@ fn deserialize_merges(data: &[u8]) -> Result<Vec<(TokenId, TokenId, TokenId)>, S
 fn rebuild_pair_lookup(
     splits: &[Split],
     num_base_tokens: usize,
+    token_bytes: &[Vec<u8>],
 ) -> FoldHashMap<u64, TokenId> {
     let mut lookup = FoldHashMap::default();
 
     for (id, split) in splits.iter().enumerate().skip(num_base_tokens) {
-        // Split::base entries (added/special tokens, e.g. gpt2's <|endoftext|>)
-        // point at themselves and are not merges; from_json never puts them in
-        // pair_lookup, and a degenerate (id,id)->id entry would make the rank
-        // table's monotonicity check reject the whole vocab.
-        if split.left == id as TokenId && split.right == id as TokenId {
-            continue;
+        // Split::base entries (added/special tokens) are not merges; from_json
+        // never puts them in pair_lookup, and a degenerate entry would make the
+        // rank table's monotonicity check reject the whole vocab on every .tkz
+        // load. A base split points at the token's *id*, which differs from its
+        // table position when the vocab has id holes (cl100k's <|endoftext|> sits
+        // at position 100256 with id 100257), so `left == id` alone misses them:
+        // keep only splits whose parts really concatenate to this token.
+        if split.left == split.right {
+            let is_merge = match (token_bytes.get(id), token_bytes.get(split.left as usize)) {
+                (Some(t), Some(part)) => t.len() == 2 * part.len() && t[..part.len()] == part[..] && t[part.len()..] == part[..],
+                _ => false,
+            };
+            if !is_merge {
+                continue;
+            }
         }
         lookup.insert(pack_pair(split.left, split.right), id as TokenId);
     }
@@ -1393,6 +1411,8 @@ mod tests {
             PretokType::Gpt2,
             PretokType::Cl100k,
             PretokType::O200k,
+            PretokType::Qwen35,
+            PretokType::Tekken,
         ] {
             assert_eq!(PretokType::from_u32(typ as u32), Some(typ));
         }
@@ -1468,6 +1488,35 @@ mod tests {
             tokenizer.encode("abcab", false).ids,
             loaded.encode("abcab", false).ids
         );
+    }
+
+    #[test]
+    fn test_rank_table_survives_roundtrip_with_id_holes() {
+        // cl100k/o200k layout: special tokens have ids past a gap, so they sit
+        // at a table position below their id and their Split::base(id) is not
+        // self-referential by position. The rebuild must still skip them.
+        let mut vocab: Vec<(u32, Vec<u8>)> = (0u32..256).map(|b| (b, vec![b as u8])).collect();
+        vocab.push((256, b"ab".to_vec()));
+        vocab.push((257, b"abc".to_vec()));
+        vocab.push((259, b"<|endoftext|>".to_vec())); // id 258 is a hole
+        let merges: Vec<(TokenId, TokenId)> = vec![(b'a' as u32, b'b' as u32), (256, b'c' as u32)];
+        let (encoder, token_bytes) =
+            crate::encoder::BacktrackingBytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256);
+        assert!(encoder.has_rank_merge(), "precondition: fresh build has rank table");
+
+        let tokenizer = Tokenizer::new(
+            Encoder::Backtracking(encoder),
+            Decoder::new(token_bytes),
+            PretokType::Gpt2,
+            Normalizer::None,
+            PostProcessor::None,
+        );
+        let mut buf = Vec::new();
+        tokenizer.save(&mut buf).expect("save failed");
+        let loaded = Tokenizer::load(&mut std::io::Cursor::new(&buf)).expect("load failed");
+        let enc = loaded.encoder().as_backtracking().expect("backtracking encoder");
+        assert!(enc.has_rank_merge(), "rank table must survive .tkz roundtrip with id holes");
+        assert_eq!(tokenizer.encode("abcab aa", false).ids, loaded.encode("abcab aa", false).ids);
     }
 
     #[test]

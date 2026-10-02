@@ -38,9 +38,13 @@
 //! assert_eq!(encoder.encode(b"ab"), vec![2]);
 //! ```
 
+use std::cell::RefCell;
+
 use foldhash::HashMap as FoldHashMap;
 use chunk::chunk;
 
+use super::units::{self, UnitSplit};
+use super::UnigramPieceCache;
 use crate::types::TokenId;
 
 // =============================================================================
@@ -52,7 +56,21 @@ const NONE: u32 = u32::MAX;
 
 /// Metaspace character (▁) in UTF-8: E2 96 81.
 /// Used for chunking at word boundaries in SentencePiece tokenizers.
-const METASPACE: [u8; 3] = [0xE2, 0x96, 0x81];
+const METASPACE: [u8; 3] = units::METASPACE;
+
+/// Units up to this many bytes merge with a linear min-rank scan over a
+/// flat array; longer ones use the radix heap. Both pop the same
+/// (rank, leftmost) pair each step, so they produce identical output.
+const SMALL_UNIT_MAX: usize = 64;
+
+/// Units longer than this skip the memo cache (CJK runs with no `▁`
+/// rarely repeat verbatim, and would only bloat the arena).
+const CACHED_UNIT_MAX: usize = 256;
+
+thread_local! {
+    /// Scratch buffers for unit merges, reused across calls on this thread.
+    static THREAD_STATE: RefCell<EncodeState> = RefCell::new(EncodeState::new());
+}
 
 // =============================================================================
 // Helper Functions
@@ -329,6 +347,11 @@ pub struct EncodeState {
     symbols: Vec<Symbol>,
     heap: RadixHeap,
     result: Vec<TokenId>,
+    /// Small-unit merge scratch: current tokens, rank of each adjacent
+    /// pair (`u32::MAX` = no merge) and the pair's merged token.
+    toks: Vec<TokenId>,
+    ranks: Vec<u32>,
+    merged: Vec<TokenId>,
 }
 
 impl EncodeState {
@@ -338,6 +361,9 @@ impl EncodeState {
             symbols: Vec::new(),
             heap: RadixHeap::new(),
             result: Vec::new(),
+            toks: Vec::new(),
+            ranks: Vec::new(),
+            merged: Vec::new(),
         }
     }
 
@@ -350,6 +376,9 @@ impl EncodeState {
             symbols: Vec::with_capacity(text_len),
             heap: RadixHeap::new(),
             result: Vec::with_capacity(text_len / 4),
+            toks: Vec::new(),
+            ranks: Vec::new(),
+            merged: Vec::new(),
         }
     }
 
@@ -410,6 +439,15 @@ pub struct SentencePieceBPE {
     byte_lut: [TokenId; 256],
     /// Token ID → byte length mapping.
     token_lengths: Vec<u16>,
+    /// ASCII byte → initial symbol (the `token_cache` / `byte_lut` lookup
+    /// `init_symbols_into` would do, precomputed).
+    ascii_lut: [TokenId; 128],
+    /// Initial symbol for `▁`, if it is a vocab char.
+    metaspace_token: Option<TokenId>,
+    /// Identity for thread-local unit-cache tagging.
+    cache_id: u64,
+    /// Which `▁` boundaries the input may be split at (see [`units`]).
+    unit_split: UnitSplit,
 }
 
 impl std::fmt::Debug for SentencePieceBPE {
@@ -419,6 +457,7 @@ impl std::fmt::Debug for SentencePieceBPE {
             .field("num_base_tokens", &self.num_base_tokens)
             .field("merges", &self.pair_lookup.len())
             .field("max_rank", &self.max_rank)
+            .field("unit_split", &self.unit_split)
             .finish()
     }
 }
@@ -510,15 +549,19 @@ impl SentencePieceBPE {
             }
         }
 
-        let encoder = Self {
+        let merged_bytes = pair_lookup.values().map(|&(id, _)| token_bytes[id as usize].as_slice());
+        let unit_split = Self::classify_unit_split(&token_cache, merged_bytes);
+
+        let encoder = Self::assemble(
             pair_lookup,
             max_rank,
             num_base_tokens,
-            vocab_size: vocab.len(),
+            vocab.len(),
             token_cache,
             byte_lut,
             token_lengths,
-        };
+            unit_split,
+        );
 
         (encoder, token_bytes)
     }
@@ -541,18 +584,62 @@ impl SentencePieceBPE {
         &self.pair_lookup
     }
 
+    /// Classify the `▁` split rule from every symbol the merge loop can
+    /// hold: initial chars/bytes (all `token_cache` keys) and merge outputs.
+    fn classify_unit_split<'a>(
+        token_cache: &'a FoldHashMap<Vec<u8>, TokenId>,
+        merged_bytes: impl Iterator<Item = &'a [u8]>,
+    ) -> UnitSplit {
+        UnitSplit::classify(token_cache.keys().map(|k| k.as_slice()).chain(merged_bytes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        pair_lookup: FoldHashMap<u64, (TokenId, u32)>,
+        max_rank: u32,
+        num_base_tokens: usize,
+        vocab_size: usize,
+        token_cache: FoldHashMap<Vec<u8>, TokenId>,
+        byte_lut: [TokenId; 256],
+        token_lengths: Vec<u16>,
+        unit_split: UnitSplit,
+    ) -> Self {
+        let mut ascii_lut = [u32::MAX; 128];
+        for (b, slot) in ascii_lut.iter_mut().enumerate() {
+            *slot = token_cache.get(&[b as u8][..]).copied().unwrap_or(byte_lut[b]);
+        }
+        let metaspace_token = token_cache.get(&METASPACE[..]).copied();
+        Self {
+            pair_lookup,
+            max_rank,
+            num_base_tokens,
+            vocab_size,
+            token_cache,
+            byte_lut,
+            token_lengths,
+            ascii_lut,
+            metaspace_token,
+            cache_id: units::next_cache_id(),
+            unit_split,
+        }
+    }
+
     /// Reconstruct encoder from serialized parts with pre-built lookups.
     ///
     /// Used during deserialization to rebuild the encoder from saved data.
     /// All lookups (byte_lut, token_cache, token_lengths) are pre-built from decoder
-    /// data, avoiding intermediate `Vec<Vec<u8>>` allocation.
-    pub fn from_parts(
+    /// data, avoiding intermediate `Vec<Vec<u8>>` allocation. `token_bytes`
+    /// maps a token id to its bytes (used to classify merge outputs for
+    /// the `▁` unit split).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts<'a>(
         merges: &[(TokenId, TokenId, TokenId)], // (left, right, merged_id)
         byte_lut: [TokenId; 256],
         token_cache: FoldHashMap<Vec<u8>, TokenId>,
         token_lengths: Vec<u16>,
         vocab_size: usize,
         num_base_tokens: usize,
+        token_bytes: impl Fn(TokenId) -> &'a [u8],
     ) -> Self {
         // Build pair_lookup directly from pre-computed merged IDs - O(num_merges)
         let mut pair_lookup: FoldHashMap<u64, (TokenId, u32)> = FoldHashMap::default();
@@ -565,7 +652,10 @@ impl SentencePieceBPE {
             max_rank = max_rank.max(merge_rank as u32);
         }
 
-        Self {
+        let merged_bytes = pair_lookup.values().map(|&(id, _)| token_bytes(id));
+        let unit_split = Self::classify_unit_split(&token_cache, merged_bytes);
+
+        Self::assemble(
             pair_lookup,
             max_rank,
             num_base_tokens,
@@ -573,7 +663,14 @@ impl SentencePieceBPE {
             token_cache,
             byte_lut,
             token_lengths,
-        }
+            unit_split,
+        )
+    }
+
+    /// The `▁` split rule this vocab admits.
+    #[inline]
+    pub fn unit_split(&self) -> UnitSplit {
+        self.unit_split
     }
 
     /// Check if two tokens can appear adjacent in a valid BPE encoding.
@@ -610,6 +707,167 @@ impl SentencePieceBPE {
     /// let tokens = encoder.encode(b"hello world");
     /// ```
     pub fn encode(&self, text: &[u8]) -> Vec<TokenId> {
+        let mut out = Vec::with_capacity(text.len() / 3);
+        self.encode_into(text, None, &mut out);
+        out
+    }
+
+    /// Append the encoding of `text` to `out`.
+    ///
+    /// When the vocab admits a `▁` unit split, the text is merged one unit
+    /// at a time (identical to whole-text BPE, see [`units`]) with units
+    /// memoized in `cache` — or, when `cache` is `None`, in a thread-local
+    /// cache tagged with this encoder's identity.
+    pub fn encode_into(
+        &self,
+        text: &[u8],
+        cache: Option<&mut UnigramPieceCache>,
+        out: &mut Vec<TokenId>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        // Whole text is a single known token (applied to the whole input
+        // only, exactly as the whole-text path does).
+        if let Some(&token_id) = self.token_cache.get(text) {
+            out.push(token_id);
+            return;
+        }
+        THREAD_STATE.with(|state| {
+            let state = &mut *state.borrow_mut();
+            if self.unit_split == UnitSplit::None {
+                return self.merge_heap_into(text, state, out);
+            }
+            match cache {
+                Some(cache) => self.encode_units_into(text, cache, state, out),
+                None => units::with_thread_cache(self.cache_id, |cache| {
+                    self.encode_units_into(text, cache, state, out)
+                }),
+            }
+        });
+    }
+
+    fn encode_units_into(
+        &self,
+        text: &[u8],
+        cache: &mut UnigramPieceCache,
+        state: &mut EncodeState,
+        out: &mut Vec<TokenId>,
+    ) {
+        self.unit_split.for_each_unit(text, |unit| {
+            if unit.len() > CACHED_UNIT_MAX {
+                return self.merge_heap_into(unit, state, out);
+            }
+            if cache.lookup(unit, out) {
+                return;
+            }
+            let start = out.len();
+            if unit.len() <= SMALL_UNIT_MAX {
+                self.merge_small_into(unit, state, out);
+            } else {
+                self.merge_heap_into(unit, state, out);
+            }
+            cache.insert(unit, &out[start..]);
+        });
+    }
+
+    /// Initial symbol for the char at `text[pos]`: `(token, bytes consumed)`,
+    /// `token == u32::MAX` when the char has no mapping (it is dropped).
+    /// Same result as the lookup in [`Self::init_symbols_into`].
+    #[inline(always)]
+    fn char_token(&self, text: &[u8], pos: usize) -> (TokenId, usize) {
+        let b = text[pos];
+        if b < 0x80 {
+            return (self.ascii_lut[b as usize], 1);
+        }
+        if b == METASPACE[0] && text.len() >= pos + 3 && text[pos + 1..pos + 3] == METASPACE[1..] {
+            if let Some(t) = self.metaspace_token {
+                return (t, 3);
+            }
+        }
+        let end = (pos + utf8_char_len(b)).min(text.len());
+        let char_bytes = &text[pos..end];
+        match self.token_cache.get(char_bytes) {
+            Some(&token_id) => (token_id, char_bytes.len()),
+            None => (self.byte_lut[b as usize], 1),
+        }
+    }
+
+    /// Rank and merged token of an adjacent pair (`u32::MAX` rank = none).
+    #[inline(always)]
+    fn pair_rank(&self, left: TokenId, right: TokenId) -> (u32, TokenId) {
+        match self.get_merge(left, right) {
+            Some((merged, rank)) => (rank, merged),
+            None => (u32::MAX, u32::MAX),
+        }
+    }
+
+    /// Merge one short unit with a linear (rank, leftmost) min scan.
+    fn merge_small_into(&self, unit: &[u8], state: &mut EncodeState, out: &mut Vec<TokenId>) {
+        let EncodeState { toks, ranks, merged, .. } = state;
+        toks.clear();
+        let mut pos = 0;
+        while pos < unit.len() {
+            let (token, len) = self.char_token(unit, pos);
+            if token != u32::MAX {
+                toks.push(token);
+            }
+            pos += len;
+        }
+        if toks.len() < 2 {
+            out.extend_from_slice(toks);
+            return;
+        }
+        ranks.clear();
+        merged.clear();
+        for w in toks.windows(2) {
+            let (r, m) = self.pair_rank(w[0], w[1]);
+            ranks.push(r);
+            merged.push(m);
+        }
+        loop {
+            let mut best = u32::MAX;
+            let mut at = 0;
+            for (i, &r) in ranks.iter().enumerate() {
+                if r < best {
+                    best = r;
+                    at = i;
+                }
+            }
+            if best == u32::MAX {
+                break;
+            }
+            toks[at] = merged[at];
+            toks.remove(at + 1);
+            ranks.remove(at);
+            merged.remove(at);
+            if at > 0 {
+                (ranks[at - 1], merged[at - 1]) = self.pair_rank(toks[at - 1], toks[at]);
+            }
+            if at < ranks.len() {
+                (ranks[at], merged[at]) = self.pair_rank(toks[at], toks[at + 1]);
+            }
+        }
+        out.extend_from_slice(toks);
+    }
+
+    /// Radix-heap merge of `text` as one sequence (no shortcut, no split).
+    fn merge_heap_into(&self, text: &[u8], state: &mut EncodeState, out: &mut Vec<TokenId>) {
+        state.symbols.clear();
+        state.heap.clear();
+        self.init_symbols_into(text, &mut state.symbols);
+        if state.symbols.is_empty() {
+            return;
+        }
+        self.init_heap(&state.symbols, &mut state.heap);
+        self.merge_loop(&mut state.symbols, &mut state.heap);
+        self.collect_results_into(&state.symbols, out);
+    }
+
+    /// Whole-text radix-heap BPE with no unit splitting or caching — the
+    /// reference the split path must reproduce.
+    #[doc(hidden)]
+    pub fn encode_whole(&self, text: &[u8]) -> Vec<TokenId> {
         if text.is_empty() {
             return Vec::new();
         }
@@ -1019,5 +1277,54 @@ mod tests {
         let chunked = encoder.encode_chunked(text, &mut state, 6);
 
         assert_eq!(regular, chunked);
+    }
+
+    /// Tiny Llama-like vocab: chars, `▁▁` runs, word tokens, and optionally
+    /// a `>▁<` token that spans a word start.
+    fn split_vocab(with_blocker: bool) -> SentencePieceBPE {
+        let mut toks: Vec<&str> = vec!["▁", "a", "b", ">", "<", "▁▁", "▁a", "ab", "▁ab", "▁▁▁▁", "▁b", ">▁"];
+        let mut merges: Vec<(&str, &str)> = vec![
+            ("▁", "▁"), ("▁", "a"), ("a", "b"), ("▁a", "b"), ("▁▁", "▁▁"), ("▁", "b"), (">", "▁"),
+        ];
+        if with_blocker {
+            toks.push(">▁<");
+            merges.push((">▁", "<"));
+        }
+        let id = |t: &str| toks.iter().position(|x| *x == t).unwrap() as TokenId;
+        let vocab: Vec<(TokenId, Vec<u8>)> =
+            toks.iter().enumerate().map(|(i, t)| (i as TokenId, t.as_bytes().to_vec())).collect();
+        let merges: Vec<(TokenId, TokenId)> = merges.iter().map(|&(a, b)| (id(a), id(b))).collect();
+        let (enc, _) = SentencePieceBPE::from_vocab_and_merges(&vocab, &merges, toks.len(), &Default::default());
+        enc
+    }
+
+    #[test]
+    fn test_unit_split_matches_whole() {
+        let texts = [
+            "▁ab▁a▁b", "▁▁▁▁ab▁▁a", "ab>▁<▁a>▁b", "▁", "▁▁", "a", "><▁>▁<▁▁>▁",
+            "▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁ab▁abababababababababab",
+        ];
+        for blocker in [false, true] {
+            let enc = split_vocab(blocker);
+            assert_ne!(enc.unit_split(), UnitSplit::None, "blocker={blocker}");
+            if blocker {
+                assert_eq!(enc.unit_split(), UnitSplit::WordStart { blocked: 1u128 << b'>' });
+            }
+            let mut long = String::new();
+            for i in 0..200 {
+                long.push_str(texts[i % texts.len()]);
+            }
+            for t in texts.iter().copied().chain([long.as_str()]) {
+                let mut cache = UnigramPieceCache::new();
+                let mut warm = Vec::new();
+                enc.encode_into(t.as_bytes(), Some(&mut cache), &mut warm);
+                let mut again = Vec::new();
+                enc.encode_into(t.as_bytes(), Some(&mut cache), &mut again);
+                let whole = enc.encode_whole(t.as_bytes());
+                assert_eq!(enc.encode(t.as_bytes()), whole, "blocker={blocker} {t:?}");
+                assert_eq!(warm, whole, "blocker={blocker} {t:?}");
+                assert_eq!(again, whole, "cached blocker={blocker} {t:?}");
+            }
+        }
     }
 }

@@ -1,5 +1,6 @@
-//! Mask-scanner pretokenizers: 64-byte batches are classified with NEON
-//! into per-byte class bitmasks, piece-start bits are derived with
+//! Mask-scanner pretokenizers: 64-byte batches are classified with SIMD
+//! (NEON on aarch64; SSE2 or runtime-detected AVX2 on x86_64, see
+//! [`MaskIsa`]) into per-byte class bitmasks, piece-start bits are derived with
 //! shifted-mask algebra in scalar registers, and iteration pops one bit
 //! per piece — no per-piece dispatch branches.
 //!
@@ -11,8 +12,8 @@
 //! are re-derived by running `Core` from the pending piece start. The
 //! walker never emits a piece across an unresolved bad zone.
 //!
-//! On non-aarch64 targets every piece takes the `Core` path (the walker
-//! starts with `scalar_until = usize::MAX`).
+//! On other targets (or `PRETOKIE_ISA=scalar`) every piece takes the
+//! `Core` path (the walker starts with `scalar_until = usize::MAX`).
 
 use std::marker::PhantomData;
 
@@ -28,9 +29,170 @@ fn scalar_advance<C: PretokConfig>(text: &str, pos: usize) -> usize {
     }
 }
 
-#[inline(always)]
-fn simd_available() -> bool {
-    cfg!(target_arch = "aarch64")
+// =======================================================================
+// Classification backend selection
+// =======================================================================
+
+/// Which byte-classification backend a [`Mask`] runs. Picked once per
+/// `Mask` (see [`MaskIsa::detect`]); the batch algebra and walker are
+/// monomorphized per backend, so the hot loop never re-dispatches.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaskIsa {
+    /// No SIMD: every piece takes the `Core` path.
+    Scalar,
+    /// Baseline 128-bit SIMD: NEON on aarch64, SSE2 on x86_64.
+    Base,
+    /// AVX2 (x86_64 only, runtime-detected).
+    Avx2,
+}
+
+impl MaskIsa {
+    /// Best backend for this CPU, cached. `PRETOKIE_ISA=scalar|base|avx2`
+    /// overrides the choice (benchmarks / differential tests); an
+    /// unsupported request falls back to the detected best.
+    pub fn detect() -> MaskIsa {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static CACHED: AtomicU8 = AtomicU8::new(0);
+        match CACHED.load(Ordering::Relaxed) {
+            1 => return MaskIsa::Scalar,
+            2 => return MaskIsa::Base,
+            3 => return MaskIsa::Avx2,
+            _ => {}
+        }
+        // AVX2 measured no faster than SSE2 end-to-end (classification is not
+        // the bottleneck), so the baseline backend is the default and AVX2 is
+        // opt-in via PRETOKIE_ISA=avx2.
+        let best = if Self::Base.supported() {
+            MaskIsa::Base
+        } else {
+            MaskIsa::Scalar
+        };
+        let isa = match std::env::var("PRETOKIE_ISA").as_deref() {
+            Ok("scalar") => MaskIsa::Scalar,
+            Ok("base") | Ok("sse2") | Ok("neon") if Self::Base.supported() => MaskIsa::Base,
+            Ok("avx2") if Self::Avx2.supported() => MaskIsa::Avx2,
+            _ => best,
+        };
+        CACHED.store(isa as u8 + 1, Ordering::Relaxed);
+        isa
+    }
+
+    /// Whether this backend can run on the current CPU.
+    pub fn supported(self) -> bool {
+        match self {
+            MaskIsa::Scalar => true,
+            MaskIsa::Base => cfg!(any(target_arch = "aarch64", target_arch = "x86_64")),
+            MaskIsa::Avx2 => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    std::arch::is_x86_feature_detected!("avx2")
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// A byte-classification backend: fills [`AsciiMasks`] for one 64-byte
+/// batch. `batch` is the per-batch entry the walker calls; backends that
+/// need a `#[target_feature]` context override it with a trampoline.
+trait Classify {
+    fn ascii_masks(
+        bytes: &[u8],
+        scan: usize,
+        case_masks: bool,
+        slash_mask: bool,
+        ctl_mask: bool,
+    ) -> AsciiMasks;
+
+    #[inline(always)]
+    fn batch<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64)
+    where
+        Self: Sized,
+    {
+        batch_masks::<C, Self>(bytes, scan)
+    }
+}
+
+/// Baseline 128-bit backend (NEON / SSE2; both are architectural
+/// baselines, so no runtime detection).
+struct Base;
+
+impl Classify for Base {
+    #[inline(always)]
+    fn ascii_masks(
+        bytes: &[u8],
+        scan: usize,
+        case_masks: bool,
+        slash_mask: bool,
+        ctl_mask: bool,
+    ) -> AsciiMasks {
+        #[cfg(target_arch = "aarch64")]
+        {
+            neon_ascii_masks(bytes, scan, case_masks, slash_mask, ctl_mask)
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            sse2_ascii_masks(bytes, scan, case_masks, slash_mask, ctl_mask)
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let _ = (bytes, scan, case_masks, slash_mask, ctl_mask);
+            unreachable!("MaskIsa::Base is unsupported on this target")
+        }
+    }
+}
+
+/// AVX2 backend. Only instantiated after [`MaskIsa::Avx2`] was detected.
+struct Avx2;
+
+impl Classify for Avx2 {
+    #[inline(always)]
+    fn ascii_masks(
+        bytes: &[u8],
+        scan: usize,
+        case_masks: bool,
+        slash_mask: bool,
+        ctl_mask: bool,
+    ) -> AsciiMasks {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: an `Avx2` walker is only built when AVX2 was detected.
+            unsafe { avx2_ascii_masks(bytes, scan, case_masks, slash_mask, ctl_mask) }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (bytes, scan, case_masks, slash_mask, ctl_mask);
+            unreachable!("MaskIsa::Avx2 is unsupported on this target")
+        }
+    }
+
+    /// Trampoline into an AVX2 codegen context. When the walker itself
+    /// runs inside one (`for_each_piece`), this inlines away; from the
+    /// plain iterator it is one call per 64-byte batch.
+    #[inline(always)]
+    fn batch<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: as above.
+            unsafe { avx2_batch_masks::<C>(bytes, scan) }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            batch_masks::<C, Self>(bytes, scan)
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn avx2_batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
+    batch_masks::<C, Avx2>(bytes, scan)
 }
 
 // =======================================================================
@@ -42,7 +204,6 @@ fn simd_available() -> bool {
 /// is exactly {space, tab, \r, \n} and everything else ASCII that is
 /// not a letter/digit is "punct" (including \x0b, \x0c and controls),
 /// matching `Core`'s scalar predicates.
-#[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy, Default)]
 struct AsciiMasks {
     /// ASCII letters.
@@ -110,7 +271,7 @@ unsafe fn movemask64(
 /// flags are compile-time constants after monomorphization.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn ascii_masks(
+fn neon_ascii_masks(
     bytes: &[u8],
     scan: usize,
     case_masks: bool,
@@ -173,12 +334,136 @@ fn ascii_masks(
 }
 
 // =======================================================================
+// x86_64 classification (SSE2 baseline, AVX2 runtime-detected)
+// =======================================================================
+//
+// Same predicates as `neon_ascii_masks`. x86 has no unsigned byte `<=`,
+// so `x <= k` is `min_epu8(x, k) == x`; the high-bit test is the raw
+// movemask of the input.
+
+/// SSE2 classification of `bytes[scan..scan+64]` (requires
+/// `scan + 64 <= bytes.len()`).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn sse2_ascii_masks(
+    bytes: &[u8],
+    scan: usize,
+    case_masks: bool,
+    slash_mask: bool,
+    ctl_mask: bool,
+) -> AsciiMasks {
+    use std::arch::x86_64::*;
+    debug_assert!(scan + 64 <= bytes.len());
+    let mut m = AsciiMasks::default();
+    // SAFETY: SSE2 is part of the x86_64 baseline; the four 16-byte
+    // unaligned loads stay inside `bytes[scan..scan+64]`.
+    unsafe {
+        let p = bytes.as_ptr().add(scan);
+        let set = |b: u8| _mm_set1_epi8(b as i8);
+        let le = |x: __m128i, k: u8| _mm_cmpeq_epi8(_mm_min_epu8(x, set(k)), x);
+        for i in 0..4 {
+            let v = _mm_loadu_si128(p.add(16 * i) as *const __m128i);
+            let sh = 16 * i as u32;
+            let mv = |x: __m128i| (_mm_movemask_epi8(x) as u32 as u64) << sh;
+            let lowered = _mm_or_si128(v, set(0x20));
+            let l = le(_mm_sub_epi8(lowered, set(b'a')), 25);
+            m.l |= mv(l);
+            m.d |= mv(le(_mm_sub_epi8(v, set(b'0')), 9));
+            m.s |= mv(_mm_cmpeq_epi8(v, set(b' ')));
+            m.t |= mv(_mm_cmpeq_epi8(v, set(b'\t')));
+            m.n |= mv(_mm_or_si128(
+                _mm_cmpeq_epi8(v, set(b'\r')),
+                _mm_cmpeq_epi8(v, set(b'\n')),
+            ));
+            m.hi |= mv(v);
+            m.ap |= mv(_mm_cmpeq_epi8(v, set(b'\'')));
+            if case_masks {
+                let bit = _mm_cmpeq_epi8(_mm_and_si128(v, set(0x20)), set(0x20));
+                m.lo |= mv(_mm_and_si128(l, bit));
+            }
+            if slash_mask {
+                m.slash |= mv(_mm_cmpeq_epi8(v, set(b'/')));
+            }
+            if ctl_mask {
+                m.low_ctl |= mv(_mm_or_si128(le(v, 0x20), _mm_cmpeq_epi8(v, set(0x7F))));
+            }
+        }
+    }
+    m
+}
+
+/// AVX2 classification of `bytes[scan..scan+64]`: two 32-byte lanes.
+///
+/// # Safety
+/// The CPU must support AVX2; `scan + 64 <= bytes.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn avx2_ascii_masks(
+    bytes: &[u8],
+    scan: usize,
+    case_masks: bool,
+    slash_mask: bool,
+    ctl_mask: bool,
+) -> AsciiMasks {
+    use std::arch::x86_64::*;
+    debug_assert!(scan + 64 <= bytes.len());
+    let mut m = AsciiMasks::default();
+    let p = bytes.as_ptr().add(scan);
+    // Macros rather than closures: a closure is its own function and does
+    // not reliably inherit this `#[target_feature]`, which would turn each
+    // intrinsic into an out-of-line call.
+    macro_rules! set {
+        ($b:expr) => {
+            _mm256_set1_epi8($b as i8)
+        };
+    }
+    macro_rules! le {
+        ($x:expr, $k:expr) => {{
+            let x = $x;
+            _mm256_cmpeq_epi8(_mm256_min_epu8(x, set!($k)), x)
+        }};
+    }
+    for i in 0..2 {
+        let v = _mm256_loadu_si256(p.add(32 * i) as *const __m256i);
+        let sh = 32 * i as u32;
+        macro_rules! mv {
+            ($x:expr) => {
+                (_mm256_movemask_epi8($x) as u32 as u64) << sh
+            };
+        }
+        let lowered = _mm256_or_si256(v, set!(0x20));
+        let l = le!(_mm256_sub_epi8(lowered, set!(b'a')), 25);
+        m.l |= mv!(l);
+        m.d |= mv!(le!(_mm256_sub_epi8(v, set!(b'0')), 9));
+        m.s |= mv!(_mm256_cmpeq_epi8(v, set!(b' ')));
+        m.t |= mv!(_mm256_cmpeq_epi8(v, set!(b'\t')));
+        m.n |= mv!(_mm256_or_si256(
+            _mm256_cmpeq_epi8(v, set!(b'\r')),
+            _mm256_cmpeq_epi8(v, set!(b'\n')),
+        ));
+        m.hi |= mv!(v);
+        m.ap |= mv!(_mm256_cmpeq_epi8(v, set!(b'\'')));
+        if case_masks {
+            let bit = _mm256_cmpeq_epi8(_mm256_and_si256(v, set!(0x20)), set!(0x20));
+            m.lo |= mv!(_mm256_and_si256(l, bit));
+        }
+        if slash_mask {
+            m.slash |= mv!(_mm256_cmpeq_epi8(v, set!(b'/')));
+        }
+        if ctl_mask {
+            m.low_ctl |= mv!(_mm256_or_si256(le!(v, 0x20), _mm256_cmpeq_epi8(v, set!(0x7F))));
+        }
+    }
+    m
+}
+
+// =======================================================================
 // Bit-domain helpers (platform-independent)
 // =======================================================================
 
 /// Kogge-Stone rightward fill: propagate `seed` bits toward higher bit
 /// positions through contiguous runs of `mask`.
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn fill_right(seed: u64, mask: u64) -> u64 {
     let mut x = seed & mask;
@@ -200,7 +485,6 @@ fn fill_right(seed: u64, mask: u64) -> u64 {
 }
 
 /// Leftward counterpart of [`fill_right`].
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn fill_left(seed: u64, mask: u64) -> u64 {
     let mut x = seed & mask;
@@ -222,7 +506,6 @@ fn fill_left(seed: u64, mask: u64) -> u64 {
 }
 
 /// Fill whole `mask` runs containing a `seed` bit, in both directions.
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn fill_both(seed: u64, mask: u64) -> u64 {
     fill_right(seed, mask) | fill_left(seed, mask)
@@ -230,7 +513,6 @@ fn fill_both(seed: u64, mask: u64) -> u64 {
 
 /// Piece-start bits inside ASCII digit runs for `\p{N}{1,3}`: each run
 /// splits into 3-char pieces, so starts sit at run start + 3k.
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn digit_run_splits3(d: u64) -> u64 {
     let mut b = d & !(d << 1); // run starts
@@ -248,32 +530,24 @@ fn digit_run_splits3(d: u64) -> u64 {
 
 /// Mask of the contiguous digit run starting at bit 0 (caller checks
 /// `d & 1 != 0`).
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn leading_run(d: u64) -> u64 {
     let tz = (!d).trailing_zeros();
     if tz >= 64 { u64::MAX } else { (1u64 << tz) - 1 }
 }
 
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn is_ascii_ws_byte(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn is_cjk_char(ch: char) -> bool {
-    let cp = ch as u32;
-    matches!(cp, 0x4E00..=0x9FA5 | 0x3040..=0x309F | 0x30A0..=0x30FF)
-}
+use crate::util::is_cjk_char;
 
 // =======================================================================
 // Unicode in-mask classification
 // =======================================================================
 
 /// UTF-8 sequence length from a lead byte (valid UTF-8 assumed).
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn utf8_len(b: u8) -> usize {
     if b < 0x80 { 1 } else if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 }
@@ -286,7 +560,6 @@ fn utf8_len(b: u8) -> usize {
 /// - letters/marks under CamelCase (case-state dependent),
 /// - numerics under Chunked3 (`\p{N}{1,3}` counts chars, masks count bytes),
 /// - DeepSeek non-[\p{P}\p{S}] chars (the one-char letter-prefix rule).
-#[cfg(target_arch = "aarch64")]
 enum UClass {
     Letter,
     Number,
@@ -294,14 +567,13 @@ enum UClass {
     Defer,
 }
 
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn uclass<C: PretokConfig>(ch: char) -> UClass {
     use crate::util::{is_punct_or_symbol, is_unicode_letter, is_unicode_mark};
     let letter = match C::LETTER_MODE {
         LetterMode::Plain => is_unicode_letter(ch),
         LetterMode::PlainWithMarks | LetterMode::CamelCase => {
-            ch.is_alphabetic() || is_unicode_mark(ch)
+            crate::util::is_alpha(ch) || is_unicode_mark(ch)
         }
     };
     if letter {
@@ -331,7 +603,6 @@ fn uclass<C: PretokConfig>(ch: char) -> UClass {
 /// Per-byte class masks for a batch's non-ASCII chars: every byte of a
 /// classified char carries the char's class, so byte-adjacency equals
 /// char-adjacency and the u64 boundary algebra applies unchanged.
-#[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy, Default)]
 struct UniMasks {
     l: u64,
@@ -345,6 +616,8 @@ struct UniMasks {
     l_lead: u64,
     /// Lead bytes of CJK chars (DeepSeek ws-split exception).
     cjk_lead: u64,
+    /// All bytes of CJK chars (DeepSeek's pre-split runs).
+    cjk: u64,
     /// Bytes only the scalar path can decide.
     defer: u64,
 }
@@ -353,7 +626,6 @@ struct UniMasks {
 /// `bytes[scan..scan+64]`. A char spilling off the batch end is
 /// classified via its full in-text bytes (valid UTF-8 keeps the read in
 /// bounds); only its in-batch bytes get class bits.
-#[cfg(target_arch = "aarch64")]
 #[inline(never)] // keep the clean ASCII path's register allocation intact
 fn classify_uni<C: PretokConfig>(bytes: &[u8], scan: usize, m: u64) -> UniMasks {
     let mut u = UniMasks::default();
@@ -386,6 +658,7 @@ fn classify_uni<C: PretokConfig>(bytes: &[u8], scan: usize, m: u64) -> UniMasks 
         }
         if C::WS_EXCEPTION == WsException::Cjk && is_cjk_char(ch) {
             u.cjk_lead |= lead;
+            u.cjk |= chm;
         }
         m &= !chm;
     }
@@ -400,9 +673,8 @@ fn classify_uni<C: PretokConfig>(bytes: &[u8], scan: usize, m: u64) -> UniMasks 
 /// `bytes[scan..scan+64]`. Bit k of `usable` = a trustworthy piece start
 /// at `scan + k`; `bad` marks bytes whose boundaries `Core` re-derives,
 /// and no piece is emitted across an unresolved bad zone.
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
+fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64, u64) {
     // One byte of lookahead is required for the bit-63 whitespace-split
     // test (reading a whole char there is safe: input is valid UTF-8, so
     // a char starting in-bounds is fully in-bounds).
@@ -413,9 +685,13 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     let camel = C::LETTER_MODE == LetterMode::CamelCase;
     let want_slash = C::PUNCT_TRAILING == PunctTrailing::NewlinesAndSlashes;
     let want_ctl = C::PUNCT_CLASS == PunctClass::PunctSymbolOnly;
-    let m = ascii_masks(bytes, scan, camel, want_slash, want_ctl);
+    let m = K::ascii_masks(bytes, scan, camel, want_slash, want_ctl);
 
-    let sp = m.s | m.t; // `Core` lets both space and tab prefix content
+    let sp = m.s | m.t;
+    // A space prefixes letters and punct (and digits under GPT-2); a tab
+    // prefixes letters only (`[^\r\n\p{L}\p{N}]?\p{L}+`), and nothing
+    // under GPT-2's ` ?\p{L}+` (SpaceOnly configs).
+    let tab_pfx = C::PUNCT_PREFIX_MODE != PunctPrefixMode::SpaceOnly;
     let n = m.n;
     let ws = sp | n;
     let hi = m.hi;
@@ -430,6 +706,7 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     // path instead of starting in a bad zone.
     let (pl, pd, psp, pws, po, plo, pn);
     let (mut claim_l, mut claim_d, mut claim_o) = (0u64, 0u64, 0u64);
+    let (mut pcj, mut claim_cj) = (0u64, 0u64);
     let mut claimed = 0u64;
     let mut edge_kill = 0u64;
     if scan == 0 {
@@ -449,6 +726,9 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
                 0
             };
             claimed = claim_bits;
+            if C::WS_EXCEPTION == WsException::Cjk && is_cjk_char(ch) {
+                (pcj, claim_cj) = (1, claim_bits);
+            }
             match uclass::<C>(ch) {
                 UClass::Letter => {
                     claim_l = claim_bits;
@@ -475,7 +755,7 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
                             let o2 = !crate::util::is_ascii_letter(b2)
                                 && !crate::util::is_digit(b2)
                                 && !is_ascii_ws_byte(b2);
-                            let sp2 = b2 == b' ' || b2 == b'\t';
+                            let sp2 = b2 == b' '; // a tab never prefixes punct
                             if !o2 && !sp2 {
                                 edge_kill = letter_bit; // fresh punct piece absorbs
                             }
@@ -550,6 +830,13 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     // punct
     start |= o & !((o << 1) | po);
 
+    // DeepSeek: a CJK run is a segment of its own — split at both edges.
+    let cj = uni.cjk | claim_cj;
+    if C::WS_EXCEPTION == WsException::Cjk {
+        let cjp = (cj << 1) | pcj;
+        start |= (cj & !cjp) | ((l | o | d) & !cj & cjp);
+    }
+
     // ---- punct-run trailing newlines (and slashes for O200K) ----
     // '/' (O200K) is punct-class, so it extends the main punct run on
     // its own; it participates in the trailing tail only after a
@@ -558,7 +845,8 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     let tn = if C::PUNCT_TRAILING == PunctTrailing::None {
         0
     } else {
-        fill_right(n & ((o << 1) | po), trail)
+        // (CJK punct ends its segment: "゛\n" → ゛ \n.)
+        fill_right(n & (((o & !cj) << 1) | (po & !pcj)), trail)
     };
     // A punct char directly after a consumed trailing run starts a fresh
     // piece even though its predecessor byte is also punct-class.
@@ -612,6 +900,13 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
         split &= !(d >> 1);
         if C::WS_EXCEPTION == WsException::Cjk {
             split &= !(uni.cjk_lead >> 1);
+            // Unicode numerics (`½`, `¹`) are deferred under Chunked3, but
+            // an earlier DeepSeek stage splits them off too, so a ws run
+            // before one may stay whole: leave that run to `Core`.
+            let pre = ews & (defer >> 1);
+            if pre != 0 {
+                bad |= fill_both(pre, ews) | pre << 1;
+            }
         }
     }
     // Bit 63 needs the real lookahead char.
@@ -626,7 +921,7 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
                 && match C::WS_EXCEPTION {
                     WsException::None => true,
                     WsException::Digits => !ch.is_numeric(),
-                    WsException::Cjk => !is_cjk_char(ch),
+                    WsException::Cjk => !is_cjk_char(ch) && !ch.is_numeric(),
                 }
         };
         split = (split & !(1 << 63)) | ((u64::from(keep) << 63) & split_base);
@@ -653,10 +948,19 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     // Only a space that itself starts a piece absorbs what follows; a
     // run-interior space (possible under ws exceptions, e.g. DeepSeek's
     // "no split before CJK") does not.
-    let sp_bits = sp & (run_start | split);
+    let (ps, pt) = if scan == 0 {
+        (0u64, 0u64)
+    } else {
+        (u64::from(bytes[scan - 1] == b' '), u64::from(bytes[scan - 1] == b'\t'))
+    };
+    let pfx_bits = run_start | split;
     let after_sp_classes =
         l | o | if C::SPACE_PREFIXES_DIGITS { d } else { 0 };
-    let after_sp = ((sp_bits << 1) | psp) & after_sp_classes;
+    let mut after_sp = (((m.s & pfx_bits) << 1) | ps) & after_sp_classes;
+    if tab_pfx {
+        after_sp |= (((m.t & pfx_bits) << 1) | pt) & l;
+    }
+    after_sp &= !cj; // nothing prefixes a CJK run
     if C::WS_EXCEPTION == WsException::Cjk && psp == 1 && uni.cjk_lead & 1 != 0 {
         // Whether the previous batch's trailing space started a piece
         // depends on its own predecessor (the CJK split exception).
@@ -669,7 +973,17 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     if C::PUNCT_CLASS == PunctClass::PunctSymbolOnly {
         let ctl = o & m.low_ctl;
         if ctl != 0 {
-            bad |= ctl | ctl << 1 | ctl >> 1;
+            // `<< 2`: after a lone control, ASCII punct prefixes the letters
+            // ("\x1b[s" -> "\x1b" "[s"), a cut the punct algebra can't see.
+            bad |= ctl | ctl << 1 | ctl << 2 | ctl >> 1;
+        }
+        // The same reach from a control in the previous batch's last two bytes.
+        let is_ctl = |b: u8| (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7F;
+        if scan >= 1 && is_ctl(bytes[scan - 1]) {
+            bad |= 0b11;
+        }
+        if scan >= 2 && is_ctl(bytes[scan - 2]) {
+            bad |= 0b1;
         }
     }
 
@@ -693,12 +1007,6 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
         let kill = ((o & boundary) << 1) & absorb_l;
         boundary &= !kill;
         if C::PUNCT_PREFIX_MODE == PunctPrefixMode::AsciiOnly {
-            // Core's asymmetry: a unicode letter after non-apostrophe
-            // ASCII punct IS absorbed, with a full unicode letter scan
-            // ("=σλ" is one piece) — only the apostrophe path and the
-            // ASCII-letter prefix scan are ASCII-restricted ("l'été" →
-            // l ' été; "-handâa" → -hand + âa).
-            boundary &= !((((o & !ap) & boundary) << 1) & uni.l_lead);
             // A unicode letter following an absorbed-prefix ASCII run
             // starts a fresh piece, while after a plain run it continues.
             let prefix_runs = fill_right(kill, m.l);
@@ -824,12 +1132,6 @@ fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
     (boundary & !bad, bad)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-#[inline(always)]
-fn batch_masks<C: PretokConfig>(_bytes: &[u8], _scan: usize) -> (u64, u64) {
-    (0, u64::MAX)
-}
-
 // =======================================================================
 // Bench-only internal hooks (not public API)
 // =======================================================================
@@ -837,7 +1139,7 @@ fn batch_masks<C: PretokConfig>(_bytes: &[u8], _scan: usize) -> (u64, u64) {
 /// Stage-level access to the mask pipeline for the profiling examples.
 /// Hidden from docs; semver-exempt.
 #[doc(hidden)]
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub mod bench_internal {
     use crate::core::config::*;
 
@@ -848,14 +1150,14 @@ pub mod bench_internal {
         let camel = C::LETTER_MODE == LetterMode::CamelCase;
         let want_slash = C::PUNCT_TRAILING == PunctTrailing::NewlinesAndSlashes;
         let want_ctl = C::PUNCT_CLASS == PunctClass::PunctSymbolOnly;
-        let m = super::ascii_masks(bytes, scan, camel, want_slash, want_ctl);
+        let m = <super::Base as super::Classify>::ascii_masks(bytes, scan, camel, want_slash, want_ctl);
         m.l ^ m.d ^ m.s ^ m.t ^ m.n ^ m.hi ^ m.ap ^ m.lo ^ m.slash ^ m.low_ctl
     }
 
     /// Stages (a)+(b): the full per-batch boundary computation.
     #[inline(always)]
     pub fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
-        super::batch_masks::<C>(bytes, scan)
+        super::batch_masks::<C, super::Base>(bytes, scan)
     }
 
     /// The scalar ground-truth advance (bad-zone executor).
@@ -893,12 +1195,14 @@ struct MaskState {
     pre_base: usize,
     pre_usable: u64,
     pre_bad: u64,
+    /// Consecutive mostly-bad batches (see [`Self::adapt`]).
+    bad_streak: u32,
 }
 
 impl MaskState {
     #[inline]
-    fn new(pos: usize) -> Self {
-        let scalar_until = if simd_available() { pos } else { usize::MAX };
+    fn new(pos: usize, simd: bool) -> Self {
+        let scalar_until = if simd { pos } else { usize::MAX };
         Self {
             pos,
             scan: pos,
@@ -910,6 +1214,26 @@ impl MaskState {
             pre_base: usize::MAX,
             pre_usable: 0,
             pre_bad: 0,
+            bad_streak: 0,
+        }
+    }
+
+    /// Mostly-bad batches (e.g. CJK under o200k's letter classes) pay a
+    /// full classification yet yield few trusted boundaries. From the
+    /// second in a row, stay on the `Core` path for an exponentially
+    /// growing window before classifying again. This only moves the
+    /// mask/scalar switch point — `Core` from any piece start is exact —
+    /// so output is unchanged. Call after `load_segment` on a refill.
+    #[inline(always)]
+    fn adapt(&mut self, bad: u64) {
+        if bad.count_ones() >= 48 {
+            self.bad_streak = (self.bad_streak + 1).min(6);
+            if self.bad_streak >= 2 {
+                let until = self.mask_base + (64usize << self.bad_streak);
+                self.scalar_until = self.scalar_until.max(until);
+            }
+        } else {
+            self.bad_streak = 0;
         }
     }
 
@@ -940,7 +1264,7 @@ impl MaskState {
 
     /// The next piece's byte range, or None at end of input.
     #[inline(always)]
-    fn next_span<C: PretokConfig>(&mut self, text: &str) -> Option<(usize, usize)> {
+    fn next_span<C: PretokConfig, K: Classify>(&mut self, text: &str) -> Option<(usize, usize)> {
         let bytes = text.as_bytes();
         let len = bytes.len();
         loop {
@@ -984,7 +1308,7 @@ impl MaskState {
             let (usable, bad) = if self.pre_base == self.scan {
                 (self.pre_usable, self.pre_bad)
             } else {
-                batch_masks::<C>(bytes, self.scan)
+                K::batch::<C>(bytes, self.scan)
             };
             self.mask_base = self.scan;
             self.scan += 64;
@@ -993,7 +1317,7 @@ impl MaskState {
             // Kick off the next batch now; its SIMD chain overlaps this
             // batch's pops instead of stalling the next refill.
             if self.scan + 64 <= len {
-                let (u2, b2) = batch_masks::<C>(bytes, self.scan);
+                let (u2, b2) = K::batch::<C>(bytes, self.scan);
                 self.pre_base = self.scan;
                 self.pre_usable = u2;
                 self.pre_bad = b2;
@@ -1007,6 +1331,7 @@ impl MaskState {
             } else {
                 self.load_segment(0);
             }
+            self.adapt(bad);
         }
     }
 
@@ -1022,7 +1347,7 @@ impl MaskState {
     /// compute is the other half, and its one-batch-ahead precompute still
     /// overlaps these drains). This is the bulk-encode hot loop.
     #[inline(always)]
-    fn for_each_span<C: PretokConfig, F: FnMut(usize, usize)>(&mut self, text: &str, mut f: F) {
+    fn for_each_span<C: PretokConfig, K: Classify, F: FnMut(usize, usize)>(&mut self, text: &str, mut f: F) {
         let bytes = text.as_bytes();
         let len = bytes.len();
         loop {
@@ -1064,14 +1389,14 @@ impl MaskState {
             let (usable, bad) = if self.pre_base == self.scan {
                 (self.pre_usable, self.pre_bad)
             } else {
-                batch_masks::<C>(bytes, self.scan)
+                K::batch::<C>(bytes, self.scan)
             };
             self.mask_base = self.scan;
             self.scan += 64;
             self.batch_usable = usable;
             self.batch_bad = bad;
             if self.scan + 64 <= len {
-                let (u2, b2) = batch_masks::<C>(bytes, self.scan);
+                let (u2, b2) = K::batch::<C>(bytes, self.scan);
                 self.pre_base = self.scan;
                 self.pre_usable = u2;
                 self.pre_bad = b2;
@@ -1083,6 +1408,7 @@ impl MaskState {
             } else {
                 self.load_segment(0);
             }
+            self.adapt(bad);
         }
     }
 }
@@ -1095,13 +1421,29 @@ impl MaskState {
 pub struct Mask<'a, C: PretokConfig> {
     text: &'a str,
     state: MaskState,
+    isa: MaskIsa,
     _cfg: PhantomData<C>,
 }
 
 impl<'a, C: PretokConfig> Mask<'a, C> {
     #[inline]
     pub fn new(text: &'a str) -> Self {
-        Self { text, state: MaskState::new(0), _cfg: PhantomData }
+        Self::with_isa(text, MaskIsa::detect())
+    }
+
+    /// Construct with an explicit classification backend (benchmarks and
+    /// differential tests). An unsupported `isa` falls back to the
+    /// detected best.
+    #[doc(hidden)]
+    #[inline]
+    pub fn with_isa(text: &'a str, isa: MaskIsa) -> Self {
+        let isa = if isa.supported() { isa } else { MaskIsa::detect() };
+        Self {
+            text,
+            state: MaskState::new(0, isa != MaskIsa::Scalar),
+            isa,
+            _cfg: PhantomData,
+        }
     }
 
     /// Visit every piece of `text` via an inline callback, byte-identical
@@ -1113,13 +1455,31 @@ impl<'a, C: PretokConfig> Mask<'a, C> {
     pub fn for_each_piece<F: FnMut(&'a str)>(&mut self, mut f: F) {
         let text = self.text;
         let bytes = text.as_bytes();
-        self.state.for_each_span::<C, _>(text, |start, end| {
+        let emit = |start: usize, end: usize| {
             debug_assert!(text.is_char_boundary(start) && text.is_char_boundary(end));
             // SAFETY: spans come from ASCII-classified boundary bits or
             // Core's own piece ends; both are char boundaries.
             f(unsafe { std::str::from_utf8_unchecked(&bytes[start..end]) });
-        });
+        };
+        match self.isa {
+            // SAFETY: `isa` is only `Avx2` when AVX2 was detected.
+            #[cfg(target_arch = "x86_64")]
+            MaskIsa::Avx2 => unsafe { avx2_for_each_span::<C, _>(&mut self.state, text, emit) },
+            _ => self.state.for_each_span::<C, Base, _>(text, emit),
+        }
     }
+}
+
+/// Runs the bulk walker inside an AVX2 codegen context so the per-batch
+/// classification inlines into it.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_for_each_span<C: PretokConfig, F: FnMut(usize, usize)>(
+    state: &mut MaskState,
+    text: &str,
+    f: F,
+) {
+    state.for_each_span::<C, Avx2, F>(text, f)
 }
 
 impl<'a, C: PretokConfig> Iterator for Mask<'a, C> {
@@ -1127,7 +1487,10 @@ impl<'a, C: PretokConfig> Iterator for Mask<'a, C> {
 
     #[inline]
     fn next(&mut self) -> Option<&'a str> {
-        let (start, end) = self.state.next_span::<C>(self.text)?;
+        let (start, end) = match self.isa {
+            MaskIsa::Avx2 => self.state.next_span::<C, Avx2>(self.text)?,
+            _ => self.state.next_span::<C, Base>(self.text)?,
+        };
         debug_assert!(self.text.is_char_boundary(start) && self.text.is_char_boundary(end));
         // SAFETY: spans come from ASCII-classified boundary bits or Core's
         // own piece ends; both are char boundaries.
@@ -1142,14 +1505,21 @@ mod tests {
     use super::*;
     use crate::configs::*;
 
+    /// Every backend runnable on this CPU (the scalar walker included).
+    fn isas() -> impl Iterator<Item = MaskIsa> {
+        [MaskIsa::Scalar, MaskIsa::Base, MaskIsa::Avx2].into_iter().filter(|i| i.supported())
+    }
+
     fn check<C: PretokConfig>(text: &str) {
         let scalar: Vec<&str> = Core::<C>::new(text).collect();
-        let masked: Vec<&str> = Mask::<C>::new(text).collect();
-        assert_eq!(masked, scalar, "mask vs core mismatch on {text:?}");
-        // The bulk-drain callback path must match the iterator exactly.
-        let mut bulk: Vec<&str> = Vec::new();
-        Mask::<C>::new(text).for_each_piece(|p| bulk.push(p));
-        assert_eq!(bulk, scalar, "for_each_piece vs core mismatch on {text:?}");
+        for isa in isas() {
+            let masked: Vec<&str> = Mask::<C>::with_isa(text, isa).collect();
+            assert_eq!(masked, scalar, "{isa:?}: mask vs core mismatch on {text:?}");
+            // The bulk-drain callback path must match the iterator exactly.
+            let mut bulk: Vec<&str> = Vec::new();
+            Mask::<C>::with_isa(text, isa).for_each_piece(|p| bulk.push(p));
+            assert_eq!(bulk, scalar, "{isa:?}: for_each_piece vs core mismatch on {text:?}");
+        }
     }
 
     fn check_all(text: &str) {
@@ -1160,6 +1530,7 @@ mod tests {
         check::<SmolLMConfig>(text);
         check::<DeepSeekConfig>(text);
         check::<QwenConfig>(text);
+        check::<TekkenConfig>(text);
     }
 
     /// Wrap short unit vectors in long ASCII padding so the mask path is
@@ -1190,6 +1561,7 @@ mod tests {
             "1¹23", "¹²³", "12¹", " ¹", "a ❶b", "x ½", "a\n\n½ cup", "x  ½",
             "values \u{200B}\u{200B}that", "higher \u{AD}partic", "\u{200B}école",
             "a\u{80}\u{94}b", "x «y", "«ab", "a \u{200B}b", "x\u{AD}y",
+            "l\x1b[s\x1b[6n", "\x01!x", "\x01'll", "\x1bab", "\x7f\x00é", "x ❤\u{FE0F}\n", "!!\u{301}x",
             "ก\u{E31}น", "આફ્રિકા ખંડ", "l'été", ".\n\n'The",
             "abc\n123", "a 1 b", "12345 67890 a123b",
             "hello/world//x", "a!//b", "x”\n/y",
@@ -1198,6 +1570,9 @@ mod tests {
             "money $100.99, 50% off!", "e.g. Dr. Smith's co-op",
             "日本語のテキスト and English", "русский текст тоже",
             "a\u{3000}b", "nbsp\u{A0}here", "tab\tnew\nline",
+            "8\t_re_num", "\t.re", "\t8", "\tre", "a \t_x", "\r\n  \r\n  x", "\n \n",
+            "aⅢ", " Ⅲ", "x ⅰ", "（BD-ROM・-R・-RE）", "・(PД", "Ｆ一", " 中文", "a  中",
+            "ア゛b", "゛゛", "-中", "中-R", "=σλ", "-handâa",
         ];
         for c in cases {
             check_padded(c);
@@ -1220,7 +1595,7 @@ mod tests {
             " ", " ", " ", "\t", "\n", "\r", "\n\n",
             ".", ",", "!", "$", "<", "/", "«", "»", "”", "…",
             "'", "'s", "'ll", "'re", "'T",
-            "é", "ß", "ก", "\u{E31}", "中", "の", "½", "¹", "❶",
+            "é", "ß", "ก", "\u{E31}", "中", "の", "・", "゛", "Ⅲ", "½", "¹", "❶",
             "\u{200B}", "\u{AD}", "\u{A0}", "\u{3000}", "\x01", "\x0b",
             "🎉", "👍",
         ];
@@ -1242,60 +1617,86 @@ mod tests {
         }
     }
 
+    /// Streaming differential of `Mask` (iterator and bulk drain, every
+    /// backend) against `Core` over a large text, without materializing
+    /// the piece lists.
+    fn diff_stream<C: PretokConfig>(label: &str, text: &str) {
+        let name = std::any::type_name::<C>().rsplit("::").next().unwrap();
+        for isa in isas() {
+            let mut core = Core::<C>::new(text);
+            let mut mask = Mask::<C>::with_isa(text, isa);
+            let mut i = 0usize;
+            loop {
+                match (core.next(), mask.next()) {
+                    (Some(a), Some(b)) if a == b => {}
+                    (None, None) => break,
+                    (a, b) => panic!("{label} {name} {isa:?} piece {i}: core {a:?} mask {b:?}"),
+                }
+                i += 1;
+            }
+            let mut core = Core::<C>::new(text);
+            let mut j = 0usize;
+            Mask::<C>::with_isa(text, isa).for_each_piece(|b| {
+                let a = core.next();
+                assert_eq!(a, Some(b), "{label} {name} {isa:?} for_each piece {j}");
+                j += 1;
+            });
+            assert_eq!(core.next(), None, "{label} {name} {isa:?} for_each short");
+        }
+    }
+
+    fn diff_stream_all(label: &str, text: &str) {
+        diff_stream::<Gpt2Config>(label, text);
+        diff_stream::<Cl100kConfig>(label, text);
+        diff_stream::<O200kConfig>(label, text);
+        diff_stream::<VoyageConfig>(label, text);
+        diff_stream::<SmolLMConfig>(label, text);
+        diff_stream::<DeepSeekConfig>(label, text);
+        diff_stream::<QwenConfig>(label, text);
+        diff_stream::<TekkenConfig>(label, text);
+    }
+
+    fn bench_data(name: &str) -> Option<Vec<u8>> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benches/data");
+        std::fs::read(dir.join(name)).ok()
+    }
+
+    /// 5 MB of OpenWebText (falls back to enwik8) under every backend.
     #[test]
     fn owt_sample_differential() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("benches/data/owt_sample.txt");
-        let Ok(data) = std::fs::read(&path) else {
-            eprintln!("owt_sample.txt missing; skipping");
+        let Some(data) = bench_data("owt_sample.txt").or_else(|| bench_data("enwik8")) else {
+            eprintln!("owt_sample.txt / enwik8 missing; skipping");
             return;
         };
         let text = String::from_utf8_lossy(&data[..data.len().min(5_000_000)]).into_owned();
-        macro_rules! diff {
-            ($cfg:ty) => {{
-                let mut core = Core::<$cfg>::new(&text);
-                let mut mask = Mask::<$cfg>::new(&text);
-                let mut i = 0usize;
-                loop {
-                    match (core.next(), mask.next()) {
-                        (Some(a), Some(b)) => assert_eq!(
-                            a, b,
-                            "{} piece {i}: core {:?} mask {:?}",
-                            stringify!($cfg), a, b
-                        ),
-                        (None, None) => break,
-                        (a, b) => panic!(
-                            "{} piece {i}: core {:?} mask {:?}",
-                            stringify!($cfg), a, b
-                        ),
-                    }
-                    i += 1;
-                }
-                // for_each_piece must reproduce the iterator exactly.
-                let mut mask_it = Mask::<$cfg>::new(&text);
-                let mut j = 0usize;
-                Mask::<$cfg>::new(&text).for_each_piece(|b| {
-                    let a = mask_it.next();
-                    assert_eq!(
-                        a, Some(b),
-                        "{} for_each piece {j}: iter {:?} bulk {:?}",
-                        stringify!($cfg), a, b
-                    );
-                    j += 1;
-                });
-                assert_eq!(mask_it.next(), None, "{} for_each short", stringify!($cfg));
-            }};
+        diff_stream_all("sample", &text);
+    }
+
+    /// Full 100 MB enwik8 plus every file under `PRETOKIE_FIXTURES`
+    /// (e.g. tokbench's data/fixtures). Slow; run with
+    /// `cargo test --release -p pretokie -- --ignored corpus_differential`.
+    #[test]
+    #[ignore]
+    fn corpus_differential() {
+        let mut ran = 0;
+        if let Some(data) = bench_data("enwik8") {
+            diff_stream_all("enwik8", &String::from_utf8_lossy(&data));
+            ran += 1;
         }
-        diff!(Gpt2Config);
-        diff!(Cl100kConfig);
-        diff!(O200kConfig);
-        diff!(VoyageConfig);
-        diff!(SmolLMConfig);
-        diff!(DeepSeekConfig);
-        diff!(QwenConfig);
+        if let Ok(dir) = std::env::var("PRETOKIE_FIXTURES") {
+            let mut stack = vec![std::path::PathBuf::from(dir)];
+            while let Some(p) = stack.pop() {
+                if p.is_dir() {
+                    for e in std::fs::read_dir(&p).unwrap() {
+                        stack.push(e.unwrap().path());
+                    }
+                } else if let Ok(data) = std::fs::read(&p) {
+                    diff_stream_all(&p.display().to_string(), &String::from_utf8_lossy(&data));
+                    ran += 1;
+                }
+            }
+        }
+        assert!(ran > 0, "no corpus found (benches/data/enwik8 or PRETOKIE_FIXTURES)");
+        eprintln!("corpus_differential: {ran} corpora");
     }
 }

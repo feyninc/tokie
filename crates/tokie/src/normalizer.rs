@@ -393,6 +393,10 @@ pub fn sentencepiece_precompiled_normalize<'a>(
     if whitespace_split {
         // Step 2: collapse whitespace and strip (WhitespaceSplit)
         let collapsed = collapse_and_strip_whitespace(&transformed);
+        // Whitespace-only input: WhitespaceSplit leaves no pieces, so no `▁`.
+        if collapsed.is_empty() {
+            return Cow::Borrowed("");
+        }
 
         // Step 3: apply metaspace (prepend ▁ and replace spaces)
         let mut result = String::with_capacity(collapsed.len() + 3);
@@ -640,12 +644,10 @@ fn collapse_strip_whitespace_and_controls(text: &str) -> String {
 fn is_control(c: char) -> bool {
     match c {
         '\t' | '\n' | '\r' => false,
+        // HF keeps unassigned (Cn) code points: "a\u{5FF}b" → [a, [UNK], b].
         _ => matches!(
             get_general_category(c),
-            GeneralCategory::Control
-                | GeneralCategory::Format
-                | GeneralCategory::Unassigned
-                | GeneralCategory::PrivateUse
+            GeneralCategory::Control | GeneralCategory::Format | GeneralCategory::PrivateUse
         ),
     }
 }
@@ -1232,6 +1234,14 @@ mod tests {
         let result = norm.normalize(text);
         assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(result, "Hello World!"); // No change
+    }
+
+    #[test]
+    fn test_bert_clean_keeps_unassigned() {
+        // Matches HF: Cc/Cf/Co are dropped, unassigned code points are kept.
+        let norm = Normalizer::BertCased;
+        assert_eq!(norm.normalize("a\u{5FF}b\u{378}"), "a\u{5FF}b\u{378}");
+        assert_eq!(norm.normalize("a\u{200B}\u{E000}\u{7F}b"), "ab");
     }
 
 }

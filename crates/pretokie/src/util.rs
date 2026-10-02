@@ -89,7 +89,14 @@ pub fn decode_utf8(bytes: &[u8]) -> (char, usize) {
 /// For pretokenizer regex patterns using `\p{L}`, use this instead.
 #[inline(always)]
 pub fn is_unicode_letter(c: char) -> bool {
-    c.is_alphabetic() && !is_unicode_mark(c)
+    is_alpha(c) && !is_unicode_mark(c)
+}
+
+/// `char::is_alphabetic()` minus letter numbers (Nl: `Ⅲ`, `ⅰ`, `〇`), which
+/// have the `Alphabetic` property but are `\p{N}`, not `\p{L}`.
+#[inline(always)]
+pub fn is_alpha(c: char) -> bool {
+    c.is_alphabetic() && !c.is_numeric()
 }
 
 /// Check if a Unicode char is in \p{P} or \p{S} (punctuation or symbol).
@@ -246,4 +253,10 @@ mod swar_tests {
             assert_eq!(ascii_letter_run(c), expect, "{c:?}");
         }
     }
+}
+
+/// DeepSeek's pre-isolated CJK range `[一-龥぀-ゟ゠-ヿ]`.
+#[inline(always)]
+pub fn is_cjk_char(ch: char) -> bool {
+    matches!(ch as u32, 0x4E00..=0x9FA5 | 0x3040..=0x309F | 0x30A0..=0x30FF)
 }
