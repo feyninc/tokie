@@ -1397,6 +1397,7 @@ name = "pretokie"
 version = "0.1.3"
 dependencies = [
  "foldhash",
+ "onig",
  "regex-automata",
  "unicode-general-category",
 ]

@@ -12,10 +12,29 @@ readme = "README.md"
 
 [features]
 regex = ["regex-automata"]
+# Dev-only oracle: a faithful re-implementation of HuggingFace tokenizers'
+# pretokenization (Oniguruma via `onig`, Ruby syntax, no options — see
+# docs/pretokie-v2/00-oracle-engine.md). Used by tests/golden.rs and
+# examples/dump.rs; never enabled by published builds.
+oracle = ["dep:onig"]
 
 [dependencies]
 regex-automata = { version = "0.4", optional = true }
 unicode-general-category = "1.0"
+onig = { version = "6.5.1", default-features = false, optional = true }
 
 [dev-dependencies]
 foldhash = "0.1"
+
+[[test]]
+name = "golden"
+required-features = ["oracle"]
+
+[[example]]
+name = "dump"
+required-features = ["oracle"]
+
+# verify_vs_hf builds the reference regex patterns (needs the `regex` feature)
+[[example]]
+name = "verify_vs_hf"
+required-features = ["regex", "oracle"]

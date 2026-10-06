@@ -16,6 +16,12 @@ mod configs;
 mod impls;
 pub mod util;
 
+/// Dev-only HuggingFace oracle (requires the `oracle` feature). See
+/// `docs/pretokie-v2/00-oracle-engine.md`; never part of published builds'
+/// default features.
+#[cfg(feature = "oracle")]
+pub mod oracle;
+
 pub use core::iter::Core;
 pub use core::mask::Mask;
 
