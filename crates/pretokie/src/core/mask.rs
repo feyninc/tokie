@@ -201,9 +201,9 @@ unsafe fn avx2_batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, 
 
 /// One u64 mask per byte predicate for a 64-byte batch (bit i = byte
 /// scan+i). These are `Core`'s byte classes, not Unicode's: whitespace
-/// is exactly {space, tab, \r, \n} and everything else ASCII that is
-/// not a letter/digit is "punct" (including \x0b, \x0c and controls),
-/// matching `Core`'s scalar predicates.
+/// is exactly {space, tab, VT, FF, \r, \n} (Oniguruma's ASCII `\s`) and
+/// everything else ASCII that is not a letter/digit is "punct" (including
+/// controls), matching `Core`'s scalar predicates.
 #[derive(Clone, Copy, Default)]
 struct AsciiMasks {
     /// ASCII letters.
@@ -212,7 +212,8 @@ struct AsciiMasks {
     d: u64,
     /// Space (0x20).
     s: u64,
-    /// Tab (0x09).
+    /// Tab-like whitespace: tab, VT, FF (0x09, 0x0B, 0x0C) — `\s` but
+    /// neither the literal space nor `[\r\n]`.
     t: u64,
     /// Newlines: \r, \n.
     n: u64,
@@ -298,11 +299,12 @@ fn neon_ascii_masks(
             l[i] = vcleq_u8(vsubq_u8(lowered, vdupq_n_u8(b'a')), vdupq_n_u8(25));
             d[i] = vcleq_u8(vsubq_u8(v, vdupq_n_u8(b'0')), vdupq_n_u8(9));
             s[i] = vceqq_u8(v, vdupq_n_u8(b' '));
-            t[i] = vceqq_u8(v, vdupq_n_u8(b'\t'));
             n[i] = vorrq_u8(
                 vceqq_u8(v, vdupq_n_u8(b'\r')),
                 vceqq_u8(v, vdupq_n_u8(b'\n')),
             );
+            // 0x09..=0x0C minus \n
+            t[i] = vbicq_u8(vcleq_u8(vsubq_u8(v, vdupq_n_u8(b'\t')), vdupq_n_u8(3)), n[i]);
             hi[i] = vcltzq_s8(vreinterpretq_s8_u8(v));
             ap[i] = vceqq_u8(v, vdupq_n_u8(b'\''));
             if case_masks {
@@ -370,11 +372,13 @@ fn sse2_ascii_masks(
             m.l |= mv(l);
             m.d |= mv(le(_mm_sub_epi8(v, set(b'0')), 9));
             m.s |= mv(_mm_cmpeq_epi8(v, set(b' ')));
-            m.t |= mv(_mm_cmpeq_epi8(v, set(b'\t')));
-            m.n |= mv(_mm_or_si128(
+            let nl = _mm_or_si128(
                 _mm_cmpeq_epi8(v, set(b'\r')),
                 _mm_cmpeq_epi8(v, set(b'\n')),
-            ));
+            );
+            m.n |= mv(nl);
+            // 0x09..=0x0C minus \n
+            m.t |= mv(_mm_andnot_si128(nl, le(_mm_sub_epi8(v, set(b'\t')), 3)));
             m.hi |= mv(v);
             m.ap |= mv(_mm_cmpeq_epi8(v, set(b'\'')));
             if case_masks {
@@ -437,11 +441,13 @@ unsafe fn avx2_ascii_masks(
         m.l |= mv!(l);
         m.d |= mv!(le!(_mm256_sub_epi8(v, set!(b'0')), 9));
         m.s |= mv!(_mm256_cmpeq_epi8(v, set!(b' ')));
-        m.t |= mv!(_mm256_cmpeq_epi8(v, set!(b'\t')));
-        m.n |= mv!(_mm256_or_si256(
+        let nl = _mm256_or_si256(
             _mm256_cmpeq_epi8(v, set!(b'\r')),
             _mm256_cmpeq_epi8(v, set!(b'\n')),
-        ));
+        );
+        m.n |= mv!(nl);
+        // 0x09..=0x0C minus \n
+        m.t |= mv!(_mm256_andnot_si256(nl, le!(_mm256_sub_epi8(v, set!(b'\t')), 3)));
         m.hi |= mv!(v);
         m.ap |= mv!(_mm256_cmpeq_epi8(v, set!(b'\'')));
         if case_masks {
@@ -538,7 +544,7 @@ fn leading_run(d: u64) -> u64 {
 
 #[inline(always)]
 fn is_ascii_ws_byte(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+    matches!(b, b' ' | b'\t' | 0x0B | 0x0C | b'\n' | b'\r')
 }
 
 use crate::util::is_cjk_char;
@@ -776,7 +782,7 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
             let wsb = is_ascii_ws_byte(b);
             pl = u64::from(letter);
             pd = u64::from(digit);
-            psp = u64::from(b == b' ' || b == b'\t');
+            psp = u64::from(b == b' ' || crate::util::is_tab_like(b));
             pws = u64::from(wsb);
             po = u64::from(!letter && !digit && !wsb);
             plo = u64::from(crate::util::is_lower(b));
@@ -951,7 +957,7 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
     let (ps, pt) = if scan == 0 {
         (0u64, 0u64)
     } else {
-        (u64::from(bytes[scan - 1] == b' '), u64::from(bytes[scan - 1] == b'\t'))
+        (u64::from(bytes[scan - 1] == b' '), u64::from(crate::util::is_tab_like(bytes[scan - 1])))
     };
     let pfx_bits = run_start | split;
     let after_sp_classes =
@@ -978,7 +984,7 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
             bad |= ctl | ctl << 1 | ctl << 2 | ctl >> 1;
         }
         // The same reach from a control in the previous batch's last two bytes.
-        let is_ctl = |b: u8| (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7F;
+        let is_ctl = |b: u8| (b < 0x20 && !is_ascii_ws_byte(b)) || b == 0x7F;
         if scan >= 1 && is_ctl(bytes[scan - 1]) {
             bad |= 0b11;
         }
@@ -1105,11 +1111,11 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
                 }
                 boundary |= 1u64 << (i + k);
                 contr_next |= 1u64 << (i + k);
-            } else {
+            } else if C::PUNCT_PREFIX_MODE != PunctPrefixMode::SpaceOnly {
                 // No contraction: an immediately following letter is
-                // absorbed by tokie's apostrophe-prefix ("x'y" → x 'y),
-                // which SpaceOnly configs don't get from the general
-                // punct-absorb rule.
+                // absorbed by the apostrophe as a letter prefix ("x'y" →
+                // x 'y). SpaceOnly configs (GPT-2 ` ?[^\s\p{L}\p{N}]+`) keep
+                // the apostrophe a punct piece of its own ("d'Arce" → d ' Arce).
                 let nb1 = bytes[scan + i + 1];
                 if crate::util::is_ascii_letter(nb1)
                     || (nb1 >= 0x80 && (uni.l_lead >> (i + 1)) & 1 == 1)

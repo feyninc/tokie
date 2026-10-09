@@ -1,11 +1,12 @@
 //! BERT pretokenizer — single-pass, zero allocation.
 //!
-//! Rules:
-//! - Whitespace is a delimiter only (stripped, never part of a piece)
-//! - Each punctuation character is a separate piece: "..." → [".", ".", "."]
-//! - Letters and digits stay together in words: "18th" → ["18th"]
-//! - CJK ideographs are individual pieces: "你好" → ["你", "好"]
-//! - Unicode marks attach to words (spacing combining marks)
+//! Matches HuggingFace's `BertPreTokenizer`:
+//! - Whitespace (`char::is_whitespace`) is a delimiter only (stripped, never part of a piece)
+//! - Each punctuation character (ASCII punct or Unicode P) is a separate piece:
+//!   "..." → [".", ".", "."]
+//! - Everything else stays together in words: "18th" → ["18th"], "€100" → ["€100"]
+//! - CJK ideographs are NOT split here: HF isolates them in `BertNormalizer`
+//!   (`handle_chinese_chars`) before pretokenization, and so does tokie's normalizer
 //! - No contractions, no space prefix
 
 use crate::util::decode_utf8;
@@ -17,20 +18,10 @@ fn is_ascii_punct(b: u8) -> bool {
     matches!(b, 33..=47 | 58..=64 | 91..=96 | 123..=126)
 }
 
-/// Check if a character is a CJK ideograph.
-#[inline]
-fn is_cjk(c: char) -> bool {
-    let cp = c as u32;
-    matches!(cp,
-        0x4E00..=0x9FFF
-        | 0x3400..=0x4DBF
-        | 0x20000..=0x2A6DF
-        | 0x2A700..=0x2B73F
-        | 0x2B740..=0x2B81F
-        | 0x2B820..=0x2CEAF
-        | 0xF900..=0xFAFF
-        | 0x2F800..=0x2FA1F
-    )
+/// ASCII `char::is_whitespace` (includes VT and FF).
+#[inline(always)]
+fn is_ascii_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
 }
 
 /// Check if a Unicode character is punctuation.
@@ -71,7 +62,7 @@ impl<'a> Bert<'a> {
     fn skip_whitespace(&mut self) {
         while self.pos < self.len {
             let b = unsafe { *self.bytes.get_unchecked(self.pos) };
-            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            if is_ascii_ws(b) {
                 self.pos += 1;
             } else if b < 0x80 {
                 return;
@@ -82,8 +73,7 @@ impl<'a> Bert<'a> {
         }
     }
 
-    /// Scan word characters: ASCII letters, digits, and non-ASCII letters/numbers/marks.
-    /// Stops at whitespace, ASCII punctuation, CJK, and Unicode punctuation.
+    /// Scan word characters: anything that is neither whitespace nor punctuation.
     #[inline(always)]
     fn scan_word(&mut self) {
         while self.pos < self.len {
@@ -91,13 +81,16 @@ impl<'a> Bert<'a> {
             if b.is_ascii_alphanumeric() {
                 self.pos += 1;
             } else if b < 0x80 {
-                return; // ASCII whitespace or punctuation — stop
-            } else {
-                let (c, cl) = decode_utf8(unsafe { self.bytes.get_unchecked(self.pos..) });
-                if is_cjk(c) || c.is_whitespace() || is_unicode_punct(c) {
+                if is_ascii_ws(b) || is_ascii_punct(b) {
                     return;
                 }
-                // Letter, number, mark, or other non-punct non-CJK → continues word
+                self.pos += 1; // ASCII control: part of the word, as in HF
+            } else {
+                let (c, cl) = decode_utf8(unsafe { self.bytes.get_unchecked(self.pos..) });
+                if c.is_whitespace() || is_unicode_punct(c) {
+                    return;
+                }
+                // Letter, number, mark, symbol, CJK, … → continues word
                 self.pos += cl;
             }
         }
@@ -121,16 +114,13 @@ impl<'a> Iterator for Bert<'a> {
                 // Single punctuation character
                 self.pos += 1;
             } else {
-                // ASCII letter or digit — scan word
+                // Any other ASCII char (letter, digit, control) — scan word
                 self.pos += 1;
                 self.scan_word();
             }
         } else {
             let (c, cl) = decode_utf8(unsafe { self.bytes.get_unchecked(self.pos..) });
-            if is_cjk(c) {
-                // Single CJK character
-                self.pos += cl;
-            } else if is_unicode_punct(c) {
+            if is_unicode_punct(c) {
                 // Single Unicode punctuation character
                 self.pos += cl;
             } else {

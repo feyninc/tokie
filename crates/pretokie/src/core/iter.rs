@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 
 use crate::core::config::*;
-use crate::util::{is_cjk_char, ascii_letter_run, decode_utf8, is_ascii_letter, is_digit, is_lower, is_punct_or_symbol, is_upper, is_unicode_letter, is_unicode_mark};
+use crate::util::{is_cjk_char, ascii_letter_run, decode_utf8, is_ascii_letter, is_digit, is_lower, is_punct_or_symbol, is_tab_like, is_upper, is_unicode_letter, is_unicode_mark};
 
 pub struct Core<'a, C: PretokConfig> {
     bytes: &'a [u8],
@@ -70,67 +70,108 @@ impl<'a, C: PretokConfig> Core<'a, C> {
         }
     }
 
-    /// O200K CamelCase: dispatch based on first byte's case.
+    /// O200K CamelCase, entered with the first letter byte (ASCII) consumed.
     #[inline(always)]
-    fn scan_letters_case_aware(&mut self, first: u8) {
-        if first < 0x80 {
-            if is_lower(first) {
-                self.scan_lowercase();
-            } else {
-                self.scan_upper_then_lower();
-            }
+    fn scan_letters_case_aware(&mut self, _first: u8) {
+        self.pos -= 1;
+        self.scan_camel();
+    }
+
+    /// Case class of the letter/mark char at `pos` for the CamelCase rule:
+    /// bit 0 = in `U = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]`, bit 1 = in
+    /// `L = [\p{Ll}\p{Lm}\p{Lo}\p{M}]` (Lm/Lo/M are in both), 0 = neither.
+    /// Returns (class, char byte length).
+    #[inline(always)]
+    fn camel_class_at(&self, pos: usize) -> (u8, usize) {
+        let b = self.at(pos);
+        if is_upper(b) {
+            (1, 1)
+        } else if is_lower(b) {
+            (2, 1)
+        } else if b < 0x80 {
+            (0, 1)
         } else {
-            let start = self.pos - 1;
-            let (ch, _) = decode_utf8(&self.bytes[start..]);
-            if ch.is_lowercase() {
-                self.scan_lowercase();
-            } else {
-                self.scan_upper_then_lower();
+            let (ch, cl) = decode_utf8(&self.bytes[pos..]);
+            (crate::util::camel_class(ch), cl)
+        }
+    }
+
+    /// `U*L+|U+L*` (the o200k/Tekken word body) from the letter char at
+    /// `pos`, with the regex's backtracking: the greedy `U*` run gives back
+    /// chars until `L+` can start, so a run with no following `Ll` ends
+    /// after its last `L`-class char (`한Q` → `한`, `Q`), and an all-`Lu`/`Lt`
+    /// run is taken whole by `U+`.
+    #[inline(always)]
+    fn scan_camel(&mut self) {
+        let (c0, cl0) = self.camel_class_at(self.pos);
+        self.scan_camel_known(c0, cl0);
+    }
+
+    /// [`Self::scan_camel`] from a letter/mark char `ch` already decoded at
+    /// `pos` by the caller's letter check (no second `is_alpha`).
+    #[inline(always)]
+    fn scan_camel_letter(&mut self, ch: char) {
+        self.scan_camel_known(crate::util::camel_class_of_letter(ch), ch.len_utf8());
+    }
+
+    /// [`Self::scan_camel`] given the class `c0` and byte length `cl0` of
+    /// the char at `pos`.
+    #[inline(always)]
+    fn scan_camel_known(&mut self, c0: u8, cl0: usize) {
+        let mut p = self.pos;
+        let mut last_l_end = 0usize;
+        // `U*`: ASCII uppercase in a tight loop (never in L), unicode by
+        // class. Ends with the class/length of the char that stopped it, so
+        // no char is classified twice.
+        let (next_class, next_len) = if c0 & 1 == 0 {
+            (c0, cl0)
+        } else {
+            p += cl0;
+            if c0 & 2 != 0 {
+                last_l_end = p;
             }
-        }
-    }
-
-    /// Scan `[\p{Ll}\p{Lm}\p{Lo}\p{M}]+`
-    #[inline(always)]
-    fn scan_lowercase(&mut self) {
-        while self.pos < self.len {
-            let b = self.at(self.pos);
-            if is_lower(b) {
-                self.pos += 1;
-            } else if b >= 0x80 {
-                let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
-                // `is_lowercase`/`is_uppercase` also cover Other_Lowercase/
-                // Other_Uppercase symbols (`Ⅲ` is Nl), which are not `\p{L}`.
-                if is_unicode_mark(ch) || (is_unicode_letter(ch) && !ch.is_uppercase()) {
-                    self.pos += cl;
-                } else { return; }
-            } else { return; }
-        }
-    }
-
-    /// Scan upper/titlecase/modifier/other letters, then lowercase+marks.
-    #[inline(always)]
-    fn scan_upper_then_lower(&mut self) {
-        while self.pos < self.len {
-            let b = self.at(self.pos);
-            if is_upper(b) {
-                self.pos += 1;
-            } else if is_lower(b) {
-                self.pos += 1;
-                self.scan_lowercase();
-                return;
-            } else if b >= 0x80 {
-                let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
-                if ch.is_uppercase() && is_unicode_letter(ch) {
-                    self.pos += cl;
-                } else if (ch.is_lowercase() && is_unicode_letter(ch)) || is_unicode_mark(ch) {
-                    self.pos += cl;
-                    self.scan_lowercase();
-                    return;
-                } else if is_unicode_letter(ch) {
-                    self.pos += cl;
-                } else { return; }
-            } else { return; }
+            loop {
+                while p < self.len && is_upper(self.at(p)) {
+                    p += 1;
+                }
+                if p >= self.len {
+                    break (0, 0);
+                }
+                let b = self.at(p);
+                if b < 0x80 {
+                    break (if is_lower(b) { 2 } else { 0 }, 1);
+                }
+                let (c, cl) = self.camel_class_at(p);
+                if c & 1 == 0 {
+                    break (c, cl);
+                }
+                p += cl;
+                if c & 2 != 0 {
+                    last_l_end = p;
+                }
+            }
+        };
+        if next_class == 2 {
+            // `L+` continues the run past the uppercase prefix.
+            p += next_len;
+            loop {
+                while p < self.len && is_lower(self.at(p)) {
+                    p += 1;
+                }
+                if p >= self.len || self.at(p) < 0x80 {
+                    break;
+                }
+                let (c, cl) = self.camel_class_at(p);
+                if c & 2 == 0 {
+                    break;
+                }
+                p += cl;
+            }
+            self.pos = p;
+        } else if last_l_end != 0 {
+            self.pos = last_l_end;
+        } else {
+            self.pos = p;
         }
     }
 
@@ -223,7 +264,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
             // [\p{P}\p{S}] in ASCII = printable non-alphanumerics; excludes controls
             matches!(b, 0x21..=0x2F | 0x3A..=0x40 | 0x5B..=0x60 | 0x7B..=0x7E)
         } else {
-            !is_ascii_letter(b) && !is_digit(b) && b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' && b < 0x80
+            !is_ascii_letter(b) && !is_digit(b) && b != b' ' && !is_tab_like(b) && b != b'\n' && b != b'\r' && b < 0x80
         }
     }
 
@@ -236,7 +277,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
             // Qwen3.5 ` ?[^\s\p{L}\p{M}\p{N}]+`. O200K's ` ?[^\s\p{L}\p{N}]+`
             // keeps marks in the run (" ❤️" is one piece), so it takes the
             // default branch.
-            !ch.is_alphabetic() && !ch.is_numeric() && !ch.is_whitespace() && !is_unicode_mark(ch)
+            !crate::util::is_alpha(ch) && !ch.is_numeric() && !ch.is_whitespace() && !is_unicode_mark(ch)
         } else {
             !is_unicode_letter(ch) && !ch.is_numeric() && !ch.is_whitespace()
         }
@@ -287,7 +328,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
         let mut prev_pos = self.pos;
         while self.pos < self.len {
             let c = self.at(self.pos);
-            if c == b' ' || c == b'\n' || c == b'\r' || c == b'\t' {
+            if c == b' ' || c == b'\n' || c == b'\r' || is_tab_like(c) {
                 prev_pos = self.pos;
                 self.pos += 1;
             } else if c >= 0x80 {
@@ -324,7 +365,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
                 prev_pos = self.pos;
                 self.pos += 1;
                 last_newline_end = self.pos;
-            } else if c == b' ' || c == b'\t' {
+            } else if c == b' ' || is_tab_like(c) {
                 prev_pos = self.pos;
                 self.pos += 1;
             } else if c >= 0x80 {
@@ -428,18 +469,13 @@ impl<'a, C: PretokConfig> Core<'a, C> {
 
     // ---- Punct prefix: scan letters after a prefix char ----
 
-    /// Scan the letter run whose first char `ch` (`cl` bytes) is at `self.pos`,
-    /// right after a one-char prefix. Case-aware under CamelCase, where the
-    /// o200k contraction suffix is merged too.
+    /// Scan the letter run whose first char is at `self.pos`, right after a
+    /// one-char prefix. Case-aware under CamelCase, where the o200k
+    /// contraction suffix is merged too.
     #[inline(always)]
-    fn scan_unicode_letters_after_prefix(&mut self, ch: char, cl: usize) {
+    fn scan_unicode_letters_after_prefix(&mut self, ch: char) {
         if C::LETTER_MODE == LetterMode::CamelCase {
-            self.pos += cl;
-            if ch.is_lowercase() || is_unicode_mark(ch) {
-                self.scan_lowercase();
-            } else {
-                self.scan_upper_then_lower();
-            }
+            self.scan_camel_letter(ch);
             let clen = self.check_contraction();
             if clen > 0 { self.pos += clen; }
         } else {
@@ -472,23 +508,58 @@ impl<'a, C: PretokConfig> Core<'a, C> {
         is_ascii_letter(next) || (next >= 0x80 && Self::is_letter_char(decode_utf8(&self.bytes[self.pos + 1..]).0))
     }
 
-    /// After a consumed non-punct control char: letters take it as their
-    /// one-char prefix; otherwise it is a piece of its own.
+    /// Whether a letter char (this config's letter class) starts at `pos`.
+    #[inline(always)]
+    fn letter_at(&self, pos: usize) -> bool {
+        pos < self.len && {
+            let b = self.at(pos);
+            is_ascii_letter(b) || (b >= 0x80 && Self::is_letter_char(decode_utf8(&self.bytes[pos..]).0))
+        }
+    }
+
+    /// DeepSeek: byte length of the char at `pos` if no main-regex
+    /// alternative can start on it (Cc/Cf/Co/Cn — not letter, mark, digit,
+    /// whitespace, `[\p{P}\p{S}]` or a pre-split CJK char), else 0.
+    #[inline(always)]
+    fn gap_char_at(&self, pos: usize) -> usize {
+        if pos >= self.len {
+            return 0;
+        }
+        let b = self.at(pos);
+        if b < 0x80 {
+            return usize::from((b < 0x20 && !is_tab_like(b) && b != b'\n' && b != b'\r') || b == 0x7F);
+        }
+        let (ch, cl) = decode_utf8(&self.bytes[pos..]);
+        let gap = !is_cjk_char(ch)
+            && !crate::util::is_alpha(ch)
+            && !is_unicode_mark(ch)
+            && !ch.is_numeric()
+            && !ch.is_whitespace()
+            && !is_punct_or_symbol(ch);
+        if gap { cl } else { 0 }
+    }
+
+    /// After a consumed non-punct control char (DeepSeek): letters take it
+    /// as their one-char prefix (`[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`).
+    /// Otherwise nothing matches it, and `Isolated` keeps the whole
+    /// unmatched gap as one piece ("\x1b\x1b" stays together) — up to a
+    /// gap char that prefixes the letters after it ("\x1b\x1bab" →
+    /// "\x1b", "\x1bab").
     #[inline(always)]
     fn scan_after_control_prefix(&mut self, start: usize) -> Option<&'a str> {
-        if self.pos >= self.len {
-            return None;
+        if self.letter_at(self.pos) {
+            let next = self.at(self.pos);
+            self.pos += if next < 0x80 { 1 } else { decode_utf8(&self.bytes[self.pos..]).1 };
+            self.scan_letters();
+            return self.handle_post_letters(start);
         }
-        let next = self.at(self.pos);
-        if is_ascii_letter(next) {
-            self.pos += 1;
-        } else if next >= 0x80 && Self::is_letter_char(decode_utf8(&self.bytes[self.pos..]).0) {
-            self.pos += decode_utf8(&self.bytes[self.pos..]).1;
-        } else {
-            return None;
+        loop {
+            let gl = self.gap_char_at(self.pos);
+            if gl == 0 || self.letter_at(self.pos + gl) {
+                return None;
+            }
+            self.pos += gl;
         }
-        self.scan_letters();
-        self.handle_post_letters(start)
     }
 }
 
@@ -516,6 +587,11 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
             let clen = self.check_contraction();
             if clen > 0 && C::CONTRACTION_MODE == ContractionMode::Standalone {
                 self.pos += clen;
+            } else if C::PUNCT_PREFIX_MODE == PunctPrefixMode::SpaceOnly {
+                // GPT-2 ` ?[^\s\p{L}\p{N}]+`: a non-contraction apostrophe is
+                // punct and never prefixes letters ("d'Arce" → d ' Arce).
+                self.pos += 1;
+                self.scan_punct();
             } else if clen == 0 || C::CONTRACTION_MODE == ContractionMode::Suffix {
                 // Not a standalone contraction — treat as prefix or punct
                 if self.pos + 1 < self.len {
@@ -527,10 +603,10 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                             return Some(piece);
                         }
                     } else if next >= 0x80 {
-                        let (ch, cl) = decode_utf8(&self.bytes[self.pos + 1..]);
+                        let (ch, _) = decode_utf8(&self.bytes[self.pos + 1..]);
                         if Self::is_letter_char(ch) && C::PUNCT_PREFIX_MODE != PunctPrefixMode::AsciiOnly {
                             self.pos += 1; // skip apostrophe prefix
-                            self.scan_unicode_letters_after_prefix(ch, cl);
+                            self.scan_unicode_letters_after_prefix(ch);
                             if C::LETTER_MODE != LetterMode::CamelCase {
                                 if let Some(piece) = self.handle_post_letters(start) {
                                     return Some(piece);
@@ -555,12 +631,12 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                 self.pos += 1;
                 self.scan_digits();
             }
-        } else if b == b'\t' && !self.tab_prefixes_letters() {
-            // Tab only ever prefixes letters (`[^\r\n\p{L}\p{N}]?\p{L}+`); the
-            // punct/digit rules take a literal space (` ?`), and GPT-2's
+        } else if is_tab_like(b) && !self.tab_prefixes_letters() {
+            // Tab (and VT/FF) only ever prefixes letters (`[^\r\n\p{L}\p{N}]?\p{L}+`);
+            // the punct/digit rules take a literal space (` ?`), and GPT-2's
             // ` ?\p{L}+` takes no tab at all. Otherwise it's plain whitespace.
             self.scan_whitespace();
-        } else if b == b' ' || b == b'\t' {
+        } else if b == b' ' || is_tab_like(b) {
             // Space/tab: prefix letters, prefix punct, or whitespace run
             if self.pos + 1 < self.len {
                 let next = self.at(self.pos + 1);
@@ -575,13 +651,7 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                     if Self::is_letter_char(ch) {
                         self.pos += 1; // consume space prefix
                         if C::LETTER_MODE == LetterMode::CamelCase {
-                            let (_, cl) = decode_utf8(&self.bytes[self.pos..]);
-                            self.pos += cl;
-                            if ch.is_lowercase() || is_unicode_mark(ch) {
-                                self.scan_lowercase();
-                            } else {
-                                self.scan_upper_then_lower();
-                            }
+                            self.scan_camel_letter(ch);
                             let clen = self.check_contraction();
                             if clen > 0 { self.pos += clen; }
                         } else {
@@ -645,19 +715,18 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                 self.pos += cl;
                 self.scan_cjk(ch);
             } else if Self::is_letter_char(ch) {
-                self.pos += cl;
                 if C::LETTER_MODE == LetterMode::CamelCase {
-                    if ch.is_lowercase() { self.scan_lowercase(); } else { self.scan_upper_then_lower(); }
+                    self.scan_camel_letter(ch);
                 } else {
+                    self.pos += cl;
                     self.scan_letters();
                 }
                 if let Some(piece) = self.handle_post_letters(start) {
                     return Some(piece);
                 }
             } else if is_unicode_mark(ch) && C::LETTER_MODE == LetterMode::CamelCase {
-                // O200K: mark at start → scan as lowercase
-                self.pos += cl;
-                self.scan_lowercase();
+                // O200K: mark at start (in both case classes)
+                self.scan_camel_letter(ch);
                 let clen = self.check_contraction();
                 if clen > 0 { self.pos += clen; }
             } else if ch.is_numeric() {
@@ -666,7 +735,9 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
             } else if ch.is_whitespace() {
                 // `[^\r\n\p{L}\p{N}]?\p{L}+`: non-ASCII whitespace (NBSP, U+3000)
                 // is a valid one-char letter prefix, like tab.
-                let next_letter = C::PUNCT_PREFIX_MODE == PunctPrefixMode::Any
+                // DeepSeek's `[^\r\n\p{L}\p{P}\p{S}]?` admits it as well;
+                // GPT-2's ` ?\p{L}+` takes a literal space only.
+                let next_letter = C::PUNCT_PREFIX_MODE != PunctPrefixMode::SpaceOnly
                     && self.pos + cl < self.len
                     && {
                         let next = self.at(self.pos + cl);
@@ -677,7 +748,9 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                     self.pos += cl;
                     let next = self.at(self.pos);
                     if is_ascii_letter(next) {
-                        self.scan_letters_after_punct_prefix(next);
+                        // Full letter run (not DeepSeek's ASCII-only punct rule).
+                        self.pos += 1;
+                        self.do_letter_scan(next);
                         if C::LETTER_MODE == LetterMode::CamelCase {
                             let clen = self.check_contraction();
                             if clen > 0 { self.pos += clen; }
@@ -685,8 +758,8 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                             return Some(piece);
                         }
                     } else {
-                        let (ch2, cl2) = decode_utf8(&self.bytes[self.pos..]);
-                        self.scan_unicode_letters_after_prefix(ch2, cl2);
+                        let (ch2, _) = decode_utf8(&self.bytes[self.pos..]);
+                        self.scan_unicode_letters_after_prefix(ch2);
                         if C::LETTER_MODE != LetterMode::CamelCase {
                             if let Some(piece) = self.handle_post_letters(start) {
                                 return Some(piece);
@@ -725,9 +798,9 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                             return Some(piece);
                         }
                     } else if next >= 0x80 {
-                        let (ch2, cl2) = decode_utf8(&self.bytes[self.pos..]);
+                        let (ch2, _) = decode_utf8(&self.bytes[self.pos..]);
                         if Self::is_letter_char(ch2) {
-                            self.scan_unicode_letters_after_prefix(ch2, cl2);
+                            self.scan_unicode_letters_after_prefix(ch2);
                         } else {
                             self.scan_punct();
                         }
@@ -736,7 +809,7 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                     }
                 }
             }
-        } else if C::PUNCT_CLASS == PunctClass::PunctSymbolOnly && !Self::is_punct_byte(b) && !(0x0B..=0x0C).contains(&b) {
+        } else if C::PUNCT_CLASS == PunctClass::PunctSymbolOnly && !Self::is_punct_byte(b) {
             // DeepSeek: an ASCII control (ESC, NUL, DEL) is not punct either
             self.pos += 1;
             if let Some(piece) = self.scan_after_control_prefix(start) {
@@ -760,17 +833,12 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                         return Some(piece);
                     }
                 } else if next >= 0x80 {
-                    let (ch, cl) = decode_utf8(&self.bytes[self.pos + 1..]);
+                    let (ch, _) = decode_utf8(&self.bytes[self.pos + 1..]);
                     // DeepSeek: ASCII punct prefixes `[A-Za-z]+` only ("=σλ" → = σλ)
                     if Self::is_letter_char(ch) && C::PUNCT_PREFIX_MODE != PunctPrefixMode::AsciiOnly {
                         self.pos += 1; // skip punct prefix
                         if C::LETTER_MODE == LetterMode::CamelCase {
-                            self.pos += cl;
-                            if ch.is_lowercase() || is_unicode_mark(ch) {
-                                self.scan_lowercase();
-                            } else {
-                                self.scan_upper_then_lower();
-                            }
+                            self.scan_camel_letter(ch);
                             let clen = self.check_contraction();
                             if clen > 0 { self.pos += clen; }
                         } else {
@@ -1079,5 +1147,34 @@ mod tests {
         // `[!-/:-@[-`{-~][A-Za-z]+`; `[^\r\n\p{L}\p{P}\p{S}]?` excludes punct.
         assert_eq!(pieces::<DeepSeekConfig>("=σλ"), vec!["=", "σλ"]);
         assert_eq!(pieces::<DeepSeekConfig>("-handâa"), vec!["-hand", "âa"]);
+    }
+
+    // HF-oracle parity (tests/golden.rs, `--features oracle`).
+    #[test] fn space_only_apostrophe_is_punct() {
+        // GPT-2 ` ?[^\s\p{L}\p{N}]+`: a non-contraction apostrophe never prefixes letters.
+        assert_eq!(pieces::<Gpt2Config>("d'Arce o'clock"), vec!["d", "'", "Arce", " o", "'", "clock"]);
+        assert_eq!(pieces::<Gpt2Config>("DON'T"), vec!["DON", "'", "T"]);
+        assert_eq!(pieces::<Gpt2Config>("\n\n'We"), vec!["\n", "\n", "'", "We"]);
+        assert_eq!(pieces::<SmolLMConfig>("d'Andorra"), vec!["d", "'", "Andorra"]);
+        // Cl100k-family still takes it as a one-char letter prefix.
+        assert_eq!(pieces::<Cl100kConfig>("d'Arce"), vec!["d", "'Arce"]);
+    }
+    #[test] fn camel_lo_lm_marks_are_both_cases() {
+        // `U*L+|U+L*` with Lm/Lo/M in both U and L: U* backtracks to the last
+        // L-class char when no Ll follows.
+        assert_eq!(pieces::<O200kConfig>("한Q"), vec!["한", "Q"]);
+        assert_eq!(pieces::<O200kConfig>(":惡搞RFC"), vec![":惡搞", "RFC"]);
+        assert_eq!(pieces::<O200kConfig>("\u{301}Q_"), vec!["\u{301}", "Q", "_"]);
+        assert_eq!(pieces::<O200kConfig>("+\u{301}Жl"), vec!["+\u{301}Жl"]);
+        assert_eq!(pieces::<O200kConfig>("Q'\u{301}Xß中"), vec!["Q", "'\u{301}Xß中"]);
+        assert_eq!(pieces::<TekkenConfig>("\u{a0}한Q"), vec!["\u{a0}한", "Q"]);
+    }
+    #[test] fn deepseek_unicode_ws_prefixes_letters() {
+        // `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`: NBSP/U+2003/U+3000 are valid prefixes.
+        assert_eq!(pieces::<DeepSeekConfig>("80\u{a0}km"), vec!["80", "\u{a0}km"]);
+        assert_eq!(pieces::<DeepSeekConfig>("a\u{3000}b  c"), vec!["a", "\u{3000}b", " ", " c"]);
+        assert_eq!(pieces::<DeepSeekConfig>("z\u{2003}e"), vec!["z", "\u{2003}e"]);
+        // The prefix takes the full letter run, not the ASCII-only punct rule's.
+        assert_eq!(pieces::<DeepSeekConfig>("\u{a0}héllo"), vec!["\u{a0}héllo"]);
     }
 }
