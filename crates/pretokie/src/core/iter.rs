@@ -708,6 +708,7 @@ mod tests {
     type SmolLM<'a> = Core<'a, SmolLMConfig>;
     type DeepSeek<'a> = Core<'a, DeepSeekConfig>;
     type Qwen<'a> = Core<'a, QwenConfig>;
+    type Tekken<'a> = Core<'a, TekkenConfig>;
 
     // GPT-2
     #[test] fn gpt2_basic() { assert_eq!(Gpt2::new("Hello world").collect::<Vec<_>>(), vec!["Hello", " world"]); }
@@ -749,6 +750,16 @@ mod tests {
     }
     #[test] fn o200k_digits() { assert_eq!(O200k::new("12345").collect::<Vec<_>>(), vec!["123", "45"]); }
     #[test] fn o200k_apost_prefix() { assert_eq!(O200k::new("'hello'").collect::<Vec<_>>(), vec!["'hello", "'"]); }
+
+    // Tekken: o200k without the contraction suffix, single digits
+    #[test] fn tekken_no_contraction() {
+        assert_eq!(Tekken::new("I'm").collect::<Vec<_>>(), vec!["I", "'m"]);
+        assert_eq!(Tekken::new("don't").collect::<Vec<_>>(), vec!["don", "'t"]);
+        assert_eq!(Tekken::new("O'Donnell").collect::<Vec<_>>(), vec!["O", "'Donnell"]);
+    }
+    #[test] fn tekken_digits() { assert_eq!(Tekken::new("12345").collect::<Vec<_>>(), vec!["1", "2", "3", "4", "5"]); }
+    #[test] fn tekken_camelcase() { assert_eq!(Tekken::new("parseJSON").collect::<Vec<_>>(), vec!["parse", "JSON"]); }
+    #[test] fn tekken_punct_slash() { assert_eq!(Tekken::new("a //\nb").collect::<Vec<_>>(), vec!["a", " //\n", "b"]); }
 
     // Voyage
     #[test] fn voyage_basic() { assert_eq!(Voyage::new("Hello world").collect::<Vec<_>>(), vec!["Hello", " world"]); }

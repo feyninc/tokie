@@ -566,6 +566,11 @@ fn detect_pretokenizer_type(data: &serde_json::Value) -> DetectedPretokenizer {
                                     || pattern.contains("\\p{Ll}");
 
                                 if is_case_aware {
+                                    // Tekken (Mistral-Nemo, Nemotron) is o200k without the
+                                    // `(?i:'s|'t|...)?` contraction suffix and with single digits.
+                                    if !pattern.contains("'s|'t") && !pattern.contains("\\p{N}{") {
+                                        return DetectedPretokenizer { pretok_type: PretokType::Tekken, fallback_pattern: None };
+                                    }
                                     return DetectedPretokenizer { pretok_type: PretokType::O200k, fallback_pattern: None };
                                 }
 
@@ -1480,6 +1485,25 @@ mod tests {
             }
         });
         assert_eq!(detect_pretokenizer_type(&data).pretok_type, PretokType::Qwen35);
+    }
+
+    #[test]
+    fn test_detect_tekken_vs_o200k() {
+        // Nemotron / Mistral-Nemo: case-aware letters, no contractions, single digits.
+        let tekken = "[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\r\n/]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+        let o200k = "[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\r\n/]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+        for (pat, want) in [(tekken, PretokType::Tekken), (o200k, PretokType::O200k)] {
+            let data = serde_json::json!({
+                "pre_tokenizer": {
+                    "type": "Sequence",
+                    "pretokenizers": [
+                        {"type": "Split", "pattern": {"Regex": pat}, "behavior": "Isolated", "invert": false},
+                        {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}
+                    ]
+                }
+            });
+            assert_eq!(detect_pretokenizer_type(&data).pretok_type, want);
+        }
     }
 
     #[test]
