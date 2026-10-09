@@ -30,6 +30,7 @@ pub enum PretokType {
     DeepSeek = 6,
     SmolLM = 7,
     Qwen35 = 8,
+    Tekken = 9,
 }
 
 impl PretokType {
@@ -60,6 +61,7 @@ pub enum Pretokenizer {
     SmolLM,
     DeepSeek,
     Qwen,
+    Tekken,
     Regex(Arc<pretokie::Regex>),
 }
 
@@ -73,6 +75,7 @@ pub enum PretokenizerIter<'a> {
     SmolLM(pretokie::SmolLM<'a>),
     DeepSeek(pretokie::DeepSeek<'a>),
     Qwen(pretokie::Qwen<'a>),
+    Tekken(pretokie::Tekken<'a>),
     Regex(pretokie::regex::RegexIter<'a>),
 }
 
@@ -90,6 +93,7 @@ impl<'a> Iterator for PretokenizerIter<'a> {
             PretokenizerIter::SmolLM(it) => it.next(),
             PretokenizerIter::DeepSeek(it) => it.next(),
             PretokenizerIter::Qwen(it) => it.next(),
+            PretokenizerIter::Tekken(it) => it.next(),
             PretokenizerIter::Regex(it) => it.next(),
         }
     }
@@ -108,6 +112,7 @@ impl Pretokenizer {
             PretokType::SmolLM => Pretokenizer::SmolLM,
             PretokType::DeepSeek => Pretokenizer::DeepSeek,
             PretokType::Qwen35 => Pretokenizer::Qwen,
+            PretokType::Tekken => Pretokenizer::Tekken,
         }
     }
 
@@ -125,6 +130,7 @@ impl Pretokenizer {
     pub fn smollm() -> Self { Pretokenizer::SmolLM }
     pub fn deepseek() -> Self { Pretokenizer::DeepSeek }
     pub fn qwen() -> Self { Pretokenizer::Qwen }
+    pub fn tekken() -> Self { Pretokenizer::Tekken }
 
     /// Visit every piece of `text`, dispatching on the pretokenizer type
     /// once per call instead of once per piece: each arm runs a
@@ -143,6 +149,7 @@ impl Pretokenizer {
             Pretokenizer::SmolLM => pretokie::SmolLM::new(text).for_each_piece(f),
             Pretokenizer::DeepSeek => pretokie::DeepSeek::new(text).for_each_piece(f),
             Pretokenizer::Qwen => pretokie::Qwen::new(text).for_each_piece(f),
+            Pretokenizer::Tekken => pretokie::Tekken::new(text).for_each_piece(f),
             Pretokenizer::Bert => for p in pretokie::Bert::new(text) { f(p) },
             Pretokenizer::Regex(r) => for p in r.split(text) { f(p) },
         }
@@ -160,6 +167,7 @@ impl Pretokenizer {
             Pretokenizer::SmolLM => PretokenizerIter::SmolLM(pretokie::SmolLM::new(text)),
             Pretokenizer::DeepSeek => PretokenizerIter::DeepSeek(pretokie::DeepSeek::new(text)),
             Pretokenizer::Qwen => PretokenizerIter::Qwen(pretokie::Qwen::new(text)),
+            Pretokenizer::Tekken => PretokenizerIter::Tekken(pretokie::Tekken::new(text)),
             Pretokenizer::Regex(r) => PretokenizerIter::Regex(r.split(text)),
         }
     }

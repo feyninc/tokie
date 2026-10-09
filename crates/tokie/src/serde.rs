@@ -10,7 +10,8 @@
 //!   - magic: "TOKI" (4 bytes)
 //!   - version: u32 (4 bytes) - currently v12
 //!   - encoder_type: u32 (4 bytes) - 0=Backtracking, 1=Simple, 2=WordPiece
-//!   - pretokenizer_type: u32 (4 bytes) - 0=None, 1=GPT2, 2=CL100K, 3=O200K, 4=BERT, 5=Voyage
+//!   - pretokenizer_type: u32 (4 bytes) - 0=None, 1=GPT2, 2=CL100K, 3=O200K, 4=BERT, 5=Voyage,
+//!     6=DeepSeek, 7=SmolLM, 8=Qwen3.5, 9=Tekken
 //!   - normalizer_type: u32 (4 bytes) - 0=None, 1=BertUncased, 2=BertCased, 3=Nfc
 //!   - post_processor_type: u32 (4 bytes) - 0=None, 1=Bert, 2=Prefix, 3=Template
 //!   - vocab_size: u32 (4 bytes)
@@ -69,6 +70,7 @@ impl PretokType {
             6 => Some(Self::DeepSeek),
             7 => Some(Self::SmolLM),
             8 => Some(Self::Qwen35),
+            9 => Some(Self::Tekken),
             _ => None,
         }
     }
@@ -1393,6 +1395,8 @@ mod tests {
             PretokType::Gpt2,
             PretokType::Cl100k,
             PretokType::O200k,
+            PretokType::Qwen35,
+            PretokType::Tekken,
         ] {
             assert_eq!(PretokType::from_u32(typ as u32), Some(typ));
         }

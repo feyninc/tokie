@@ -1160,6 +1160,7 @@ mod tests {
         check::<SmolLMConfig>(text);
         check::<DeepSeekConfig>(text);
         check::<QwenConfig>(text);
+        check::<TekkenConfig>(text);
     }
 
     /// Wrap short unit vectors in long ASCII padding so the mask path is

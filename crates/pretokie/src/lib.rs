@@ -23,7 +23,7 @@ pub use core::mask::Mask;
 #[doc(hidden)]
 #[cfg(target_arch = "aarch64")]
 pub use core::mask::bench_internal;
-pub use configs::{Gpt2Config, Cl100kConfig, O200kConfig, VoyageConfig, SmolLMConfig, DeepSeekConfig, QwenConfig};
+pub use configs::{Gpt2Config, Cl100kConfig, O200kConfig, VoyageConfig, SmolLMConfig, DeepSeekConfig, QwenConfig, TekkenConfig};
 
 pub type Gpt2<'a> = Mask<'a, Gpt2Config>;
 pub type Cl100k<'a> = Mask<'a, Cl100kConfig>;
@@ -32,6 +32,7 @@ pub type Voyage<'a> = Mask<'a, VoyageConfig>;
 pub type SmolLM<'a> = Mask<'a, SmolLMConfig>;
 pub type DeepSeek<'a> = Mask<'a, DeepSeekConfig>;
 pub type Qwen<'a> = Mask<'a, QwenConfig>;
+pub type Tekken<'a> = Mask<'a, TekkenConfig>;
 
 pub use impls::bert::Bert;
 #[cfg(feature = "regex")]

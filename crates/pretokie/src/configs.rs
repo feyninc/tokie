@@ -93,3 +93,18 @@ impl PretokConfig for QwenConfig {
     const WS_EXCEPTION: WsException = WsException::None;
     const PUNCT_PREFIX_MODE: PunctPrefixMode = PunctPrefixMode::Any;
 }
+
+/// Mistral Tekken (Mistral-Nemo, Nemotron): o200k's case-aware letter runs
+/// and `[\r\n/]*` punct tail, but no contraction suffix and single digits.
+pub struct TekkenConfig;
+impl PretokConfig for TekkenConfig {
+    const CONTRACTION_CASE: ContractionCase = ContractionCase::Insensitive;
+    const CONTRACTION_MODE: ContractionMode = ContractionMode::None;
+    const DIGIT_MODE: DigitMode = DigitMode::Single;
+    const LETTER_MODE: LetterMode = LetterMode::CamelCase;
+    const SPACE_PREFIXES_DIGITS: bool = false;
+    const WS_PATTERN: WsPattern = WsPattern::Cl100k;
+    const PUNCT_TRAILING: PunctTrailing = PunctTrailing::NewlinesAndSlashes;
+    const WS_EXCEPTION: WsException = WsException::None;
+    const PUNCT_PREFIX_MODE: PunctPrefixMode = PunctPrefixMode::Any;
+}
