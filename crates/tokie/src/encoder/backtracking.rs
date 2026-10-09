@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::thread;
 
+use super::simple::MergeCore;
 use crate::types::{Split, TokenId};
 
 /// Minimum text size to use parallel processing (10KB).
@@ -29,8 +30,8 @@ fn pack_pair(left: TokenId, right: TokenId) -> u64 {
     ((left as u64) << 32) | (right as u64)
 }
 
-/// Maximum piece length routed to the rank-merge core on the cache-miss path.
-/// Longer pieces (rare) keep the DAAC backtracking walk.
+/// Inline capacity of the rank-merge core's token buffer (it is now only a
+/// fallback for vocabs the merge core rejects, on pieces of 15 bytes or less).
 const RANK_MERGE_MAX_LEN: usize = 32;
 
 /// Direct-index dense sub-table bound: pairs with both ids below this use a
@@ -312,6 +313,44 @@ pub struct BacktrackingBytePairEncoder {
     /// None when the vocab lacks byte-complete base tokens or monotone
     /// merge ids; those vocabs keep the DAAC walk everywhere.
     rank_table: Option<RankPairTable>,
+    /// Carried-code multipass/queue merge over the same pairs, ranked by
+    /// merged id. Built whenever `rank_table` is (same preconditions) and
+    /// merged ids are unique per pair.
+    merge_core: Option<MergeCore>,
+    /// Longest uncached piece routed to `merge_core` instead of the DAAC
+    /// walk (see [`default_core_max_len`]).
+    core_max_len: usize,
+}
+
+/// Vocab size up to which the merge core beats the DAAC walk at every
+/// piece length (gpt2-sized vocabs). On larger vocabs (cl100k, o200k,
+/// DeepSeek, Qwen) the core only wins on short pieces: their pair table
+/// spills out of cache and long pieces take many merge rounds, while the
+/// DAAC walk stays linear in output tokens.
+const CORE_ANY_LEN_MAX_VOCAB: usize = 65_536;
+
+fn default_core_max_len(vocab_len: usize) -> usize {
+    if let Some(v) = std::env::var("TOKIE_CORE_MAX_LEN").ok().and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    if vocab_len <= CORE_ANY_LEN_MAX_VOCAB { usize::MAX } else { CACHE_KEY_MAX }
+}
+
+/// Build the flat merge core for a vocab the rank table accepted: rank =
+/// merged id, which must identify the pair (the core's queue drops stale
+/// entries by rank, and its SAFE pass merges every pair with the winning
+/// rank). Every pair is SAFE because merges are id-monotone.
+fn build_merge_core(rank_table: &Option<RankPairTable>, pair_lookup: &FoldHashMap<u64, TokenId>) -> Option<MergeCore> {
+    let table = rank_table.as_ref()?;
+    let mut ranked: FoldHashMap<u64, (TokenId, u32)> = FoldHashMap::default();
+    let mut seen: FoldHashMap<TokenId, ()> = FoldHashMap::default();
+    for (&k, &m) in pair_lookup {
+        if seen.insert(m, ()).is_some() {
+            return None;
+        }
+        ranked.insert(k, (m, m));
+    }
+    MergeCore::build(&ranked, table.byte_to_base)
 }
 
 impl BacktrackingBytePairEncoder {
@@ -371,6 +410,8 @@ impl BacktrackingBytePairEncoder {
         }
 
         let rank_table = RankPairTable::build(&pair_lookup, &token_bytes);
+        let merge_core = build_merge_core(&rank_table, &pair_lookup);
+        let core_max_len = default_core_max_len(token_bytes.len());
         let encoder = Self {
             split_table,
             pair_lookup,
@@ -380,6 +421,8 @@ impl BacktrackingBytePairEncoder {
             next_prefix_match,
             token_cache,
             rank_table,
+            merge_core,
+            core_max_len,
         };
 
         (encoder, token_bytes)
@@ -445,6 +488,8 @@ impl BacktrackingBytePairEncoder {
         }
 
         let rank_table = RankPairTable::build(&pair_lookup, &token_bytes);
+        let merge_core = build_merge_core(&rank_table, &pair_lookup);
+        let core_max_len = default_core_max_len(token_bytes.len());
         let encoder = Self {
             split_table,
             pair_lookup,
@@ -454,6 +499,8 @@ impl BacktrackingBytePairEncoder {
             next_prefix_match,
             token_cache,
             rank_table,
+            merge_core,
+            core_max_len,
         };
 
         (encoder, token_bytes)
@@ -478,6 +525,8 @@ impl BacktrackingBytePairEncoder {
         }
 
         let rank_table = RankPairTable::build(&pair_lookup, token_bytes);
+        let merge_core = build_merge_core(&rank_table, &pair_lookup);
+        let core_max_len = default_core_max_len(token_bytes.len());
         Self {
             split_table,
             pair_lookup,
@@ -487,6 +536,8 @@ impl BacktrackingBytePairEncoder {
             next_prefix_match,
             token_cache,
             rank_table,
+            merge_core,
+            core_max_len,
         }
     }
 
@@ -631,12 +682,16 @@ impl BacktrackingBytePairEncoder {
                 }
                 return self.encode_cache_miss(piece, lo, hi, c, out);
             }
+            if piece.len() <= LONG_KEY_MAX {
+                return self.encode_long_cached(piece, c, out);
+            }
         }
         self.encode_uncached(piece, out)
     }
 
     /// Cache-miss slow path: outlined so the hit path stays tight.
-    /// `lo`/`hi` are the piece's already-computed key words.
+    /// `lo`/`hi` are the piece's already-computed key words. Pieces with
+    /// more tokens than an inline entry holds go to the long-piece cache.
     #[inline(never)]
     fn encode_cache_miss(&self, text: &[u8], lo: u64, hi: u64, cache: &mut PretokenCache, out: &mut Vec<TokenId>) {
         debug_assert!(text.len() <= CACHE_KEY_MAX);
@@ -645,23 +700,48 @@ impl BacktrackingBytePairEncoder {
             out.push(token_id);
             return;
         }
+        if cache.get_long(text, out) {
+            return;
+        }
         let start = out.len();
-        // Pieces here are at most CACHE_KEY_MAX (15) bytes, well under
-        // RANK_MERGE_MAX_LEN, so the rank-merge core applies whenever the
-        // vocab supports it; otherwise fall back to the DAAC walk.
-        if self.rank_table.is_some() {
+        self.encode_short(text, out);
+        let toks = &out[start..];
+        if toks.len() <= CACHE_MAX_TOKENS {
+            if !toks.is_empty() {
+                cache.insert_with_key(lo, hi, toks);
+            }
+        } else {
+            cache.insert_long(text, toks);
+        }
+    }
+
+    /// Pieces of 16..=LONG_KEY_MAX bytes: long-piece cache, then the
+    /// uncached path.
+    #[inline(never)]
+    fn encode_long_cached(&self, text: &[u8], cache: &mut PretokenCache, out: &mut Vec<TokenId>) {
+        if cache.get_long(text, out) {
+            return;
+        }
+        let start = out.len();
+        self.encode_uncached(text, out);
+        cache.insert_long(text, &out[start..]);
+    }
+
+    /// Miss path for a piece of at most CACHE_KEY_MAX bytes that is not a
+    /// single token: the merge core wins at this length on every vocab
+    /// measured; the older rank-merge core and the DAAC walk are fallbacks.
+    #[inline]
+    fn encode_short(&self, text: &[u8], out: &mut Vec<TokenId>) {
+        if let Some(core) = &self.merge_core {
+            core.encode(text, out);
+        } else if self.rank_table.is_some() {
             self.encode_rank_merge(text, out);
         } else {
             self.encode_sequential_into(text, out);
         }
-        let toks = &out[start..];
-        if !toks.is_empty() && toks.len() <= CACHE_MAX_TOKENS {
-            cache.insert_with_key(lo, hi, toks);
-        }
     }
 
-    /// No-cache / long-piece path (pieces over the cache key limit never
-    /// interact with the pretoken cache).
+    /// No-cache / long-piece path.
     #[inline(never)]
     fn encode_uncached(&self, text: &[u8], out: &mut Vec<TokenId>) {
         if text.len() <= MAX_CACHED_TOKEN_LEN {
@@ -670,15 +750,32 @@ impl BacktrackingBytePairEncoder {
                 return;
             }
         }
+        if text.len() <= CACHE_KEY_MAX {
+            return self.encode_short(text, out);
+        }
         if text.len() >= PARALLEL_THRESHOLD {
             // Degenerate giant piece: fall back to the chunk-parallel path
             out.extend(self.encode(text));
             return;
         }
-        if text.len() <= RANK_MERGE_MAX_LEN && self.rank_table.is_some() {
-            return self.encode_rank_merge(text, out);
+        match &self.merge_core {
+            Some(core) if text.len() <= self.core_max_len => core.encode(text, out),
+            _ => self.encode_sequential_into(text, out),
         }
-        self.encode_sequential_into(text, out);
+    }
+
+    /// Whether the flat merge core is available for this vocab.
+    pub fn has_merge_core(&self) -> bool {
+        self.merge_core.is_some()
+    }
+
+    /// Encode one piece with the flat merge core (multipass for short
+    /// pieces, queue for long ones), bypassing caches.
+    ///
+    /// Panics if the core is unavailable; check [`Self::has_merge_core`].
+    #[doc(hidden)]
+    pub fn encode_merge_core(&self, text: &[u8], out: &mut Vec<TokenId>) {
+        self.merge_core.as_ref().expect("merge core unavailable").encode(text, out)
     }
 
     /// Whether the rank-merge core is available for this vocab.
@@ -954,12 +1051,151 @@ impl BacktrackingBytePairEncoder {
 pub struct PretokenCache {
     entries: Box<[CacheEntry]>,
     mask: usize,
+    /// Pieces the inline table can't hold (longer than 15 bytes, or more
+    /// than 3 tokens), allocated on first use.
+    long: Option<Box<LongCache>>,
+}
+
+/// Longest piece the long-piece cache keys on. Longer pieces are rare and
+/// (outside code) almost never repeat.
+const LONG_KEY_MAX: usize = 256;
+const LONG_SLOTS: usize = 1 << 13;
+const LONG_PROBES: usize = 4;
+/// Arena budgets; hitting either (or 3/4 slot occupancy) flushes the whole
+/// cache, so memory stays bounded and there is no per-entry eviction.
+const LONG_ARENA_BYTES: usize = 512 << 10;
+const LONG_ARENA_TOKS: usize = 128 << 10;
+
+/// Overflow cache for long / many-token pieces: open-addressed slots over
+/// key and token arenas, flushed wholesale when full (HF v1's generation
+/// flush). Repeated long pieces are common in code (identifiers, paths,
+/// indentation runs) and cost 10x+ per byte on the miss path.
+struct LongCache {
+    slots: Box<[LongSlot]>,
+    used: usize,
+    bytes: Vec<u8>,
+    toks: Vec<TokenId>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LongSlot {
+    /// Piece hash with the low bit forced on; 0 marks an empty slot.
+    hash: u64,
+    key_off: u32,
+    tok_off: u32,
+    key_len: u16,
+    ntok: u16,
+}
+
+/// Hash of a 1..=LONG_KEY_MAX byte piece: 8-byte words with an
+/// overlapping tail word, multiply-mixed.
+#[inline]
+fn long_hash(p: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let n = p.len();
+    let mut h = (n as u64).wrapping_mul(K);
+    if n >= 8 {
+        let mut i = 0;
+        while i + 8 <= n {
+            let w = u64::from_le_bytes(p[i..i + 8].try_into().unwrap());
+            h = (h ^ w).wrapping_mul(K).rotate_left(29);
+            i += 8;
+        }
+        if i < n {
+            let w = u64::from_le_bytes(p[n - 8..].try_into().unwrap());
+            h = (h ^ w).wrapping_mul(K).rotate_left(29);
+        }
+    } else {
+        h = (h ^ load_le_partial(p)).wrapping_mul(K);
+    }
+    (h ^ (h >> 31)) | 1
+}
+
+impl LongCache {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            slots: vec![LongSlot::default(); LONG_SLOTS].into_boxed_slice(),
+            used: 0,
+            bytes: Vec::with_capacity(LONG_ARENA_BYTES),
+            toks: Vec::with_capacity(LONG_ARENA_TOKS),
+        })
+    }
+
+    fn clear(&mut self) {
+        if self.used > 0 {
+            self.slots.fill(LongSlot::default());
+        }
+        self.used = 0;
+        self.bytes.clear();
+        self.toks.clear();
+    }
+
+    #[inline]
+    fn get(&self, piece: &[u8], out: &mut Vec<TokenId>) -> bool {
+        let h = long_hash(piece);
+        let mut i = (h >> 32) as usize & (LONG_SLOTS - 1);
+        for _ in 0..LONG_PROBES {
+            let s = self.slots[i];
+            if s.hash == 0 {
+                return false;
+            }
+            if s.hash == h && s.key_len as usize == piece.len() {
+                let k = s.key_off as usize;
+                if &self.bytes[k..k + piece.len()] == piece {
+                    let t = s.tok_off as usize;
+                    out.extend_from_slice(&self.toks[t..t + s.ntok as usize]);
+                    return true;
+                }
+            }
+            i = (i + 1) & (LONG_SLOTS - 1);
+        }
+        false
+    }
+
+    fn insert(&mut self, piece: &[u8], toks: &[TokenId]) {
+        if self.bytes.len() + piece.len() > LONG_ARENA_BYTES
+            || self.toks.len() + toks.len() > LONG_ARENA_TOKS
+            || self.used >= LONG_SLOTS / 4 * 3
+        {
+            self.clear();
+        }
+        let h = long_hash(piece);
+        let home = (h >> 32) as usize & (LONG_SLOTS - 1);
+        let mut i = home;
+        let mut target = home;
+        for _ in 0..LONG_PROBES {
+            if self.slots[i].hash == 0 {
+                target = i;
+                self.used += 1;
+                break;
+            }
+            i = (i + 1) & (LONG_SLOTS - 1);
+        }
+        // Probe window full: overwrite the home slot (its arena bytes leak
+        // until the next flush).
+        self.slots[target] = LongSlot {
+            hash: h,
+            key_off: self.bytes.len() as u32,
+            tok_off: self.toks.len() as u32,
+            key_len: piece.len() as u16,
+            ntok: toks.len() as u16,
+        };
+        self.bytes.extend_from_slice(piece);
+        self.toks.extend_from_slice(toks);
+    }
 }
 
 const CACHE_KEY_MAX: usize = 15;
 const CACHE_BITS_DEFAULT: usize = 16; // 65536 entries * 32 B = 2 MiB (fits M-series shared L2 alongside 8 workers)
 const CACHE_PROBES: usize = 4;
 const CACHE_MAX_TOKENS: usize = 3;
+
+/// TOKIE_NO_LONG_CACHE=1 disables the long-piece cache (A/B switch).
+#[inline]
+fn long_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("TOKIE_NO_LONG_CACHE").as_deref(), Ok(v) if !v.is_empty() && v != "0"))
+}
 
 /// Table size exponent, overridable for tuning via TOKIE_CACHE_BITS.
 fn cache_bits() -> usize {
@@ -1012,7 +1248,7 @@ fn load_le_partial(p: &[u8]) -> u64 {
 /// inside `doc` (detected by the bounds check; distinct live allocations
 /// are disjoint, so an in-bounds offset proves the bytes are the piece's).
 #[inline(always)]
-fn key_words_within(doc: &[u8], piece: &[u8]) -> (u64, u64) {
+pub(crate) fn key_words_within(doc: &[u8], piece: &[u8]) -> (u64, u64) {
     let len = piece.len();
     debug_assert!((1..=CACHE_KEY_MAX).contains(&len));
     let start = (piece.as_ptr() as usize).wrapping_sub(doc.as_ptr() as usize);
@@ -1072,13 +1308,39 @@ impl PretokenCache {
                 );
             }
         }
-        Self { entries, mask: n - 1 }
+        Self { entries, mask: n - 1, long: None }
     }
 
     /// Reset every entry to empty (for reuse under a different tokenizer).
     pub fn clear(&mut self) {
         let empty = CacheEntry { key_lo: 0, key_hi: 0, toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
         self.entries.fill(empty);
+        if let Some(l) = &mut self.long {
+            l.clear();
+        }
+    }
+
+    /// Longest piece the long-piece cache keys on.
+    pub const LONG_KEY_MAX: usize = LONG_KEY_MAX;
+
+    /// Look up a piece the inline table can't hold (see
+    /// [`Self::insert_long`]); on hit, append its tokens and return true.
+    #[inline]
+    pub fn get_long(&self, piece: &[u8], out: &mut Vec<TokenId>) -> bool {
+        match &self.long {
+            Some(l) if long_cache_enabled() => l.get(piece, out),
+            _ => false,
+        }
+    }
+
+    /// Remember a piece of 1..=[`Self::LONG_KEY_MAX`] bytes that the inline
+    /// table can't hold (too long, or too many tokens).
+    pub fn insert_long(&mut self, piece: &[u8], toks: &[TokenId]) {
+        debug_assert!(!piece.is_empty() && piece.len() <= LONG_KEY_MAX);
+        if toks.is_empty() || toks.len() > u16::MAX as usize || !long_cache_enabled() {
+            return;
+        }
+        self.long.get_or_insert_with(LongCache::new).insert(piece, toks);
     }
 
     #[inline(always)]
@@ -1437,6 +1699,81 @@ mod tests {
             encoder.encode_rank_merge(&bytes, &mut rank);
             assert_eq!(rank, daac, "fuzz bytes {:?}", bytes);
         }
+    }
+
+    #[test]
+    fn test_merge_core_fuzz_matches_backtracking() {
+        let encoder = byte_complete_encoder();
+        assert!(encoder.has_merge_core());
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Past SHORT_MAX (64) so both the multipass and queue loops run;
+        // a small alphabet makes merges (and repeats) frequent.
+        for _ in 0..5000 {
+            let len = 1 + (next() as usize) % 160;
+            let bytes: Vec<u8> = (0..len).map(|_| b"ab ehlot"[(next() % 8) as usize]).collect();
+            let mut daac = Vec::new();
+            encoder.encode_sequential_into(&bytes, &mut daac);
+            let mut core = Vec::new();
+            encoder.encode_merge_core(&bytes, &mut core);
+            assert_eq!(core, daac, "fuzz bytes {:?}", String::from_utf8_lossy(&bytes));
+        }
+    }
+
+    #[test]
+    fn test_long_cache_matches_uncached() {
+        // Pieces over 15 bytes and many-token short pieces go through the
+        // long-piece cache; a warm cache must reproduce the uncached output.
+        let encoder = byte_complete_encoder();
+        let mut cache = PretokenCache::new();
+        let pieces: Vec<Vec<u8>> = (0..400)
+            .map(|i| {
+                let n = 2 + (i * 7) % 300;
+                (0..n).map(|j| b"ab ehlot\xff"[(i + j * j) % 9]).collect()
+            })
+            .collect();
+        for round in 0..3 {
+            for p in &pieces {
+                let mut want = Vec::new();
+                encoder.encode_into(p, None, &mut want);
+                let mut got = vec![7u32]; // appends after existing content
+                encoder.encode_into(p, Some(&mut cache), &mut got);
+                assert_eq!(&got[1..], &want[..], "round {round} piece len {}", p.len());
+            }
+        }
+    }
+
+    #[test]
+    fn test_long_cache_distinguishes_lengths_and_flushes() {
+        let mut cache = PretokenCache::new();
+        let a = vec![b'x'; 40];
+        let b = vec![b'x'; 41];
+        cache.insert_long(&a, &[1, 2]);
+        cache.insert_long(&b, &[3]);
+        let mut out = Vec::new();
+        assert!(cache.get_long(&a, &mut out));
+        assert!(cache.get_long(&b, &mut out));
+        assert_eq!(out, vec![1, 2, 3]);
+        // Fill past the arena budget: the cache flushes instead of growing,
+        // and later inserts stay retrievable.
+        let big = vec![b'y'; LONG_KEY_MAX];
+        for i in 0..(LONG_ARENA_BYTES / LONG_KEY_MAX + 10) {
+            let mut k = big.clone();
+            k[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            cache.insert_long(&k, &[i as u32]);
+            let l = cache.long.as_ref().unwrap();
+            assert!(l.bytes.len() <= LONG_ARENA_BYTES);
+            let mut o = Vec::new();
+            assert!(cache.get_long(&k, &mut o));
+            assert_eq!(o, vec![i as u32]);
+        }
+        cache.clear();
+        assert!(!cache.get_long(&b, &mut Vec::new()));
     }
 
     #[test]

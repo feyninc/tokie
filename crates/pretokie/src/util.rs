@@ -45,6 +45,14 @@ pub fn ascii_letter_run(bytes: &[u8]) -> usize {
     i
 }
 
+/// Tab, VT (0x0B) or FF (0x0C): ASCII `\s` chars that are neither the
+/// literal space of the patterns' ` ?` prefixes nor `[\r\n]`. Oniguruma's
+/// `\s` includes VT/FF, so they behave exactly like tab in every scheme.
+#[inline(always)]
+pub fn is_tab_like(b: u8) -> bool {
+    matches!(b, b'\t' | 0x0B | 0x0C)
+}
+
 #[inline(always)]
 pub fn is_lower(b: u8) -> bool {
     b.wrapping_sub(b'a') < 26
@@ -89,7 +97,19 @@ pub fn decode_utf8(bytes: &[u8]) -> (char, usize) {
 /// For pretokenizer regex patterns using `\p{L}`, use this instead.
 #[inline(always)]
 pub fn is_unicode_letter(c: char) -> bool {
-    c.is_alphabetic() && !is_unicode_mark(c)
+    is_alpha(c) && !is_unicode_mark(c)
+}
+
+/// `char::is_alphabetic()` minus letter numbers (Nl: `Ⅲ`, `ⅰ`, `〇`), which
+/// have the `Alphabetic` property but are `\p{N}`, not `\p{L}`, and minus
+/// the Other_Alphabetic symbols (So: circled `Ⓐ`..`ⓩ`, squared/negative
+/// Latin U+1F130..U+1F189), which are `\p{S}`. The rest of Alphabetic is
+/// letters and marks.
+#[inline(always)]
+pub fn is_alpha(c: char) -> bool {
+    c.is_alphabetic()
+        && !c.is_numeric()
+        && !matches!(c as u32, 0x24B6..=0x24E9 | 0x1F130..=0x1F189)
 }
 
 /// Check if a Unicode char is in \p{P} or \p{S} (punctuation or symbol).
@@ -99,7 +119,7 @@ pub fn is_unicode_letter(c: char) -> bool {
 /// vanishingly rare in real text.
 #[inline]
 pub fn is_punct_or_symbol(c: char) -> bool {
-    !c.is_alphabetic()
+    !is_alpha(c)
         && !c.is_numeric()
         && !c.is_whitespace()
         && !c.is_control()
@@ -244,6 +264,102 @@ mod swar_tests {
         for c in cases {
             let expect = c.iter().take_while(|&&b| is_ascii_letter(b)).count();
             assert_eq!(ascii_letter_run(c), expect, "{c:?}");
+        }
+    }
+}
+
+/// DeepSeek's pre-isolated CJK range `[一-龥぀-ゟ゠-ヿ]`.
+#[inline(always)]
+pub fn is_cjk_char(ch: char) -> bool {
+    matches!(ch as u32, 0x4E00..=0x9FA5 | 0x3040..=0x309F | 0x30A0..=0x30FF)
+}
+
+/// o200k/Tekken case class of a non-ASCII char: bit 0 = in
+/// `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]`, bit 1 = in `[\p{Ll}\p{Lm}\p{Lo}\p{M}]`
+/// (so Lu/Lt → 1, Ll → 2, Lm/Lo/M → 3), 0 for non-letters (per [`is_alpha`]).
+///
+/// Uses std's `Uppercase`/`Lowercase` properties (fast tables) instead of a
+/// general-category search. They differ from Lu/Ll only on the tables below
+/// (Other_Lowercase Lm/Lo letters, Lt, `ʕ`), checked exhaustively against
+/// `unicode-general-category` in `camel_class_matches_general_category`.
+#[inline(always)]
+pub fn camel_class(ch: char) -> u8 {
+    if is_unicode_mark(ch) {
+        return 3;
+    }
+    if !is_alpha(ch) {
+        return 0;
+    }
+    camel_class_of_letter(ch)
+}
+
+/// [`camel_class`] for a char already known to be a letter or mark
+/// (`is_alpha(ch) || is_unicode_mark(ch)`) — skips the costly `is_alpha`.
+#[inline(always)]
+pub fn camel_class_of_letter(ch: char) -> u8 {
+    if is_unicode_mark(ch) {
+        3
+    } else if ch.is_uppercase() {
+        1
+    } else if ch.is_lowercase() {
+        if is_other_lowercase_letter(ch) { 3 } else { 2 }
+    } else if is_titlecase(ch) {
+        1
+    } else if ch == '\u{295}' {
+        2 // ʕ: Ll without the Lowercase property
+    } else {
+        3
+    }
+}
+
+/// Lm/Lo letters with the Other_Lowercase property (`ª`, `ʰ`, `ᴬ`, …).
+#[inline]
+fn is_other_lowercase_letter(ch: char) -> bool {
+    matches!(ch as u32,
+        0x00AA | 0x00BA | 0x02B0..=0x02B8 | 0x02C0..=0x02C1 | 0x02E0..=0x02E4 | 0x037A
+        | 0x10FC | 0x1D2C..=0x1D6A | 0x1D78 | 0x1D9B..=0x1DBF | 0x2071 | 0x207F
+        | 0x2090..=0x209C | 0x2C7C..=0x2C7D | 0xA69C..=0xA69D | 0xA770 | 0xA7F2..=0xA7F4 | 0xA7F8..=0xA7F9
+        | 0xAB5C..=0xAB5F | 0xAB69 | 0x10780 | 0x10783..=0x10785 | 0x10787..=0x107B0
+        | 0x107B2..=0x107BA | 0x1E030..=0x1E06D
+    )
+}
+
+/// Titlecase letters (Lt): neither Uppercase nor Lowercase in std.
+#[inline]
+fn is_titlecase(ch: char) -> bool {
+    matches!(ch as u32,
+        0x01C5 | 0x01C8 | 0x01CB | 0x01F2 | 0x1F88..=0x1F8F | 0x1F98..=0x1F9F
+        | 0x1FA8..=0x1FAF | 0x1FBC | 0x1FCC | 0x1FFC
+    )
+}
+
+#[cfg(test)]
+mod camel_tests {
+    use super::*;
+    use unicode_general_category::{get_general_category, GeneralCategory as G};
+
+    #[test]
+    fn camel_class_matches_general_category() {
+        for cp in 0x80u32..0x110000 {
+            let Some(ch) = char::from_u32(cp) else { continue };
+            let gc = get_general_category(ch);
+            // Code points newer than unicode-general-category's tables:
+            // std (newer Unicode) decides, nothing to compare against.
+            if gc == G::Unassigned {
+                continue;
+            }
+            let want = if is_unicode_mark(ch) {
+                3
+            } else if !is_alpha(ch) {
+                0
+            } else {
+                match gc {
+                    G::UppercaseLetter | G::TitlecaseLetter => 1,
+                    G::LowercaseLetter => 2,
+                    _ => 3,
+                }
+            };
+            assert_eq!(camel_class(ch), want, "U+{cp:04X} {gc:?}");
         }
     }
 }

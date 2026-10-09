@@ -8,23 +8,18 @@
 //! - Find segmentation that **maximizes total score** using Viterbi DP
 //! - Time: O(n × L) where L = max token length
 //!
-//! Hot path: normalized text is split at every metaspace `▁` (same boundaries
-//! as HF Metaspace `MergedWithNext`), each short unit is Viterbi'd independently
+//! Hot path: normalized text is split at metaspace `▁` boundaries no token can
+//! span (see [`super::units`]), each short unit is Viterbi'd independently
 //! (fresh f64 score accumulator), and Zipf-hot units are memoized in
 //! [`UnigramPieceCache`].
-
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use daggrs::{DoubleArrayAhoCorasick, MatchKind, Trie};
 use foldhash::HashMap as FoldHashMap;
 use smallvec::SmallVec;
+use std::cell::RefCell;
 
+use super::units::{self, UnitSplit, METASPACE};
 use crate::types::TokenId;
-
-/// Process-unique id so thread-local unit caches never alias after an
-/// encoder is dropped and another is allocated at the same address.
-static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Get the length of a UTF-8 character from its first byte.
 #[inline]
@@ -38,11 +33,27 @@ fn utf8_char_len(b: u8) -> usize {
     }
 }
 
-/// Metaspace character (▁) in UTF-8: E2 96 81.
-const METASPACE: [u8; 3] = [0xE2, 0x96, 0x81];
-
 /// Maximum token length to cache for early exit lookup (unk-bridging only).
 const MAX_CACHED_TOKEN_LEN: usize = 16;
+
+type ViterbiMatchList = SmallVec<[(usize, TokenId); 8]>;
+
+#[derive(Default)]
+struct ViterbiScratch {
+    best_score: Vec<f64>,
+    backptr: Vec<(TokenId, usize)>,
+    matches_at: Vec<ViterbiMatchList>,
+}
+
+const MAX_RETAINED_VITERBI_BYTES: usize = 64 * 1024;
+
+thread_local! {
+    // Scratch is model-independent and owned by one worker thread. Oversized
+    // units use temporary buffers so one unusually large document does not
+    // pin a large allocation for the lifetime of the worker.
+    static VITERBI_SCRATCH: RefCell<ViterbiScratch> = RefCell::new(ViterbiScratch::default());
+}
+
 
 /// log2 of the direct-mapped front-cache size. 2^18 ≈ 4 MiB of keys + 2 MiB
 /// of (offset,len) values — enough for Zipf-hot `▁word` units without the
@@ -52,28 +63,11 @@ const FRONT_BITS: u32 = 18;
 /// Units of ≤ this many bytes use the packed `u128` short/front path.
 const SHORT_KEY_MAX: usize = 15;
 
-/// Scan a vocabulary's token bytes for the per-`▁`-unit split guard.
-///
-/// Returns `true` (safe to split) when **no** token contains the metaspace
-/// sequence at an interior offset (> 0). A leading `▁` (offset 0, the normal
-/// `▁word` shape) is fine; an interior `▁` marks a multi-word token that a
-/// per-unit split could never reassemble, so its presence forces the
-/// whole-string Viterbi fallback in [`UnigramEncoder::encode_into`].
-#[inline]
-fn compute_unit_split_safe(token_bytes: &[Vec<u8>]) -> bool {
-    !token_bytes
-        .iter()
-        .any(|bytes| memchr::memmem::find_iter(bytes, &METASPACE).any(|pos| pos > 0))
-}
+/// Arena size (tokens) past which the unit cache resets itself.
+const ARENA_MAX_TOKENS: usize = 1 << 23;
 
-thread_local! {
-    /// Thread-local unit cache tagged by encoder identity so switching
-    /// tokenizers on the same thread cannot return another model's ids.
-    static THREAD_UNIT_CACHE: RefCell<Option<(usize, UnigramPieceCache)>> =
-        const { RefCell::new(None) };
-}
-
-/// Per-thread / pooled memoization of Unigram `▁`-unit encodings.
+/// Per-thread / pooled memoization of `▁`-unit encodings (Unigram and
+/// SentencePiece BPE).
 ///
 /// Units repeat heavily under Zipf (e.g. `▁the`, `▁of`). Cache entries store
 /// `(offset, len)` into an append-only token arena so variable-length
@@ -129,7 +123,7 @@ impl UnigramPieceCache {
     }
 
     #[inline]
-    fn lookup(&mut self, unit: &[u8], out: &mut Vec<TokenId>) -> bool {
+    pub(crate) fn lookup(&mut self, unit: &[u8], out: &mut Vec<TokenId>) -> bool {
         if let Some(key) = Self::pack_key(unit) {
             let idx = Self::front_index(key);
             if self.front_keys[idx] == key {
@@ -156,9 +150,14 @@ impl UnigramPieceCache {
     }
 
     #[inline]
-    fn insert(&mut self, unit: &[u8], toks: &[TokenId]) {
+    pub(crate) fn insert(&mut self, unit: &[u8], toks: &[TokenId]) {
         if unit.is_empty() || toks.is_empty() {
             return;
+        }
+        // Bound memory on long-lived (thread-local / pooled) caches fed an
+        // unbounded stream of distinct units.
+        if self.arena.len() + toks.len() > ARENA_MAX_TOKENS {
+            self.clear();
         }
         let offset = self.arena.len() as u32;
         let len = toks.len() as u32;
@@ -216,12 +215,11 @@ pub struct UnigramEncoder {
     /// Identity for thread-local unit-cache tagging.
     cache_id: u64,
 
-    /// Whether it is safe to split the input at every metaspace `▁` and
-    /// Viterbi each unit independently. False when the vocab contains any
-    /// multi-word token (metaspace at an interior offset), in which case
-    /// encoding falls back to whole-string Viterbi to stay exact. See
-    /// [`compute_unit_split_safe`].
-    unit_split_safe: bool,
+    /// Which `▁` boundaries the input may be split at so each unit is
+    /// Viterbi'd independently. [`UnitSplit::None`] when the vocab has a
+    /// token spanning a word boundary, in which case encoding falls back to
+    /// whole-string Viterbi to stay exact. See [`UnitSplit::classify`].
+    unit_split: UnitSplit,
 }
 
 impl std::fmt::Debug for UnigramEncoder {
@@ -229,7 +227,7 @@ impl std::fmt::Debug for UnigramEncoder {
         f.debug_struct("UnigramEncoder")
             .field("vocab_size", &self.vocab_size)
             .field("unk_token", &self.unk_token)
-            .field("unit_split_safe", &self.unit_split_safe)
+            .field("unit_split", &self.unit_split)
             .finish()
     }
 }
@@ -295,8 +293,8 @@ impl UnigramEncoder {
             vocab_size: vocab.len(),
             token_cache,
             has_byte_fallback,
-            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
-            unit_split_safe: compute_unit_split_safe(&token_bytes),
+            cache_id: units::next_cache_id(),
+            unit_split: UnitSplit::classify(token_bytes.iter().map(|b| b.as_slice())),
         };
 
         (encoder, token_bytes)
@@ -332,8 +330,8 @@ impl UnigramEncoder {
             vocab_size,
             token_cache,
             has_byte_fallback,
-            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
-            unit_split_safe: compute_unit_split_safe(token_bytes),
+            cache_id: units::next_cache_id(),
+            unit_split: UnitSplit::classify(token_bytes.iter().map(|b| b.as_slice())),
         }
     }
 
@@ -373,10 +371,25 @@ impl UnigramEncoder {
     }
 
     /// Whether encoding uses the fast per-`▁`-unit split path (`true`) or the
-    /// whole-string Viterbi fallback for vocabs with interior-`▁` tokens.
+    /// whole-string Viterbi fallback for vocabs with word-spanning tokens.
     #[inline]
     pub fn unit_split_safe(&self) -> bool {
-        self.unit_split_safe
+        self.unit_split != UnitSplit::None
+    }
+
+    /// The `▁` split rule this vocab admits.
+    #[inline]
+    pub fn unit_split(&self) -> UnitSplit {
+        self.unit_split
+    }
+
+    /// Whole-string Viterbi with no unit splitting or caching — the
+    /// reference the split path must reproduce.
+    #[doc(hidden)]
+    pub fn encode_whole(&self, text: &[u8]) -> Vec<TokenId> {
+        let mut out = Vec::new();
+        self.append_collapsing_unk(&mut out, &self.viterbi_unit(text));
+        out
     }
 
     /// Get token length in bytes.
@@ -405,8 +418,8 @@ impl UnigramEncoder {
     /// encoder's address is used so repeated single-threaded encodes still
     /// benefit from Zipf hits without leaking entries across models.
     ///
-    /// When [`Self::unit_split_safe`] is false the vocab has a multi-word
-    /// (interior-`▁`) token, so the input is Viterbi'd as a single whole
+    /// When [`Self::unit_split_safe`] is false the vocab has a word-spanning
+    /// token, so the input is Viterbi'd as a single whole
     /// string with no metaspace splitting — exact, at the cost of the unit
     /// memoization. `viterbi_unit` treats `▁` as an ordinary byte, so running
     /// it over the entire text is precisely whole-string Viterbi.
@@ -419,7 +432,7 @@ impl UnigramEncoder {
         if text.is_empty() {
             return;
         }
-        if !self.unit_split_safe {
+        if self.unit_split == UnitSplit::None {
             // Whole-string Viterbi fallback: no `▁` split, cache bypassed.
             let toks = self.viterbi_unit(text);
             self.append_collapsing_unk(out, &toks);
@@ -427,40 +440,22 @@ impl UnigramEncoder {
         }
         match cache {
             Some(cache) => self.encode_units_into(text, cache, out),
-            None => {
-                let key = self.cache_id as usize;
-                THREAD_UNIT_CACHE.with(|slot| {
-                    let mut slot = slot.borrow_mut();
-                    let needs_new = match slot.as_ref() {
-                        Some((k, _)) => *k != key,
-                        None => true,
-                    };
-                    if needs_new {
-                        *slot = Some((key, UnigramPieceCache::new()));
-                    }
-                    self.encode_units_into(text, &mut slot.as_mut().unwrap().1, out);
-                });
-            }
+            None => units::with_thread_cache(self.cache_id, |cache| {
+                self.encode_units_into(text, cache, out)
+            }),
         }
     }
 
-    /// Split at every metaspace `▁` and encode each unit through the cache.
+    /// Split at the vocab's safe `▁` boundaries and encode each unit
+    /// through the cache.
     fn encode_units_into(
         &self,
         text: &[u8],
         cache: &mut UnigramPieceCache,
         out: &mut Vec<TokenId>,
     ) {
-        let mut unit_start = 0usize;
-        for pos in memchr::memmem::find_iter(text, &METASPACE) {
-            if pos > unit_start {
-                self.encode_unit_cached(&text[unit_start..pos], cache, out);
-                unit_start = pos;
-            }
-        }
-        if unit_start < text.len() {
-            self.encode_unit_cached(&text[unit_start..], cache, out);
-        }
+        self.unit_split
+            .for_each_unit(text, |unit| self.encode_unit_cached(unit, cache, out));
     }
 
     #[inline]
@@ -516,6 +511,14 @@ impl UnigramEncoder {
 
     /// Viterbi on a single `▁` unit (no interior metaspace barriers).
     fn viterbi_unit(&self, text: &[u8]) -> Vec<TokenId> {
+        if text.len() > MAX_RETAINED_VITERBI_BYTES {
+            let mut scratch = ViterbiScratch::default();
+            return self.viterbi_unit_with_scratch(text, &mut scratch);
+        }
+        VITERBI_SCRATCH.with_borrow_mut(|scratch| self.viterbi_unit_with_scratch(text, scratch))
+    }
+
+    fn viterbi_unit_with_scratch(&self, text: &[u8], scratch: &mut ViterbiScratch) -> Vec<TokenId> {
         // NOTE: Unlike BPE, Unigram cannot use early exit for single-token matches.
         // Even if the input matches a single token, Viterbi might find a better
         // segmentation (e.g., "ab" as [a, b] scores -0.2 vs "ab" scores -10.0).
@@ -524,8 +527,15 @@ impl UnigramEncoder {
             return Vec::new();
         }
 
-        let mut best_score = vec![f64::NEG_INFINITY; n + 1];
-        let mut backptr: Vec<(TokenId, usize)> = vec![(0, 0); n + 1];
+        scratch.best_score.clear();
+        scratch.best_score.resize(n + 1, f64::NEG_INFINITY);
+        scratch.backptr.clear();
+        scratch.backptr.resize(n + 1, (0, 0));
+        scratch.matches_at.clear();
+        scratch.matches_at.resize_with(n, ViterbiMatchList::new);
+        let best_score = &mut scratch.best_score;
+        let backptr = &mut scratch.backptr;
+        let matches_at = &mut scratch.matches_at;
         best_score[0] = 0.0;
 
         let unk_penalty = if self.has_byte_fallback {
@@ -533,9 +543,6 @@ impl UnigramEncoder {
         } else {
             -100.0
         };
-
-        type MatchList = SmallVec<[(usize, TokenId); 8]>;
-        let mut matches_at: Vec<MatchList> = vec![SmallVec::new(); n];
 
         for m in self.matcher.find_iter(text) {
             matches_at[m.start].push((m.end, m.pattern_id));
@@ -583,7 +590,7 @@ impl UnigramEncoder {
             return self.encode_with_unk_bridging(text);
         }
 
-        self.collect_tokens_from_backptr(&backptr, n)
+        self.collect_tokens_from_backptr(backptr, n)
     }
 
     /// Collect tokens from backpointer array (backward pass of Viterbi).
@@ -822,10 +829,12 @@ mod tests {
         let (encoder, whole_string_expected) = interior_metaspace_vocab();
         let text = [mark(), b"a", mark(), b"b"].concat();
 
-        // The guard must detect the multi-word token and flip to unsafe.
-        assert!(
-            !encoder.unit_split_safe(),
-            "interior-`▁` token must make the vocab unit-split-unsafe"
+        // The guard must detect the multi-word token `a▁` and stop
+        // splitting after `a` (the refined per-char WordStart rule).
+        assert_eq!(
+            encoder.unit_split(),
+            UnitSplit::WordStart { blocked: 1u128 << b'a' },
+            "interior-`▁` token must block split points after `a`"
         );
 
         // With the guard, `encode` runs whole-string Viterbi and uses the

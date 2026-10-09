@@ -11,6 +11,8 @@
 use daggrs::{DoubleArrayAhoCorasick, Trie};
 use foldhash::HashMap as FoldHashMap;
 
+use super::backtracking::key_words_within;
+use super::PretokenCache;
 use crate::types::TokenId;
 
 /// Default continuation prefix for WordPiece (BERT-style).
@@ -148,8 +150,58 @@ impl WordPieceEncoder {
     /// Uses longest-match-first (MaxMatch) algorithm with rewind for WordPiece.
     /// Returns `[unk_token]` if the word cannot be fully tokenized.
     pub fn encode(&self, word: &[u8]) -> Vec<TokenId> {
+        let mut out = Vec::new();
+        self.encode_word_into(word, &mut out);
+        out
+    }
+
+    /// Append the encoding of one pretokenized `piece` (a subslice of
+    /// `doc`) to `out`, memoizing pieces in `cache` (inline entries for
+    /// short few-token pieces, the long-piece cache for the rest).
+    #[inline]
+    pub fn encode_piece_into(
+        &self,
+        doc: &[u8],
+        piece: &[u8],
+        cache: Option<&mut PretokenCache>,
+        out: &mut Vec<TokenId>,
+    ) {
+        match cache {
+            Some(c) if !piece.is_empty() && piece.len() <= PretokenCache::KEY_MAX => {
+                let (lo, hi) = key_words_within(doc, piece);
+                if c.get_with_key(lo, hi, out) {
+                    return;
+                }
+                if c.get_long(piece, out) {
+                    return;
+                }
+                let start = out.len();
+                self.encode_word_into(piece, out);
+                let toks = &out[start..];
+                if toks.len() <= PretokenCache::MAX_TOKENS {
+                    if !toks.is_empty() {
+                        c.insert_with_key(lo, hi, toks);
+                    }
+                } else {
+                    c.insert_long(piece, toks);
+                }
+            }
+            Some(c) if !piece.is_empty() && piece.len() <= PretokenCache::LONG_KEY_MAX => {
+                if c.get_long(piece, out) {
+                    return;
+                }
+                let start = out.len();
+                self.encode_word_into(piece, out);
+                c.insert_long(piece, &out[start..]);
+            }
+            _ => self.encode_word_into(piece, out),
+        }
+    }
+
+    /// [`Self::encode`] appending into `out` (no per-word allocation).
+    pub fn encode_word_into(&self, word: &[u8], out: &mut Vec<TokenId>) {
         if word.is_empty() {
-            return Vec::new();
+            return;
         }
 
         // HF WordPiece: words exceeding max_input_chars_per_word → UNK
@@ -159,27 +211,35 @@ impl WordPieceEncoder {
                 .map(|s| s.chars().count())
                 .unwrap_or(word.len());
             if char_count > self.max_input_chars_per_word {
-                return vec![self.unk_token];
+                out.push(self.unk_token);
+                return;
             }
         }
 
         // Single-byte fast path: direct array lookup (no hashing)
         if word.len() == 1 {
-            return vec![self.byte_lut[word[0] as usize]];
+            out.push(self.byte_lut[word[0] as usize]);
+            return;
         }
 
         // Early exit for cached tokens
         if let Some(&token_id) = self.token_cache.get(word) {
-            return vec![token_id];
+            out.push(token_id);
+            return;
         }
 
         // Get anchor state for continuation matching
         let anchor = match self.matcher.anchor {
             Some(a) => a,
-            None => return vec![self.unk_token],
+            None => {
+                out.push(self.unk_token);
+                return;
+            }
         };
 
-        let mut result = Vec::new();
+        // On failure the partial result is truncated back to `start` and
+        // replaced by a single UNK, as the whole word is untokenizable.
+        let start = out.len();
         let mut pos = 0usize;
         let mut state = self.matcher.start_state();
         let mut last_match: Option<(usize, TokenId)> = None;
@@ -198,18 +258,20 @@ impl WordPieceEncoder {
                 } else {
                     // Transition failed - emit last match or return UNK
                     if let Some((end_pos, token_id)) = last_match.take() {
-                        result.push(token_id);
+                        out.push(token_id);
                         pos = end_pos;
                         state = anchor;
                     } else {
-                        return vec![self.unk_token];
+                        out.truncate(start);
+                        out.push(self.unk_token);
+                        return;
                     }
                 }
             }
 
             // End of word reached - emit pending match if any
             if let Some((end_pos, token_id)) = last_match.take() {
-                result.push(token_id);
+                out.push(token_id);
 
                 // If match doesn't cover all remaining chars, rewind and continue
                 // This handles cases like "grippe" → ["grip", "##pe"] where
@@ -224,10 +286,8 @@ impl WordPieceEncoder {
             break;
         }
 
-        if result.is_empty() {
-            vec![self.unk_token]
-        } else {
-            result
+        if out.len() == start {
+            out.push(self.unk_token);
         }
     }
 
@@ -295,6 +355,27 @@ mod tests {
             (b"##able".to_vec(), 4),
             (b"##ing".to_vec(), 5),
         ]
+    }
+
+    #[test]
+    fn test_wordpiece_piece_cache_matches_uncached() {
+        let vocab = make_test_vocab();
+        let encoder = WordPieceEncoder::from_vocab_default(&vocab, 0);
+        let doc = b"unbreakable breaking zzz un unbreakable breaking zzz unbreakablex";
+        let mut cache = PretokenCache::new();
+        for _ in 0..2 {
+            let (mut cached, mut plain) = (Vec::new(), Vec::new());
+            for piece in doc.split(|&b| b == b' ') {
+                encoder.encode_piece_into(doc, piece, Some(&mut cache), &mut cached);
+                encoder.encode_piece_into(doc, piece, None, &mut plain);
+                assert_eq!(encoder.encode(piece), {
+                    let mut v = Vec::new();
+                    encoder.encode_word_into(piece, &mut v);
+                    v
+                });
+            }
+            assert_eq!(cached, plain);
+        }
     }
 
     #[test]

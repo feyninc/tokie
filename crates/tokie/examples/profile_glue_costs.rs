@@ -52,6 +52,7 @@ macro_rules! dispatch_mask {
             PretokType::SmolLM => $f(|d| pretokie::SmolLM::new(d)),
             PretokType::DeepSeek => $f(|d| pretokie::DeepSeek::new(d)),
             PretokType::Qwen35 => $f(|d| pretokie::Qwen::new(d)),
+            PretokType::Tekken => $f(|d| pretokie::Tekken::new(d)),
             other => panic!("no mask scanner for {:?}", other),
         }
     };

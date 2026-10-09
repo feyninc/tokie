@@ -393,6 +393,10 @@ pub fn sentencepiece_precompiled_normalize<'a>(
     if whitespace_split {
         // Step 2: collapse whitespace and strip (WhitespaceSplit)
         let collapsed = collapse_and_strip_whitespace(&transformed);
+        // Whitespace-only input: WhitespaceSplit leaves no pieces, so no `▁`.
+        if collapsed.is_empty() {
+            return Cow::Borrowed("");
+        }
 
         // Step 3: apply metaspace (prepend ▁ and replace spaces)
         let mut result = String::with_capacity(collapsed.len() + 3);
@@ -640,12 +644,10 @@ fn collapse_strip_whitespace_and_controls(text: &str) -> String {
 fn is_control(c: char) -> bool {
     match c {
         '\t' | '\n' | '\r' => false,
+        // HF keeps unassigned (Cn) code points: "a\u{5FF}b" → [a, [UNK], b].
         _ => matches!(
             get_general_category(c),
-            GeneralCategory::Control
-                | GeneralCategory::Format
-                | GeneralCategory::Unassigned
-                | GeneralCategory::PrivateUse
+            GeneralCategory::Control | GeneralCategory::Format | GeneralCategory::PrivateUse
         ),
     }
 }
@@ -659,11 +661,41 @@ fn is_bert_whitespace(c: char) -> bool {
         || get_general_category(c) == GeneralCategory::SpaceSeparator
 }
 
+/// CJK ideograph per HuggingFace's BertNormalizer `_is_chinese_char`.
+#[inline]
+fn is_chinese_char(c: char) -> bool {
+    matches!(c as u32,
+        0x4E00..=0x9FFF
+        | 0x3400..=0x4DBF
+        | 0x20000..=0x2A6DF
+        | 0x2A700..=0x2B73F
+        | 0x2B740..=0x2B81F
+        | 0x2B820..=0x2CEAF
+        | 0xF900..=0xFAFF
+        | 0x2F800..=0x2FA1F
+    )
+}
+
+/// Push `c`, padded with spaces if it is a CJK ideograph (BertNormalizer
+/// `handle_chinese_chars`: the BERT pre-tokenizer then isolates it).
+#[inline]
+fn push_padding_cjk(result: &mut String, c: char) {
+    if is_chinese_char(c) {
+        result.push(' ');
+        result.push(c);
+        result.push(' ');
+    } else {
+        result.push(c);
+    }
+}
+
 /// Clean text by removing control characters and normalizing whitespace.
 ///
-/// This matches HuggingFace's BertNormalizer `clean_text` behavior:
+/// This matches HuggingFace's BertNormalizer `clean_text` +
+/// `handle_chinese_chars` behavior:
 /// - Removes null (U+0000), replacement char (U+FFFD), and control characters
 /// - Normalizes all whitespace variants to standard space ' '
+/// - Pads CJK ideographs with spaces ("中文" → " 中  文 ")
 ///
 /// Returns `Cow::Borrowed` when no changes needed (zero allocation).
 ///
@@ -737,7 +769,11 @@ fn clean_text_unicode<'a>(text: &'a str, first_problem: usize) -> Cow<'a, str> {
     // Check if the Unicode portion needs cleaning
     let suffix = &text[first_problem..];
     let suffix_needs_cleaning = suffix.chars().any(|c| {
-        c == '\0' || c == '\u{FFFD}' || is_control(c) || (is_bert_whitespace(c) && c != ' ')
+        c == '\0'
+            || c == '\u{FFFD}'
+            || is_control(c)
+            || (is_bert_whitespace(c) && c != ' ')
+            || is_chinese_char(c)
     });
 
     if !prefix_needs_cleaning && !suffix_needs_cleaning {
@@ -766,7 +802,7 @@ fn clean_text_unicode<'a>(text: &'a str, first_problem: usize) -> Cow<'a, str> {
         if is_bert_whitespace(c) {
             result.push(' ');
         } else {
-            result.push(c);
+            push_padding_cjk(&mut result, c);
         }
     }
 
@@ -909,6 +945,10 @@ pub fn bert_uncased_normalize(text: &str) -> Cow<'_, str> {
                 } else {
                     result.push(c);
                 }
+            } else if is_chinese_char(c) {
+                // handle_chinese_chars (NFD maps CJK compatibility
+                // ideographs to unified ones, still in range)
+                push_padding_cjk(&mut result, c);
             } else {
                 // Unicode lowercase
                 for lc in c.to_lowercase() {
@@ -1232,6 +1272,14 @@ mod tests {
         let result = norm.normalize(text);
         assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(result, "Hello World!"); // No change
+    }
+
+    #[test]
+    fn test_bert_clean_keeps_unassigned() {
+        // Matches HF: Cc/Cf/Co are dropped, unassigned code points are kept.
+        let norm = Normalizer::BertCased;
+        assert_eq!(norm.normalize("a\u{5FF}b\u{378}"), "a\u{5FF}b\u{378}");
+        assert_eq!(norm.normalize("a\u{200B}\u{E000}\u{7F}b"), "ab");
     }
 
 }
