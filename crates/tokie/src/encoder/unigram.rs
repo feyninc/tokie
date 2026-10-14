@@ -63,8 +63,14 @@ const FRONT_BITS: u32 = 18;
 /// Units of ≤ this many bytes use the packed `u128` short/front path.
 const SHORT_KEY_MAX: usize = 15;
 
-/// Arena size (tokens) past which the unit cache resets itself.
-const ARENA_MAX_TOKENS: usize = 1 << 23;
+/// Variable-size budget (bytes) past which the unit cache resets itself:
+/// the token arena plus the `long` map's boxed key bytes and per-entry
+/// overhead (32 MiB, on top of the fixed 6 MiB front tables).
+const CACHE_MAX_BYTES: usize = 32 << 20;
+
+/// Approximate heap cost of one `long` entry beyond its key bytes
+/// (boxed-slice header + value + hash-table slot).
+const LONG_ENTRY_OVERHEAD: usize = 32;
 
 /// Per-thread / pooled memoization of `▁`-unit encodings (Unigram and
 /// SentencePiece BPE).
@@ -79,6 +85,9 @@ pub struct UnigramPieceCache {
     front_vals: Box<[(u32, u32)]>,
     short: FoldHashMap<u128, (u32, u32)>,
     long: FoldHashMap<Box<[u8]>, (u32, u32)>,
+    /// Heap bytes held by `long` keys (+ [`LONG_ENTRY_OVERHEAD`] each),
+    /// counted toward [`CACHE_MAX_BYTES`] together with the arena.
+    long_bytes: usize,
 }
 
 impl UnigramPieceCache {
@@ -90,16 +99,23 @@ impl UnigramPieceCache {
             front_vals: vec![(0u32, 0u32); n].into_boxed_slice(),
             short: FoldHashMap::default(),
             long: FoldHashMap::default(),
+            long_bytes: 0,
         }
     }
 
     /// Drop all cached entries (tokenizer switch / pool generation change).
     pub fn clear(&mut self) {
+        // Every entry points into the arena, so an empty arena means the
+        // tables are already clean (skip the 6 MiB fill).
+        if self.arena.is_empty() {
+            return;
+        }
         self.arena.clear();
         self.front_keys.fill(0);
         self.front_vals.fill((0, 0));
         self.short.clear();
         self.long.clear();
+        self.long_bytes = 0;
     }
 
     #[inline]
@@ -156,7 +172,9 @@ impl UnigramPieceCache {
         }
         // Bound memory on long-lived (thread-local / pooled) caches fed an
         // unbounded stream of distinct units.
-        if self.arena.len() + toks.len() > ARENA_MAX_TOKENS {
+        let long_cost = if unit.len() > SHORT_KEY_MAX { unit.len() + LONG_ENTRY_OVERHEAD } else { 0 };
+        let used = (self.arena.len() + toks.len()) * std::mem::size_of::<TokenId>() + self.long_bytes + long_cost;
+        if used > CACHE_MAX_BYTES {
             self.clear();
         }
         let offset = self.arena.len() as u32;
@@ -168,7 +186,9 @@ impl UnigramPieceCache {
             self.front_keys[idx] = key;
             self.front_vals[idx] = (offset, len);
         } else {
-            self.long.insert(unit.to_vec().into_boxed_slice(), (offset, len));
+            if self.long.insert(unit.to_vec().into_boxed_slice(), (offset, len)).is_none() {
+                self.long_bytes += long_cost;
+            }
         }
     }
 }

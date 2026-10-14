@@ -330,9 +330,6 @@ pub struct BacktrackingBytePairEncoder {
 const CORE_ANY_LEN_MAX_VOCAB: usize = 65_536;
 
 fn default_core_max_len(vocab_len: usize) -> usize {
-    if let Some(v) = std::env::var("TOKIE_CORE_MAX_LEN").ok().and_then(|v| v.parse().ok()) {
-        return v;
-    }
     if vocab_len <= CORE_ANY_LEN_MAX_VOCAB { usize::MAX } else { CACHE_KEY_MAX }
 }
 
@@ -1054,6 +1051,9 @@ pub struct PretokenCache {
     /// Pieces the inline table can't hold (longer than 15 bytes, or more
     /// than 3 tokens), allocated on first use.
     long: Option<Box<LongCache>>,
+    /// Set by any insert since the last [`Self::clear`]; an untouched cache
+    /// clears for free (pooled leases re-tag caches on tokenizer switch).
+    dirty: bool,
 }
 
 /// Longest piece the long-piece cache keys on. Longer pieces are rare and
@@ -1186,27 +1186,9 @@ impl LongCache {
 }
 
 const CACHE_KEY_MAX: usize = 15;
-const CACHE_BITS_DEFAULT: usize = 16; // 65536 entries * 32 B = 2 MiB (fits M-series shared L2 alongside 8 workers)
+const CACHE_BITS: usize = 16; // 65536 entries * 32 B = 2 MiB (fits M-series shared L2 alongside 8 workers)
 const CACHE_PROBES: usize = 4;
 const CACHE_MAX_TOKENS: usize = 3;
-
-/// TOKIE_NO_LONG_CACHE=1 disables the long-piece cache (A/B switch).
-#[inline]
-fn long_cache_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("TOKIE_NO_LONG_CACHE").as_deref(), Ok(v) if !v.is_empty() && v != "0"))
-}
-
-/// Table size exponent, overridable for tuning via TOKIE_CACHE_BITS.
-fn cache_bits() -> usize {
-    static BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BITS.get_or_init(|| {
-        std::env::var("TOKIE_CACHE_BITS").ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&b| (10..=24).contains(&b))
-            .unwrap_or(CACHE_BITS_DEFAULT)
-    })
-}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1285,7 +1267,7 @@ impl PretokenCache {
 
     pub fn new() -> Self {
         let empty = CacheEntry { key_lo: 0, key_hi: 0, toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
-        let n = 1usize << cache_bits();
+        let n = 1usize << CACHE_BITS;
         let entries = vec![empty; n].into_boxed_slice();
         // Advise transparent huge pages for the table on Linux: the default
         // table is exactly one 2 MiB page, and probes are uniform-random, so
@@ -1308,11 +1290,15 @@ impl PretokenCache {
                 );
             }
         }
-        Self { entries, mask: n - 1, long: None }
+        Self { entries, mask: n - 1, long: None, dirty: false }
     }
 
     /// Reset every entry to empty (for reuse under a different tokenizer).
     pub fn clear(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
         let empty = CacheEntry { key_lo: 0, key_hi: 0, toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
         self.entries.fill(empty);
         if let Some(l) = &mut self.long {
@@ -1328,8 +1314,8 @@ impl PretokenCache {
     #[inline]
     pub fn get_long(&self, piece: &[u8], out: &mut Vec<TokenId>) -> bool {
         match &self.long {
-            Some(l) if long_cache_enabled() => l.get(piece, out),
-            _ => false,
+            Some(l) => l.get(piece, out),
+            None => false,
         }
     }
 
@@ -1337,9 +1323,10 @@ impl PretokenCache {
     /// table can't hold (too long, or too many tokens).
     pub fn insert_long(&mut self, piece: &[u8], toks: &[TokenId]) {
         debug_assert!(!piece.is_empty() && piece.len() <= LONG_KEY_MAX);
-        if toks.is_empty() || toks.len() > u16::MAX as usize || !long_cache_enabled() {
+        if toks.is_empty() || toks.len() > u16::MAX as usize {
             return;
         }
+        self.dirty = true;
         self.long.get_or_insert_with(LongCache::new).insert(piece, toks);
     }
 
@@ -1425,6 +1412,7 @@ impl PretokenCache {
             }
             i = (i + 1) & self.mask;
         }
+        self.dirty = true;
         let e = &mut self.entries[target];
         e.key_lo = lo;
         e.key_hi = hi;

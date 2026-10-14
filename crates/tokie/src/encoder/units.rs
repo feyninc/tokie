@@ -131,28 +131,53 @@ pub(crate) fn next_cache_id() -> u64 {
     NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Unit caches kept per thread, one per recently used encoder. Two lets a
+/// thread alternate between two `▁`-unit models (e.g. a Unigram and a
+/// SentencePiece BPE tokenizer) without clearing on every call; a third
+/// model evicts the least recently used. Slots are allocated on first use,
+/// so a single-model thread holds one cache (6 MiB of front tables plus at
+/// most 32 MiB of arena/keys, see [`UnigramPieceCache`]).
+const THREAD_UNIT_SLOTS: usize = 2;
+
+type UnitSlots = [Option<(u64, UnigramPieceCache)>; THREAD_UNIT_SLOTS];
+
 thread_local! {
-    /// Thread-local unit cache tagged by encoder identity so switching
+    /// Thread-local unit caches tagged by encoder identity so switching
     /// tokenizers on the same thread cannot return another model's ids.
-    static THREAD_UNIT_CACHE: RefCell<Option<(u64, UnigramPieceCache)>> =
-        const { RefCell::new(None) };
+    /// Ordered most recently used first.
+    static THREAD_UNIT_CACHE: RefCell<UnitSlots> = const { RefCell::new([const { None }; THREAD_UNIT_SLOTS]) };
 }
 
-/// Run `f` with this thread's unit cache for encoder `cache_id` (cleared
-/// and re-tagged when the thread last served a different encoder).
+/// Make `slots[0]` the cache for `cache_id`: promote a matching slot, or
+/// recycle (clear + re-tag) the least recently used one.
+#[cold]
+fn promote_thread_cache(slots: &mut UnitSlots, cache_id: u64) {
+    let pos = slots
+        .iter()
+        .position(|s| matches!(s, Some((id, _)) if *id == cache_id))
+        .unwrap_or_else(|| {
+            let lru = slots.iter().position(Option::is_none).unwrap_or(THREAD_UNIT_SLOTS - 1);
+            match &mut slots[lru] {
+                Some((id, cache)) => {
+                    cache.clear();
+                    *id = cache_id;
+                }
+                empty => *empty = Some((cache_id, UnigramPieceCache::new())),
+            }
+            lru
+        });
+    slots[..=pos].rotate_right(1);
+}
+
+/// Run `f` with this thread's unit cache for encoder `cache_id`.
 #[inline]
 pub(crate) fn with_thread_cache<R>(cache_id: u64, f: impl FnOnce(&mut UnigramPieceCache) -> R) -> R {
-    THREAD_UNIT_CACHE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        match slot.as_mut() {
-            Some((id, _)) if *id == cache_id => {}
-            Some((id, cache)) => {
-                cache.clear();
-                *id = cache_id;
-            }
-            None => *slot = Some((cache_id, UnigramPieceCache::new())),
+    THREAD_UNIT_CACHE.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        if !matches!(&slots[0], Some((id, _)) if *id == cache_id) {
+            promote_thread_cache(&mut slots, cache_id);
         }
-        f(&mut slot.as_mut().unwrap().1)
+        f(&mut slots[0].as_mut().unwrap().1)
     })
 }
 
@@ -184,6 +209,41 @@ mod tests {
         assert_eq!(UnitSplit::classify([&[0xE2u8, 0x96][..]]), UnitSplit::None);
         // Single raw bytes (byte fallback) are fine.
         assert_eq!(UnitSplit::classify([&[0xE2u8][..], "▁".as_bytes()]), UnitSplit::EveryMetaspace);
+    }
+
+    fn thread_hit(id: u64, unit: &[u8]) -> Option<Vec<crate::types::TokenId>> {
+        with_thread_cache(id, |c| {
+            let mut out = Vec::new();
+            c.lookup(unit, &mut out).then_some(out)
+        })
+    }
+
+    #[test]
+    fn thread_cache_alternation_keeps_both_models() {
+        let (a, b) = (next_cache_id(), next_cache_id());
+        let long = "▁a-unit-longer-than-fifteen-bytes".as_bytes();
+        with_thread_cache(a, |c| {
+            c.insert(b"\xe2\x96\x81the", &[1]);
+            c.insert(long, &[1, 2, 3]);
+        });
+        with_thread_cache(b, |c| c.insert(b"\xe2\x96\x81the", &[2]));
+        for _ in 0..3 {
+            assert_eq!(thread_hit(a, b"\xe2\x96\x81the"), Some(vec![1]));
+            assert_eq!(thread_hit(a, long), Some(vec![1, 2, 3]));
+            assert_eq!(thread_hit(b, b"\xe2\x96\x81the"), Some(vec![2]));
+            assert_eq!(thread_hit(b, long), None);
+        }
+    }
+
+    #[test]
+    fn thread_cache_evicts_least_recently_used() {
+        let (a, b, c) = (next_cache_id(), next_cache_id(), next_cache_id());
+        with_thread_cache(a, |k| k.insert(b"x", &[1]));
+        with_thread_cache(b, |k| k.insert(b"x", &[2]));
+        assert_eq!(thread_hit(a, b"x"), Some(vec![1])); // b is now LRU
+        assert_eq!(thread_hit(c, b"x"), None); // recycles b's slot
+        assert_eq!(thread_hit(a, b"x"), Some(vec![1]));
+        assert_eq!(thread_hit(b, b"x"), None);
     }
 
     #[test]

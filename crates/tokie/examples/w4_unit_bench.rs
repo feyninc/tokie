@@ -1,7 +1,11 @@
 //! W4 harness: throughput + output fingerprints for SentencePiece BPE,
 //! Unigram and WordPiece models.
 //!
-//! Run: cargo run --release -p tokie --features hf --example w4_unit_bench [-- model...]
+//! Needs the tokbench data dir (`fixtures/*.txt`) as the first argument or
+//! in `$TOKBENCH_DATA`, plus `benches/data/enwik8`:
+//!
+//! Run: cargo run --release -p tokie --features hf --example w4_unit_bench -- <data-dir> [model...]
+//!  or: TOKBENCH_DATA=<data-dir> cargo run --release -p tokie --features hf --example w4_unit_bench [-- model...]
 //!
 //! For each model prints encoder type, MB/s on 1 MB enwik8 (one string),
 //! MB/s on the tokbench fixtures in 10 KiB chunks (sequential 1T and
@@ -9,8 +13,31 @@
 //! before/after a change can be diffed for exact equality.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokie::Tokenizer;
+
+/// tokbench data directory (holds `fixtures/` and `models/`), set once in `main`.
+static TOKBENCH: OnceLock<PathBuf> = OnceLock::new();
+
+fn tokbench() -> &'static Path {
+    TOKBENCH.get().expect("tokbench data dir not set")
+}
+
+/// Resolve the tokbench data dir: the first CLI arg when it is a directory
+/// (consumed from `args`), else `$TOKBENCH_DATA`; exits with usage otherwise.
+fn init_tokbench(args: &mut Vec<String>, usage: &str) {
+    let dir = if args.first().is_some_and(|a| Path::new(a).is_dir()) {
+        PathBuf::from(args.remove(0))
+    } else if let Some(d) = std::env::var_os("TOKBENCH_DATA") {
+        PathBuf::from(d)
+    } else {
+        eprintln!("usage: {usage}");
+        eprintln!("tokbench data dir (with fixtures/ and models/) must be the first argument or $TOKBENCH_DATA");
+        std::process::exit(2);
+    };
+    TOKBENCH.set(dir).unwrap();
+}
 
 const MODELS: &[&str] = &[
     "tokiers/Llama-2-7b-hf",
@@ -65,17 +92,15 @@ fn best_of<F: FnMut()>(iters: usize, mut f: F) -> f64 {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    init_tokbench(&mut args, "w4_unit_bench [data-dir] [model...]");
     let models: Vec<&str> = if args.is_empty() { MODELS.to_vec() } else { args.iter().map(|s| s.as_str()).collect() };
     let iters: usize = std::env::var("W4_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
 
     let enwik = std::fs::read(root().join("benches/data/enwik8")).expect("enwik8");
     let enwik = String::from_utf8_lossy(&enwik[..1_000_000]).into_owned();
 
-    let fixture_dir = PathBuf::from(
-        std::env::var("TOKBENCH_FIXTURES")
-            .unwrap_or_else(|_| "C:/Users/lain/Desktop/github/tokbench/data/fixtures".into()),
-    );
+    let fixture_dir = tokbench().join("fixtures");
     let fixtures: Vec<(String, String)> = ["english", "chinese", "japanese", "agentic-swe"]
         .iter()
         .filter_map(|n| {

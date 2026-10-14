@@ -1327,4 +1327,39 @@ mod tests {
             }
         }
     }
+
+    /// Alternating three `▁`-unit models on one thread (more than the
+    /// thread-local cache keeps) must match each model's cold encoding:
+    /// no ids leak between models via the shared thread-local slots.
+    #[test]
+    fn test_thread_cache_alternating_models() {
+        use crate::encoder::UnigramEncoder;
+        let plain = split_vocab(false);
+        let blocked = split_vocab(true);
+        let m = "▁".as_bytes();
+        let uni_vocab = vec![
+            (0u32, b"a".to_vec(), -2.0),
+            (1u32, b"b".to_vec(), -2.0),
+            (2u32, m.to_vec(), -2.0),
+            (3u32, [m, b"ab"].concat(), -0.5),
+            (4u32, [m, b"a"].concat(), -1.0),
+            (5u32, b">".to_vec(), -3.0),
+            (6u32, b"<".to_vec(), -3.0),
+        ];
+        let (uni, _) = UnigramEncoder::from_vocab_with_scores(&uni_vocab, 2);
+        let texts = ["▁ab▁a▁b", "ab>▁<▁a>▁b", "▁▁▁▁ab▁▁a", "▁ab▁ab▁abababababababababab▁a"];
+        let cold_uni = |t: &[u8]| {
+            let mut out = Vec::new();
+            uni.encode_into(t, Some(&mut UnigramPieceCache::new()), &mut out);
+            out
+        };
+        for _ in 0..3 {
+            for t in texts.map(str::as_bytes) {
+                assert_eq!(plain.encode(t), plain.encode_whole(t), "{t:?}");
+                assert_eq!(uni.encode(t), cold_uni(t), "{t:?}");
+                assert_eq!(blocked.encode(t), blocked.encode_whole(t), "{t:?}");
+                assert_eq!(plain.encode(t), plain.encode_whole(t), "{t:?}");
+            }
+        }
+    }
 }

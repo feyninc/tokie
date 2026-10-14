@@ -1,14 +1,44 @@
 //! W3 research harness for the Simple BPE encoder.
 //!
-//! cargo run --release --features hf --example w3_simple -- types
-//! cargo run --release --features hf --example w3_simple -- equiv
-//! cargo run --release --features hf --example w3_simple -- bench [filter]
+//! Measures the Simple (pretokenized, O(n^2) merge) BPE path on gpt2-style
+//! models: which encoder each model routes to (`types`), id-for-id
+//! agreement with the raw-JSON load (`equiv`), MB/s on the tokbench
+//! fixtures in 10 KiB chunks (`bench`), merge-core vs reference
+//! microbenchmarks by piece length (`micro`), and HF tokenizers on the
+//! same chunks (`hfbench`, needs `--features build`).
+//!
+//! Needs the tokbench data dir (`fixtures/*.txt`, `models/*/tokenizer.json`)
+//! as the first argument or in `$TOKBENCH_DATA`, plus `benches/data/enwik8`:
+//!
+//! cargo run --release -p tokie --features hf --example w3_simple -- <data-dir> types
+//! TOKBENCH_DATA=<data-dir> cargo run --release -p tokie --features hf --example w3_simple -- bench [filter]
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokie::Tokenizer;
 
-const TOKBENCH: &str = "C:/Users/lain/Desktop/github/tokbench/data";
+/// tokbench data directory (holds `fixtures/` and `models/`), set once in `main`.
+static TOKBENCH: OnceLock<PathBuf> = OnceLock::new();
+
+fn tokbench() -> &'static Path {
+    TOKBENCH.get().expect("tokbench data dir not set")
+}
+
+/// Resolve the tokbench data dir: the first CLI arg when it is a directory
+/// (consumed from `args`), else `$TOKBENCH_DATA`; exits with usage otherwise.
+fn init_tokbench(args: &mut Vec<String>, usage: &str) {
+    let dir = if args.first().is_some_and(|a| Path::new(a).is_dir()) {
+        PathBuf::from(args.remove(0))
+    } else if let Some(d) = std::env::var_os("TOKBENCH_DATA") {
+        PathBuf::from(d)
+    } else {
+        eprintln!("usage: {usage}");
+        eprintln!("tokbench data dir (with fixtures/ and models/) must be the first argument or $TOKBENCH_DATA");
+        std::process::exit(2);
+    };
+    TOKBENCH.set(dir).unwrap();
+}
 
 /// (name, from_pretrained repo, raw tokenizer.json source: hub repo or local path)
 const MODELS: &[(&str, &str, &str)] = &[
@@ -22,7 +52,7 @@ const MODELS: &[(&str, &str, &str)] = &[
 
 fn json_path(src: &str) -> Option<PathBuf> {
     if let Some(name) = src.strip_prefix("tokbench:") {
-        return Some(Path::new(TOKBENCH).join("models").join(name).join("tokenizer.json"));
+        return Some(tokbench().join("models").join(name).join("tokenizer.json"));
     }
     let api = hf_hub::api::sync::Api::new().ok()?;
     match api.model(src.to_string()).get("tokenizer.json") {
@@ -67,7 +97,7 @@ fn fixtures() -> Vec<(&'static str, String)> {
     ["english", "chinese", "japanese", "agentic-swe"]
         .iter()
         .filter_map(|n| {
-            let p = Path::new(TOKBENCH).join("fixtures").join(format!("{n}.txt"));
+            let p = tokbench().join("fixtures").join(format!("{n}.txt"));
             std::fs::read_to_string(p).ok().map(|s| (*n, s))
         })
         .collect()
@@ -298,7 +328,9 @@ fn dump(dir: &str) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    init_tokbench(&mut args, "w3_simple [data-dir] types|equiv|bench [filter]|micro|dump|hist <filter>|route|hfbench");
+    args.insert(0, String::new());
     match args.get(1).map(String::as_str) {
         Some("types") => types(),
         Some("equiv") => equiv(),

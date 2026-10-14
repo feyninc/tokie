@@ -1,18 +1,46 @@
 //! X1 research harness: Backtracking miss path and long-piece cache.
 //!
-//! cargo run --release --features hf --example x1_miss -- types
-//! cargo run --release --features hf --example x1_miss -- equiv [filter]
-//! cargo run --release --features hf --example x1_miss -- miss [filter]
-//! cargo run --release --features hf --example x1_miss -- bench [filter]
-//! cargo run --release --features hf --example x1_miss -- fp [filter]
-//! cargo run --release --features hf,build --example x1_miss -- vshf [filter]
+//! Measures the Backtracking BPE encoder's pretoken-cache miss path:
+//! encoder routing per model (`types`), cached vs uncached equality
+//! (`equiv`), miss rates and piece-length mix (`miss`, `lens`), MB/s on
+//! enwik8 and the tokbench fixtures (`bench`), output fingerprints for
+//! before/after diffs (`fp`), and id-for-id agreement with HF tokenizers
+//! (`vshf`, needs `--features build`).
+//!
+//! Needs the tokbench data dir (`fixtures/*.txt`) as the first argument or
+//! in `$TOKBENCH_DATA`, plus `benches/data/enwik8`:
+//!
+//! cargo run --release -p tokie --features hf --example x1_miss -- <data-dir> types
+//! TOKBENCH_DATA=<data-dir> cargo run --release -p tokie --features hf --example x1_miss -- bench [filter]
+//! cargo run --release -p tokie --features build --example x1_miss -- <data-dir> vshf [filter]
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokie::Tokenizer;
 
-const TOKBENCH: &str = "C:/Users/lain/Desktop/github/tokbench/data";
+/// tokbench data directory (holds `fixtures/` and `models/`), set once in `main`.
+static TOKBENCH: OnceLock<PathBuf> = OnceLock::new();
+
+fn tokbench() -> &'static Path {
+    TOKBENCH.get().expect("tokbench data dir not set")
+}
+
+/// Resolve the tokbench data dir: the first CLI arg when it is a directory
+/// (consumed from `args`), else `$TOKBENCH_DATA`; exits with usage otherwise.
+fn init_tokbench(args: &mut Vec<String>, usage: &str) {
+    let dir = if args.first().is_some_and(|a| Path::new(a).is_dir()) {
+        PathBuf::from(args.remove(0))
+    } else if let Some(d) = std::env::var_os("TOKBENCH_DATA") {
+        PathBuf::from(d)
+    } else {
+        eprintln!("usage: {usage}");
+        eprintln!("tokbench data dir (with fixtures/ and models/) must be the first argument or $TOKBENCH_DATA");
+        std::process::exit(2);
+    };
+    TOKBENCH.set(dir).unwrap();
+}
 const FIXTURES: &[&str] = &["english", "chinese", "japanese", "agentic-swe"];
 
 const MODELS: &[(&str, &str)] = &[
@@ -47,7 +75,7 @@ fn enwik8(max: usize) -> String {
 
 /// Text of a tokbench fixture.
 fn fixture(name: &str) -> String {
-    let p = Path::new(TOKBENCH).join("fixtures").join(format!("{name}.txt"));
+    let p = tokbench().join("fixtures").join(format!("{name}.txt"));
     let b = std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
     String::from_utf8_lossy(&b).into_owned()
 }
@@ -339,7 +367,9 @@ fn vshf(_: &[(&str, Tokenizer)]) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    init_tokbench(&mut args, "x1_miss [data-dir] types|equiv|miss|bench|fp|lens|vshf [filter]");
+    args.insert(0, String::new());
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("types");
     let toks = load(args.get(2).map(|s| s.as_str()));
     match cmd {

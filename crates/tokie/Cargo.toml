@@ -145,3 +145,47 @@ required-features = ["hf"]
 [[example]]
 name = "hf_diff"
 required-features = ["build"]
+
+[[example]]
+name = "bench_files"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_files"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_glue_costs"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_hotpath"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_piece_costs"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_spawn_cost"
+required-features = ["hf"]
+
+[[example]]
+name = "rank_merge_bench"
+required-features = ["hf"]
+
+[[example]]
+name = "rank_merge_diff"
+required-features = ["hf"]
+
+[[example]]
+name = "w3_simple"
+required-features = ["hf"]
+
+[[example]]
+name = "w4_split_audit"
+required-features = ["hf"]
+
+[[example]]
+name = "w4_unit_bench"
+required-features = ["hf"]
