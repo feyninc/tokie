@@ -21,12 +21,6 @@ use smallvec::SmallVec;
 use super::backtracking::{key_words_within, PretokenCache};
 use crate::types::TokenId;
 
-/// Maximum token length for the whole-piece early exit. Unbounded: a piece
-/// that is itself a vocab token encodes as that token (HF `ignore_merges`,
-/// set by Llama-3, whose tiktoken-derived vocab has long tokens the merges
-/// alone never rebuild, e.g. " принимать" (19 B) -> one token, not 3).
-const MAX_CACHED_TOKEN_LEN: usize = usize::MAX;
-
 /// Pack two u32 token IDs into a single u64 key for faster hashing.
 #[inline(always)]
 fn pack_pair(left: TokenId, right: TokenId) -> u64 {
@@ -175,10 +169,17 @@ pub struct BytePairEncoder {
     /// Maps byte value -> token ID (for base tokens).
     byte_lut: [TokenId; 256],
 
-    /// Maps byte sequence -> token ID for early exit.
-    /// Includes tokens up to MAX_CACHED_TOKEN_LEN bytes (all of them).
-    /// Uses foldhash for fast lookups.
+    /// Maps byte sequence -> token ID for the whole-piece early exit (any
+    /// length). With `ignore_merges` it holds every token: a piece that is
+    /// itself a vocab token encodes as that token (HF `ignore_merges`, set by
+    /// Llama-3 / Mistral-Nemo, whose vocabs have long tokens the merges alone
+    /// never rebuild, e.g. " принимать" (19 B) -> one token, not 3). Without
+    /// it, only tokens the merge loop itself rebuilds from their bytes, so the
+    /// shortcut never changes the result (Qwen3.5 has 201 unreachable tokens).
     token_cache: FoldHashMap<Vec<u8>, TokenId>,
+
+    /// HF `model.ignore_merges`; see `token_cache`.
+    ignore_merges: bool,
 
     /// `pair_lookup` flattened for the merge loop.
     /// `None` for vocabularies too wide to pack (reference loop).
@@ -201,6 +202,9 @@ impl BytePairEncoder {
     }
 
     /// Create encoder from merge rules with added tokens.
+    ///
+    /// Uses plain BPE semantics (`ignore_merges = false`): only tokens the
+    /// merges rebuild short-circuit, so added tokens encode via merges.
     pub fn from_merges_with_added(
         merges: &[(TokenId, TokenId)],
         base_tokens: &[Vec<u8>],
@@ -259,22 +263,14 @@ impl BytePairEncoder {
         // Build token_cache for early exit optimization (foldhash for speed)
         let mut token_cache = FoldHashMap::default();
         for (token_id, bytes) in token_bytes.iter().enumerate() {
-            if bytes.len() <= MAX_CACHED_TOKEN_LEN {
-                token_cache.insert(bytes.clone(), token_id as TokenId);
-            }
+            token_cache.insert(bytes.clone(), token_id as TokenId);
         }
 
         let vocab_size = token_bytes.len();
         let num_base_tokens = base_tokens.len();
 
-        let encoder = Self {
-            pairs: PairTable::build(&pair_lookup),
-            pair_lookup,
-            byte_lut,
-            token_cache,
-            vocab_size,
-            num_base_tokens,
-        };
+        // No HF config here: plain BPE semantics (`ignore_merges = false`).
+        let encoder = Self::with_cache(pair_lookup, byte_lut, token_cache, false, vocab_size, num_base_tokens);
 
         (encoder, token_bytes)
     }
@@ -282,10 +278,12 @@ impl BytePairEncoder {
     /// Create encoder from a complete vocabulary and merge rules.
     ///
     /// For tokenizers (like LLaMA 3) where vocab has pre-assigned IDs.
+    /// `ignore_merges` is HF `model.ignore_merges` (see `token_cache`).
     pub fn from_vocab_and_merges(
         vocab: &[(u32, Vec<u8>)],
         merges: &[(TokenId, TokenId)],
         num_base_tokens: usize,
+        ignore_merges: bool,
     ) -> (Self, Vec<Vec<u8>>) {
         let token_bytes: Vec<Vec<u8>> = vocab.iter().map(|(_, bytes)| bytes.clone()).collect();
 
@@ -325,21 +323,83 @@ impl BytePairEncoder {
         // Build token_cache for early exit (foldhash for speed)
         let mut token_cache = FoldHashMap::default();
         for (token_id, bytes) in token_bytes.iter().enumerate() {
-            if bytes.len() <= MAX_CACHED_TOKEN_LEN {
-                token_cache.insert(bytes.clone(), token_id as TokenId);
-            }
+            token_cache.insert(bytes.clone(), token_id as TokenId);
         }
 
-        let encoder = Self {
+        let encoder = Self::with_cache(pair_lookup, byte_lut, token_cache, ignore_merges, vocab.len(), num_base_tokens);
+
+        (encoder, token_bytes)
+    }
+
+    /// Assemble the encoder from a cache of every token, pruning the cache
+    /// to merge-reachable tokens unless `ignore_merges`.
+    fn with_cache(
+        pair_lookup: FoldHashMap<u64, (TokenId, u32)>,
+        byte_lut: [TokenId; 256],
+        token_cache: FoldHashMap<Vec<u8>, TokenId>,
+        ignore_merges: bool,
+        vocab_size: usize,
+        num_base_tokens: usize,
+    ) -> Self {
+        let mut encoder = Self {
             pairs: PairTable::build(&pair_lookup),
             pair_lookup,
             byte_lut,
             token_cache,
-            vocab_size: vocab.len(),
+            ignore_merges,
+            vocab_size,
             num_base_tokens,
         };
+        if !ignore_merges {
+            encoder.prune_token_cache();
+        }
+        encoder
+    }
 
-        (encoder, token_bytes)
+    /// Drop multi-byte cache entries whose bytes the merge loop does not
+    /// encode as exactly that token. Single-byte entries are left alone
+    /// (1-byte pieces go through `byte_lut`). One merge run per token
+    /// (~70 ms single-threaded for a 248k vocab, ~13 ms on 16 threads), so
+    /// large vocabs are checked across threads.
+    fn prune_token_cache(&mut self) {
+        let mut cache = std::mem::take(&mut self.token_cache);
+        let this = &*self;
+        let entries: Vec<(&Vec<u8>, TokenId)> =
+            cache.iter().filter(|(b, _)| b.len() >= 2).map(|(b, &id)| (b, id)).collect();
+        let unreachable = |chunk: &[(&Vec<u8>, TokenId)]| -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            chunk
+                .iter()
+                .filter(|&&(bytes, id)| {
+                    out.clear();
+                    this.merge_only(bytes, &mut out);
+                    !(out.len() == 1 && out[0] == id)
+                })
+                .map(|&(bytes, _)| bytes.clone())
+                .collect()
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(entries.len() / 16_384).max(1);
+        let dead: Vec<Vec<u8>> = if threads == 1 {
+            unreachable(&entries)
+        } else {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = entries
+                    .chunks(entries.len().div_ceil(threads))
+                    .map(|c| s.spawn(move || unreachable(c)))
+                    .collect();
+                handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            })
+        };
+        drop(entries);
+        for bytes in &dead {
+            cache.remove(bytes);
+        }
+        self.token_cache = cache;
+    }
+
+    /// HF `ignore_merges`: whether every vocab token short-circuits.
+    pub fn ignore_merges(&self) -> bool {
+        self.ignore_merges
     }
 
     /// Get the vocabulary size.
@@ -372,10 +432,12 @@ impl BytePairEncoder {
     /// Used during deserialization to rebuild the encoder from saved data.
     /// - `merged_id` is pre-computed during serialization
     /// - `byte_lut` and `token_cache` are pre-built from decoder data (single copy)
+    /// - `token_cache` holds every token; it is pruned unless `ignore_merges`
     pub fn from_parts(
         merges: &[(TokenId, TokenId, TokenId)], // (left, right, merged_id)
         byte_lut: [TokenId; 256],
         token_cache: FoldHashMap<Vec<u8>, TokenId>,
+        ignore_merges: bool,
         vocab_size: usize,
         num_base_tokens: usize,
     ) -> Self {
@@ -385,14 +447,7 @@ impl BytePairEncoder {
             pair_lookup.insert(pack_pair(left, right), (merged_id, merge_index as u32));
         }
 
-        Self {
-            pairs: PairTable::build(&pair_lookup),
-            pair_lookup,
-            byte_lut,
-            token_cache,
-            vocab_size,
-            num_base_tokens,
-        }
+        Self::with_cache(pair_lookup, byte_lut, token_cache, ignore_merges, vocab_size, num_base_tokens)
     }
 
     /// Encode bytes into BPE tokens.
@@ -471,15 +526,18 @@ impl BytePairEncoder {
     /// Encode a piece of 2+ bytes without the pretoken cache.
     #[inline(never)]
     fn encode_uncached(&self, text: &[u8], out: &mut Vec<TokenId>) {
-        if text.len() <= MAX_CACHED_TOKEN_LEN {
-            if let Some(&token_id) = self.token_cache.get(text) {
-                return out.push(token_id);
-            }
+        if let Some(&token_id) = self.token_cache.get(text) {
+            return out.push(token_id);
         }
+        self.merge_only(text, out)
+    }
+
+    /// The merge loop alone (no whole-piece shortcut) on a piece of 2+ bytes.
+    fn merge_only(&self, text: &[u8], out: &mut Vec<TokenId>) {
         match &self.pairs {
             Some(pairs) if text.len() <= SHORT_MAX => merge_short(pairs, &self.byte_lut, text, out),
             Some(pairs) => merge_long(pairs, &self.byte_lut, text, out),
-            None => out.extend(self.encode_reference(text)),
+            None => out.extend(self.merge_reference(text)),
         }
     }
 
@@ -499,12 +557,15 @@ impl BytePairEncoder {
 
         // OPTIMIZATION 2: Early exit if input is already a single token
         // This handles most of the remaining 88.9% of pretokenized pieces
-        if text.len() <= MAX_CACHED_TOKEN_LEN {
-            if let Some(&token_id) = self.token_cache.get(text) {
-                return vec![token_id];
-            }
+        if let Some(&token_id) = self.token_cache.get(text) {
+            return vec![token_id];
         }
 
+        self.merge_reference(text)
+    }
+
+    /// The O(n²) merge loop on a piece of 2+ bytes, without the shortcut.
+    fn merge_reference(&self, text: &[u8]) -> Vec<TokenId> {
         // Initialize with byte tokens using SmallVec (stack allocation for ≤16 tokens)
         let mut tokens: SmallVec<[TokenId; 16]> = text
             .iter()
@@ -781,10 +842,36 @@ mod tests {
         // (" принимать", 19 B -> 127246, not 3 tokens).
         let long = vec![b'a'; 20];
         let vocab = vec![(0, vec![b'a']), (1, vec![b'a', b'a']), (2, long.clone())];
-        let (encoder, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &[(0, 0)], 1);
+        let (encoder, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &[(0, 0)], 1, true);
         assert_eq!(encoder.encode(&long), vec![2]);
         assert_eq!(encoder.encode_reference(&long), vec![2]);
         assert_eq!(encoder.encode(&long[..19]), encoder.encode_reference(&long[..19]));
+    }
+
+    #[test]
+    fn test_ignore_merges_gates_unreachable_tokens() {
+        // "abc" exists as a vocab token, but the merges build "ab" first and
+        // never merge "ab"+"c" (only "a"+"bc", which "ab" pre-empts).
+        let mut vocab: Vec<(u32, Vec<u8>)> = (0..256u32).map(|b| (b, vec![b as u8])).collect();
+        vocab.push((256, b"ab".to_vec()));
+        vocab.push((257, b"bc".to_vec()));
+        vocab.push((258, b"abc".to_vec()));
+        let merges = [(b'a' as u32, b'b' as u32), (b'b' as u32, b'c' as u32), (b'a' as u32, 257)];
+        for (ignore, want) in [(false, vec![256, b'c' as u32]), (true, vec![258])] {
+            let (enc, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, ignore);
+            assert_eq!(enc.ignore_merges(), ignore);
+            assert_eq!(enc.encode(b"abc"), want);
+            assert_eq!(enc.encode_reference(b"abc"), want);
+            let mut got = Vec::new();
+            enc.encode_into(b"abc", Some(&mut PretokenCache::new()), &mut got);
+            assert_eq!(got, want);
+            // Reachable tokens still short-circuit either way.
+            assert_eq!(enc.encode(b"ab"), vec![256]);
+            assert_eq!(enc.encode(b"bc"), vec![257]);
+        }
+        // Plain BPE oracle: "abc" merges as "ab" + "c".
+        let (enc, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, false);
+        assert_eq!(enc.merge_reference(b"abc"), vec![256, b'c' as u32]);
     }
 
     #[test]
@@ -862,7 +949,8 @@ mod tests {
         for round in 0..60 {
             let alphabet = 2 + round % 4;
             let (vocab, merges) = random_vocab(&mut rng, alphabet, 40 + round * 5, round % 2 == 0);
-            let (enc, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256);
+            let ignore_merges = round % 3 == 0;
+            let (enc, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, ignore_merges);
             let (enc2, _) = BytePairEncoder::from_merges(&merges.iter().copied().filter(|&(l, r)| l < 256 && r < 256).collect::<Vec<_>>(), &vocab[..256].iter().map(|(_, b)| b.clone()).collect::<Vec<_>>());
             let mut caches = [PretokenCache::new(), PretokenCache::new()];
             for _ in 0..400 {
@@ -870,6 +958,10 @@ mod tests {
                 let text: Vec<u8> = (0..len).map(|_| b'a' + rng.below(alphabet) as u8).collect();
                 for (e, cache) in [&enc, &enc2].into_iter().zip(caches.iter_mut()) {
                     let want = e.encode_reference(&text);
+                    if !e.ignore_merges() && text.len() >= 2 {
+                        // Plain BPE: the shortcut never changes the result.
+                        assert_eq!(e.merge_reference(&text), want);
+                    }
                     assert_eq!(e.encode(&text), want, "round {round} text {:?}", String::from_utf8_lossy(&text));
                     for _ in 0..2 {
                         let mut got = Vec::new();
@@ -885,7 +977,7 @@ mod tests {
     fn test_from_parts_matches() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let (vocab, merges) = random_vocab(&mut rng, 3, 80, true);
-        let (enc, token_bytes) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256);
+        let (enc, token_bytes) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, false);
         let parts: Vec<(u32, u32, u32)> = {
             let mut v: Vec<_> = enc.pair_lookup().iter().map(|(&k, &(m, r))| (r, (k >> 32) as u32, k as u32, m)).collect();
             v.sort();
@@ -893,11 +985,10 @@ mod tests {
         };
         let mut token_cache = FoldHashMap::default();
         for (id, b) in token_bytes.iter().enumerate() {
-            if b.len() <= MAX_CACHED_TOKEN_LEN {
-                token_cache.insert(b.clone(), id as TokenId);
-            }
+            token_cache.insert(b.clone(), id as TokenId);
         }
-        let rebuilt = BytePairEncoder::from_parts(&parts, enc.byte_lut, token_cache, enc.vocab_size(), 256);
+        let rebuilt = BytePairEncoder::from_parts(&parts, enc.byte_lut, token_cache, false, enc.vocab_size(), 256);
+        assert_eq!(rebuilt.token_cache, enc.token_cache);
         for _ in 0..500 {
             let text: Vec<u8> = (0..rng.below(120)).map(|_| b'a' + rng.below(3) as u8).collect();
             assert_eq!(rebuilt.encode(&text), rebuilt.encode_reference(&text));

@@ -347,7 +347,7 @@ fn load_byte_level_bpe(
         }
         EncoderType::Simple => {
             let (enc, bytes) =
-                BytePairEncoder::from_vocab_and_merges(&full_vocab, &merges, num_base_tokens);
+                BytePairEncoder::from_vocab_and_merges(&full_vocab, &merges, num_base_tokens, ignore_merges(data));
             (Encoder::Simple(enc), bytes)
         }
     };
@@ -446,7 +446,7 @@ fn load_vocab_defined_bpe(
     } else if use_simple || encoder_type == EncoderType::Simple {
         // Simple encoder for ByteLevel vocab-defined BPE or explicit request
         let (enc, bytes) =
-            BytePairEncoder::from_vocab_and_merges(&full_vocab, &merges, num_base_tokens);
+            BytePairEncoder::from_vocab_and_merges(&full_vocab, &merges, num_base_tokens, ignore_merges(data));
         (Encoder::Simple(enc), bytes)
     } else {
         // Backtracking for sequential-ID BPE (GPT-2, cl100k, o200k)
@@ -463,6 +463,12 @@ fn load_vocab_defined_bpe(
     }
     setup_added_tokens(&mut tokenizer, data);
     Ok(tokenizer)
+}
+
+/// HF BPE `model.ignore_merges` (Llama-3, Mistral-Nemo, gpt-oss): a piece
+/// that is itself a vocab token skips the merges. Absent means false.
+fn ignore_merges(data: &serde_json::Value) -> bool {
+    data["model"]["ignore_merges"].as_bool().unwrap_or(false)
 }
 
 /// Parse a byte fallback token like `<0x0A>` and return the byte value.
@@ -566,12 +572,29 @@ fn detect_pretokenizer_type(data: &serde_json::Value) -> DetectedPretokenizer {
                                     || pattern.contains("\\p{Ll}");
 
                                 if is_case_aware {
+                                    let has_contractions = pattern.contains("'s|'t") || pattern.contains("'[sS]");
+                                    let has_single_digits =
+                                        pattern.contains("|\\p{N}|") || pattern.starts_with("\\p{N}|");
                                     // Tekken (Mistral-Nemo, Nemotron) is o200k without the
-                                    // `(?i:'s|'t|...)?` contraction suffix and with single digits.
-                                    if !pattern.contains("'s|'t") && !pattern.contains("\\p{N}{") {
+                                    // `(?i:'s|'t|...)?` contraction suffix and with single digits
+                                    // (no digit chunking in any stage).
+                                    if !has_contractions && has_single_digits && !has_chunked_digits {
                                         return DetectedPretokenizer { pretok_type: PretokType::Tekken, fallback_pattern: None };
                                     }
-                                    return DetectedPretokenizer { pretok_type: PretokType::O200k, fallback_pattern: None };
+                                    if has_contractions && pattern.contains("\\p{N}{1,3}") {
+                                        return DetectedPretokenizer { pretok_type: PretokType::O200k, fallback_pattern: None };
+                                    }
+                                    // Case-aware but neither scheme: run the raw regex
+                                    // rather than guess.
+                                    let all_splits: Vec<&str> = pretokenizers
+                                        .iter()
+                                        .filter(|p| p["type"].as_str() == Some("Split"))
+                                        .filter_map(|p| p["pattern"]["Regex"].as_str())
+                                        .collect();
+                                    return DetectedPretokenizer {
+                                        pretok_type: PretokType::None,
+                                        fallback_pattern: Some(all_splits.join("|")),
+                                    };
                                 }
 
                                 // Patterns with [\p{L}\p{M}]+ include combining marks
@@ -1492,12 +1515,13 @@ mod tests {
 
     #[test]
     fn test_detect_qwen35_single_stage_single_digits() {
-        // Qwen3.5-style: one Split with [\p{L}\p{M}]+ and single \p{N} — must stay Qwen35
+        // Qwen3.5 (real tokenizer.json pattern): one Split with [\p{L}\p{M}]+ and
+        // single \p{N} — must stay Qwen35
         let data = serde_json::json!({
             "pre_tokenizer": {
                 "type": "Sequence",
                 "pretokenizers": [
-                    {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false},
+                    {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false},
                     {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}
                 ]
             }
@@ -1551,6 +1575,26 @@ mod tests {
              "strip_accents": null, "lowercase": true}
         ]}));
         assert!(seq.is_err());
+    }
+
+    #[test]
+    fn test_detect_case_aware_with_separate_digit_stage_is_not_tekken() {
+        // Tekken-like letters without contractions, but digits chunked by an
+        // earlier Split stage: neither Tekken nor o200k, so run the raw regex.
+        let letters = "[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\r\n/]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+        let data = serde_json::json!({
+            "pre_tokenizer": {
+                "type": "Sequence",
+                "pretokenizers": [
+                    {"type": "Split", "pattern": {"Regex": "\\p{N}{1,3}"}, "behavior": "Isolated", "invert": false},
+                    {"type": "Split", "pattern": {"Regex": letters}, "behavior": "Isolated", "invert": false},
+                    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}
+                ]
+            }
+        });
+        let detected = detect_pretokenizer_type(&data);
+        assert_eq!(detected.pretok_type, PretokType::None);
+        assert_eq!(detected.fallback_pattern.as_deref(), Some(format!("\\p{{N}}{{1,3}}|{letters}").as_str()));
     }
 
     #[test]
