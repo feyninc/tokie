@@ -140,7 +140,7 @@ fn load_from_json_value_with_encoder(
     encoder_type: EncoderType,
 ) -> Result<Tokenizer, JsonLoadError> {
     let model = &data["model"];
-    let normalizer = detect_normalizer(data);
+    let normalizer = detect_normalizer(data)?;
 
     // Check if this is a Unigram tokenizer
     // Unigram can be detected by:
@@ -653,6 +653,28 @@ fn detect_pretokenizer_type(data: &serde_json::Value) -> DetectedPretokenizer {
     DetectedPretokenizer { pretok_type: PretokType::None, fallback_pattern: None }
 }
 
+/// Map a HF `BertNormalizer` to [`Normalizer::BertCased`] / [`Normalizer::BertUncased`].
+///
+/// Those variants hard-code `clean_text = true`, `handle_chinese_chars = true`
+/// and `strip_accents = lowercase` (HF's `strip_accents: null` default). Any
+/// other combination (e.g. `lowercase: true, strip_accents: false`) has no
+/// tokie equivalent, so it is rejected rather than silently tokenized with the
+/// wrong flags. Missing fields take HF's defaults, except `lowercase`, which
+/// keeps tokie's historical `false` default.
+fn bert_normalizer(n: &serde_json::Value) -> Result<Normalizer, JsonLoadError> {
+    let clean_text = n["clean_text"].as_bool().unwrap_or(true);
+    let handle_chinese_chars = n["handle_chinese_chars"].as_bool().unwrap_or(true);
+    let lowercase = n["lowercase"].as_bool().unwrap_or(false);
+    let strip_accents = n["strip_accents"].as_bool().unwrap_or(lowercase);
+    if !clean_text || !handle_chinese_chars || strip_accents != lowercase {
+        return Err(JsonLoadError::InvalidFormat(
+            "unsupported BertNormalizer flags: tokie requires clean_text = true, \
+             handle_chinese_chars = true and strip_accents = null or equal to lowercase",
+        ));
+    }
+    Ok(if lowercase { Normalizer::BertUncased } else { Normalizer::BertCased })
+}
+
 /// Detect the normalizer from HuggingFace JSON.
 ///
 /// Auto-detects based on normalizer and pre_tokenizer configuration:
@@ -660,11 +682,17 @@ fn detect_pretokenizer_type(data: &serde_json::Value) -> DetectedPretokenizer {
 /// - Precompiled + WhitespaceSplit + Metaspace → SentencePiece (T5, XLM-RoBERTa)
 /// - BertNormalizer with lowercase=true → BertUncased
 /// - BertNormalizer with lowercase=false → BertCased
+///   (other BertNormalizer flag combinations are rejected, see [`bert_normalizer`])
+/// - Lowercase alone → Lowercase (SentencePieceLowercase with WhitespaceSplit + Metaspace)
 /// - NFC → Nfc
 /// - Sequence containing NFC → Nfc
 /// - Metaspace pre_tokenizer only → Metaspace (Llama, Mistral)
 /// - None or null → None
-fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
+///
+/// Known (pre-existing) approximation: CLIP / SAM3's `Sequence[NFC, Replace(\s+ → " "), Lowercase]` is detected as `Nfc`
+/// via the NFC scan below, so neither the lowercase nor the whitespace
+/// collapse is applied.
+fn detect_normalizer(data: &serde_json::Value) -> Result<Normalizer, JsonLoadError> {
     let normalizer = &data["normalizer"];
     let has_metaspace = is_metaspace_pretokenizer(data);
     let has_whitespace_split = is_whitespace_split_pretokenizer(data);
@@ -672,9 +700,9 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
     // Handle null/missing normalizer - check for Metaspace pre_tokenizer
     if normalizer.is_null() {
         if has_metaspace {
-            return metaspace_normalizer_from_pretok(data);
+            return Ok(metaspace_normalizer_from_pretok(data));
         }
-        return Normalizer::None;
+        return Ok(Normalizer::None);
     }
 
     // Check normalizer type
@@ -686,21 +714,15 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
                 if has_metaspace {
                     // Prefer the model's exact charsmap blob; fall back to the
                     // category-rule approximation if it's missing or malformed.
-                    return parse_precompiled_charsmap(normalizer, has_whitespace_split)
-                        .unwrap_or(Normalizer::SentencePiece);
+                    return Ok(parse_precompiled_charsmap(normalizer, has_whitespace_split)
+                        .unwrap_or(Normalizer::SentencePiece));
                 }
             }
             "BertNormalizer" => {
-                // BertNormalizer with lowercase option
-                let lowercase = normalizer["lowercase"].as_bool().unwrap_or(false);
-                if lowercase {
-                    return Normalizer::BertUncased;
-                } else {
-                    return Normalizer::BertCased;
-                }
+                return bert_normalizer(normalizer);
             }
             "NFC" => {
-                return Normalizer::Nfc;
+                return Ok(Normalizer::Nfc);
             }
             "Sequence" => {
                 // Check sequence normalizers for specific patterns
@@ -709,7 +731,7 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
                     // 32× Replace(punct → " punct "), Replace(\s+→" "), Strip]
                     // + Metaspace pre-tokenizer.
                     if let Some(n) = detect_punct_pad_chain(normalizers, has_metaspace) {
-                        return n;
+                        return Ok(n);
                     }
 
                     let has_lowercase = normalizers.iter().any(|n| {
@@ -733,17 +755,17 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
 
                     // ALBERT pattern: Sequence with Lowercase + Precompiled + WhitespaceSplit + Metaspace
                     if has_precompiled && has_lowercase && has_metaspace && has_whitespace_split {
-                        return Normalizer::SentencePieceLowercase;
+                        return Ok(Normalizer::SentencePieceLowercase);
                     }
 
                     // General SentencePiece: Sequence with Precompiled + Metaspace
                     // (with or without WhitespaceSplit — bge-m3 omits it)
                     if has_precompiled && has_metaspace {
-                        return normalizers
+                        return Ok(normalizers
                             .iter()
                             .find(|n| n["type"].as_str() == Some("Precompiled"))
                             .and_then(|n| parse_precompiled_charsmap(n, has_whitespace_split))
-                            .unwrap_or(Normalizer::SentencePiece);
+                            .unwrap_or(Normalizer::SentencePiece));
                     }
 
                     // Mixtral pattern: Prepend "▁" + Replace " " → "▁".
@@ -751,22 +773,17 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
                     // and prepends unconditionally (TinyLlama, Phi-3,
                     // voyage-2 family) — unlike the Metaspace pre-tokenizer.
                     if has_prepend_metaspace && has_replace_space_metaspace {
-                        return Normalizer::Metaspace(MetaspacePrepend::Unconditional);
+                        return Ok(Normalizer::Metaspace(MetaspacePrepend::Unconditional));
                     }
 
                     // Check for NFC or BertNormalizer in sequence
                     for n in normalizers {
                         if let Some(n_type) = n["type"].as_str() {
                             if n_type == "NFC" {
-                                return Normalizer::Nfc;
+                                return Ok(Normalizer::Nfc);
                             }
                             if n_type == "BertNormalizer" {
-                                let lowercase = n["lowercase"].as_bool().unwrap_or(false);
-                                if lowercase {
-                                    return Normalizer::BertUncased;
-                                } else {
-                                    return Normalizer::BertCased;
-                                }
+                                return bert_normalizer(n);
                             }
                         }
                     }
@@ -775,9 +792,10 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
             "Lowercase" => {
                 // Simple lowercase normalizer - check if also has Metaspace
                 if has_metaspace && has_whitespace_split {
-                    return Normalizer::SentencePieceLowercase;
+                    return Ok(Normalizer::SentencePieceLowercase);
                 }
-                return Normalizer::BertUncased;
+                // HF `Lowercase` only lowercases: no clean_text / CJK padding.
+                return Ok(Normalizer::Lowercase);
             }
             "Replace" => {
                 // Replace normalizer - check if it converts space to metaspace (Gemma style)
@@ -785,7 +803,7 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
                 let pattern = normalizer["pattern"]["String"].as_str();
                 let content = normalizer["content"].as_str();
                 if pattern == Some(" ") && content == Some("▁") {
-                    return Normalizer::MetaspaceReplace;
+                    return Ok(Normalizer::MetaspaceReplace);
                 }
             }
             _ => {}
@@ -794,10 +812,10 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
 
     // Even if normalizer exists, check for Metaspace pre_tokenizer
     if has_metaspace {
-        return metaspace_normalizer_from_pretok(data);
+        return Ok(metaspace_normalizer_from_pretok(data));
     }
 
-    Normalizer::None
+    Ok(Normalizer::None)
 }
 
 /// Detect the potion-multilingual punctuation-padding normalizer chain:
@@ -1504,6 +1522,35 @@ mod tests {
             });
             assert_eq!(detect_pretokenizer_type(&data).pretok_type, want);
         }
+    }
+
+    #[test]
+    fn test_detect_normalizer_lowercase_and_bert_flags() {
+        let detect = |n: serde_json::Value| detect_normalizer(&serde_json::json!({ "normalizer": n }));
+        // Plain Lowercase is lowercase-only (no BERT cleaning / CJK padding).
+        assert_eq!(detect(serde_json::json!({"type": "Lowercase"})).unwrap(), Normalizer::Lowercase);
+
+        let bert = |clean: bool, cjk: bool, strip: serde_json::Value, lower: bool| {
+            detect(serde_json::json!({
+                "type": "BertNormalizer", "clean_text": clean, "handle_chinese_chars": cjk,
+                "strip_accents": strip, "lowercase": lower
+            }))
+        };
+        use serde_json::Value::{Bool, Null};
+        assert_eq!(bert(true, true, Null, true).unwrap(), Normalizer::BertUncased);
+        assert_eq!(bert(true, true, Bool(true), true).unwrap(), Normalizer::BertUncased);
+        assert_eq!(bert(true, true, Null, false).unwrap(), Normalizer::BertCased);
+        assert_eq!(bert(true, true, Bool(false), false).unwrap(), Normalizer::BertCased);
+        // No tokie equivalent: rejected instead of silently approximated.
+        assert!(bert(true, true, Bool(false), true).is_err());
+        assert!(bert(true, true, Bool(true), false).is_err());
+        assert!(bert(false, true, Null, true).is_err());
+        assert!(bert(true, false, Null, false).is_err());
+        let seq = detect(serde_json::json!({"type": "Sequence", "normalizers": [
+            {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": false,
+             "strip_accents": null, "lowercase": true}
+        ]}));
+        assert!(seq.is_err());
     }
 
     #[test]

@@ -185,6 +185,13 @@ pub enum Normalizer {
     SentencePiecePunctPad {
         charsmap: Arc<PrecompiledCharsmap>,
     },
+
+    /// Plain lowercase (HF `Lowercase` normalizer): per-char Unicode
+    /// lowercase, nothing else — no control stripping, no CJK padding,
+    /// no accent stripping.
+    ///
+    /// Example: "HÉLLO 中文" → "héllo 中文"
+    Lowercase,
 }
 
 impl Normalizer {
@@ -223,6 +230,7 @@ impl Normalizer {
             Normalizer::SentencePiecePunctPad { charsmap } => {
                 sentencepiece_punct_pad_normalize(charsmap, text)
             }
+            Normalizer::Lowercase => lowercase_normalize(text),
         }
     }
 
@@ -245,6 +253,37 @@ fn normalize_nfc<'a>(text: &'a str) -> Cow<'a, str> {
         return Cow::Borrowed(text);
     }
     Cow::Owned(nfc.normalize(text))
+}
+
+/// Plain lowercase, matching HF's `Lowercase` normalizer (`char::to_lowercase`
+/// per char, so no context-sensitive final sigma).
+///
+/// Returns `Cow::Borrowed` when the text has no uppercase characters.
+fn lowercase_normalize(text: &str) -> Cow<'_, str> {
+    if text.is_ascii() {
+        if !text.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Cow::Borrowed(text);
+        }
+        return Cow::Owned(text.to_ascii_lowercase());
+    }
+    let mut chars = text.char_indices();
+    let first = loop {
+        match chars.next() {
+            None => return Cow::Borrowed(text),
+            Some((i, c)) => {
+                let mut lc = c.to_lowercase();
+                if lc.len() != 1 || lc.next() != Some(c) {
+                    break i;
+                }
+            }
+        }
+    };
+    let mut result = String::with_capacity(text.len() + 8);
+    result.push_str(&text[..first]);
+    for c in text[first..].chars() {
+        result.extend(c.to_lowercase());
+    }
+    Cow::Owned(result)
 }
 
 /// Metaspace normalization for SentencePiece tokenizers.
@@ -638,8 +677,13 @@ fn collapse_strip_whitespace_and_controls(text: &str) -> String {
 
 /// Check if a character is a Unicode control character.
 ///
-/// Returns true for Unicode categories Cc, Cf, Cn, Co (control, format, unassigned, private-use),
+/// Returns true for Unicode categories Cc, Cf, Co (control, format, private-use),
 /// EXCEPT for tab, newline, and carriage return which are treated as whitespace.
+///
+/// Unassigned (Cn) code points are kept. That matches HF for both users of
+/// this predicate: BertNormalizer `clean_text` (`is_other()` = Cc|Cf|Co) and
+/// the ALBERT chain (NFKD + StripAccents + Lowercase + Precompiled), whose
+/// charsmap passes "a\u{5FF}b" through unchanged.
 #[inline]
 fn is_control(c: char) -> bool {
     match c {
@@ -661,7 +705,9 @@ fn is_bert_whitespace(c: char) -> bool {
         || get_general_category(c) == GeneralCategory::SpaceSeparator
 }
 
-/// CJK ideograph per HuggingFace's BertNormalizer `_is_chinese_char`.
+/// CJK ideograph per HuggingFace's BertNormalizer `is_chinese_char`
+/// (tokenizers `normalizers/bert.rs`; ranges copied verbatim, including the
+/// 0x2B820..=0x2B91F gap).
 #[inline]
 fn is_chinese_char(c: char) -> bool {
     matches!(c as u32,
@@ -670,7 +716,7 @@ fn is_chinese_char(c: char) -> bool {
         | 0x20000..=0x2A6DF
         | 0x2A700..=0x2B73F
         | 0x2B740..=0x2B81F
-        | 0x2B820..=0x2CEAF
+        | 0x2B920..=0x2CEAF
         | 0xF900..=0xFAFF
         | 0x2F800..=0x2FA1F
     )
@@ -1282,4 +1328,42 @@ mod tests {
         assert_eq!(norm.normalize("a\u{200B}\u{E000}\u{7F}b"), "ab");
     }
 
+    #[test]
+    fn test_sentencepiece_lowercase_keeps_unassigned() {
+        // HF albert-base-v2 normalizer: "a\u{5FF}b\u{378}c" is unchanged.
+        let norm = Normalizer::SentencePieceLowercase;
+        assert_eq!(norm.normalize("a\u{5FF}b\u{378}c"), "▁a\u{5FF}b\u{378}c");
+    }
+
+    #[test]
+    fn test_bert_cjk_padding() {
+        // Expected values from HF `BertNormalizer(lowercase=..).normalize_str`.
+        let cases: &[(&str, &str, &str)] = &[
+            ("中文", " 中  文 ", " 中  文 "),
+            ("Ab中C", "Ab 中 C", "ab 中 c"),
+            // CJK compatibility ideograph: NFD (uncased) maps it to U+8C48.
+            ("x\u{F900}y", "x \u{F900} y", "x \u{8C48} y"),
+            ("\u{3400}\u{20000}\u{2A700}\u{2B740}", " \u{3400}  \u{20000}  \u{2A700}  \u{2B740} ", " \u{3400}  \u{20000}  \u{2A700}  \u{2B740} "),
+            // 0x2B820..=0x2B91F is outside HF's ranges: not padded.
+            ("a\u{2B820}\u{2B91F}b", "a\u{2B820}\u{2B91F}b", "a\u{2B820}\u{2B91F}b"),
+            ("a\u{2B920}b", "a \u{2B920} b", "a \u{2B920} b"),
+            ("a\u{2CEAF}\u{2CEB0}b", "a \u{2CEAF} \u{2CEB0}b", "a \u{2CEAF} \u{2CEB0}b"),
+            // Hiragana / Hangul are not padded (uncased NFD splits Hangul).
+            ("Ｈiあ한\u{2F800}", "Ｈiあ한 \u{2F800} ", "ｈiあ\u{1112}\u{1161}\u{11AB} \u{4E3D} "),
+            ("Café\t中\u{0}", "Café  中 ", "cafe  中 "),
+        ];
+        for &(input, cased, uncased) in cases {
+            assert_eq!(Normalizer::BertCased.normalize(input), cased, "cased {input:?}");
+            assert_eq!(Normalizer::BertUncased.normalize(input), uncased, "uncased {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_lowercase_only() {
+        let norm = Normalizer::Lowercase;
+        assert!(matches!(norm.normalize("hello 中文"), Cow::Borrowed(_)));
+        assert_eq!(norm.normalize("HeLLo"), "hello");
+        // No CJK padding, control stripping or accent stripping.
+        assert_eq!(norm.normalize("HÉ中\u{0}\tΣΑΣ"), "hé中\u{0}\tσασ");
+    }
 }

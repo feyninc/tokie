@@ -92,6 +92,7 @@ impl Normalizer {
             7 => Some(Self::MetaspaceReplace),
             10 => Some(Self::Metaspace(MetaspacePrepend::IfNotSpaceLed)),
             11 => Some(Self::Metaspace(MetaspacePrepend::FirstSegment)),
+            13 => Some(Self::Lowercase),
             _ => None,
         }
     }
@@ -112,6 +113,7 @@ impl Normalizer {
             Self::Metaspace(MetaspacePrepend::IfNotSpaceLed) => 10,
             Self::Metaspace(MetaspacePrepend::FirstSegment) => 11,
             Self::SentencePiecePunctPad { .. } => 12,
+            Self::Lowercase => 13,
         }
     }
 }
