@@ -48,9 +48,10 @@ pub enum MaskIsa {
 }
 
 impl MaskIsa {
-    /// Best backend for this CPU, cached. `PRETOKIE_ISA=scalar|base|avx2`
-    /// overrides the choice (benchmarks / differential tests); an
-    /// unsupported request falls back to the detected best.
+    /// Best backend for this CPU, cached. `PRETOKIE_ISA=scalar|base|sse2|neon|avx2`
+    /// overrides the choice (benchmarks / differential tests); it is read
+    /// once per process, and an unsupported or unknown request falls back
+    /// to the detected best. See the crate docs.
     pub fn detect() -> MaskIsa {
         use std::sync::atomic::{AtomicU8, Ordering};
         static CACHED: AtomicU8 = AtomicU8::new(0);
@@ -1671,7 +1672,15 @@ mod tests {
     #[test]
     fn owt_sample_differential() {
         let Some(data) = bench_data("owt_sample.txt").or_else(|| bench_data("enwik8")) else {
-            eprintln!("owt_sample.txt / enwik8 missing; skipping");
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benches/data");
+            let msg = format!(
+                "SKIPPED: {} missing (owt_sample.txt / enwik8)",
+                dir.display()
+            );
+            if std::env::var_os("PRETOKIE_REQUIRE_DATA").is_some() {
+                panic!("{msg} and PRETOKIE_REQUIRE_DATA is set");
+            }
+            eprintln!("{msg}");
             return;
         };
         let text = String::from_utf8_lossy(&data[..data.len().min(5_000_000)]).into_owned();

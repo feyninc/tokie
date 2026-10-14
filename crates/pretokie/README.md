@@ -28,7 +28,7 @@ Part of the [tokie](https://github.com/chonkie-inc/tokie) tokenizer project.
 
 ```toml
 [dependencies]
-pretokie = "0.0.3"
+pretokie = "0.2"
 ```
 
 ```rust
@@ -52,6 +52,7 @@ Every pretokenizer implements `Iterator<Item = &str>` — use `.collect()`, `.co
 | `SmolLM` | SmolLM2 | **343** | 24.9M | 9.7 |
 | `DeepSeek` | DeepSeek-V3, DeepSeek-R1 | **311** | 21.7M | 10.7 |
 | `Qwen` | Qwen3.5 | **310** | 22.8M | 10.8 |
+| `Tekken` | Mistral Nemo, Nemotron | — | — | — |
 | `Regex` | Any pattern (fallback) | 91 | 23.3M | 36.7 |
 
 \* Pieces on 95 MB enwik8, Apple M3 Pro. Cycles/byte at 3.34 GHz.
@@ -80,13 +81,36 @@ let pieces: Vec<&str> = Bert::new("Hello, world!").collect();
 assert_eq!(pieces, vec!["Hello", ",", "world", "!"]);
 ```
 
+`Bert` matches HuggingFace's `BertPreTokenizer` exactly: since 0.2.0 it does
+**not** isolate CJK ideographs (HF does that in `BertNormalizer`'s
+`handle_chinese_chars`). Pad CJK chars with spaces before calling it, or use
+tokie's BERT normalizer. See [CHANGELOG.md](CHANGELOG.md).
+
+## SIMD backend selection (`PRETOKIE_ISA`)
+
+The `Mask`-based pretokenizers (all except `Bert`) classify 64-byte batches
+with SIMD: NEON on aarch64, SSE2 on x86_64 (AVX2 is available but opt-in, as
+it measured no faster end-to-end). The `PRETOKIE_ISA` environment variable
+overrides the choice:
+
+| Value | Backend |
+|-------|---------|
+| `scalar` | No SIMD; every piece takes the scalar `Core` path |
+| `base` / `sse2` / `neon` | Baseline 128-bit SIMD (the default) |
+| `avx2` | AVX2 (x86_64, runtime-detected) |
+
+It is read **once** per process (on the first `Mask` construction) and
+cached; unsupported or unknown values fall back to the default. It is
+intended for benchmarking and differential testing only — output is
+byte-identical across backends.
+
 ## Regex Fallback
 
 For unknown tokenizer patterns, enable the `regex` feature:
 
 ```toml
 [dependencies]
-pretokie = { version = "0.0.3", features = ["regex"] }
+pretokie = { version = "0.2", features = ["regex"] }
 ```
 
 ```rust

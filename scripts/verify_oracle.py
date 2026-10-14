@@ -4,6 +4,7 @@ For each scheme: run `examples/dump.rs --impl oracle --text <case>`, convert
 HF's ByteLevel-remapped tokens back to bytes, compare exactly.
 """
 
+import os
 import struct
 import subprocess
 from pathlib import Path
@@ -11,8 +12,9 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
-TOKIE = Path.home() / "Workspaces" / "tokie"
-DUMP = TOKIE / "target" / "debug" / "examples" / "dump"
+# Repo root = parent of this script's directory (scripts/).
+TOKIE = Path(__file__).resolve().parent.parent
+DUMP = TOKIE / "target" / "debug" / "examples" / ("dump.exe" if os.name == "nt" else "dump")
 
 REPOS = {
     "r50k": "openai-community/gpt2",

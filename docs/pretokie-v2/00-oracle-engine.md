@@ -174,8 +174,21 @@ Qwen/Qwen2-7B:
 Pipeline: `Split(RE, Isolated, invert: false)` → ByteLevel(`use_regex=false`).
 cl100k-family but **single digits** (`\p{N}`) and `trim_offsets: false`.
 tokie's `QwenConfig`: marks `[\p{L}\p{M}]+`? — note Qwen2's pattern has NO
-`\p{M}`; Qwen3.5's does (tokie's Qwen35 scheme). Grab Qwen3.5's JSON when
-building its goldens.
+`\p{M}`; Qwen3.5's does (tokie's Qwen35 scheme, oracle `QWEN35`, golden
+`qwen35` → `pretokie::Qwen`):
+
+```
+(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+```
+
+### tekken — `Split(Isolated)` + ByteLevel
+
+Mistral-Nemo (oracle `TEKKEN`, golden `tekken` → `pretokie::Tekken`):
+o200k's case classes without contraction suffixes, single digits.
+
+```
+[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+```
 
 ### deepseek — 3× `Split(Isolated)` + ByteLevel
 
@@ -296,6 +309,12 @@ Implemented as an **opt-in `oracle` feature of pretokie** (no new crate):
 (r50k, cl100k, o200k, qwen2, voyage, deepseek, smollm, bert, falcon;
 32-case suite: `uv run --with tokenizers --with huggingface_hub
 python scripts/verify_oracle.py`).
+
+Goldens cover tekken and qwen35 too (oracle-vs-pretokie; not yet in the
+Python loop-closure script). falcon stays oracle-only. Every `Mask` scheme is
+compared under each `MaskIsa` the host supports, so AVX2 is covered without
+`PRETOKIE_ISA`. Missing `benches/data` files print `SKIPPED: <path> missing`;
+set `PRETOKIE_REQUIRE_DATA=1` (CI) to fail instead.
 
 Run the suite: `cargo test -p pretokie --features oracle --lib --tests`
 (needs a C toolchain for onig — nix: `nix shell nixpkgs#cargo

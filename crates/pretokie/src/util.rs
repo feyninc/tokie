@@ -93,8 +93,13 @@ pub fn decode_utf8(bytes: &[u8]) -> (char, usize) {
 /// Check if a Unicode char is in General_Category = Letter (\p{L}).
 ///
 /// This is narrower than `char::is_alphabetic()`, which also returns true for
-/// some marks (Mn/Mc) that have the Unicode `Alphabetic` property.
-/// For pretokenizer regex patterns using `\p{L}`, use this instead.
+/// marks (Mn/Mc), letter numbers (Nl: `Ⅲ`, `ⅰ`, `〇` — these are `\p{N}`) and
+/// Other_Alphabetic symbols (So: circled `Ⓐ`..`ⓩ`, U+1F130..U+1F189 — these
+/// are `\p{S}`). For pretokenizer regex patterns using `\p{L}`, use this
+/// instead.
+///
+/// **Changed in 0.2.0:** letter numbers and the Other_Alphabetic symbols
+/// above now return `false` (previously `true`).
 #[inline(always)]
 pub fn is_unicode_letter(c: char) -> bool {
     is_alpha(c) && !is_unicode_mark(c)
@@ -114,9 +119,15 @@ pub fn is_alpha(c: char) -> bool {
 
 /// Check if a Unicode char is in \p{P} or \p{S} (punctuation or symbol).
 ///
-/// Approximated as: not letter/mark/numeric/whitespace/control and not
-/// format/private-use. Unassigned codepoints (Cn) are not excluded — they are
-/// vanishingly rare in real text.
+/// Approximated as: not letter (per [`is_alpha`]) / mark / numeric /
+/// whitespace / control and not format/private-use. Unassigned codepoints
+/// (Cn) are not excluded — they are vanishingly rare in real text.
+///
+/// Letter numbers (Nl, e.g. `Ⅲ`) are `\p{N}` and return `false`.
+///
+/// **Changed in 0.2.0:** Other_Alphabetic symbols (circled `Ⓐ`..`ⓩ`,
+/// U+1F130..U+1F189) now return `true` (they are `\p{So}`; previously
+/// treated as letters).
 #[inline]
 pub fn is_punct_or_symbol(c: char) -> bool {
     !is_alpha(c)

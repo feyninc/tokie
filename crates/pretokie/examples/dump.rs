@@ -26,7 +26,10 @@ fn pretokie_pretokens(scheme: &Scheme, text: &str) -> Vec<Vec<u8>> {
         "r50k" => pretokie::Gpt2::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
         "cl100k" => pretokie::Cl100k::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
         "o200k" => pretokie::O200k::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "qwen2" => pretokie::Qwen::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        // Qwen2's pattern is Voyage's; `pretokie::Qwen` is Qwen3.5.
+        "qwen2" | "voyage" => pretokie::Voyage::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "tekken" => pretokie::Tekken::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "qwen35" => pretokie::Qwen::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
         "deepseek" => pretokie::DeepSeek::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
         "smollm" => pretokie::SmolLM::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
         "bert" => pretokie::Bert::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),

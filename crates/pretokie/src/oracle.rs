@@ -43,6 +43,14 @@ pub const QWEN2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]
 /// the schemes' spec sources stay separable.
 pub const VOYAGE_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// tekken: mistralai/Mistral-Nemo tokenizer.json (Split, Isolated) —
+/// o200k's case-aware letter runs without contraction suffixes, single digits.
+pub const TEKKEN_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// qwen3.5: Qwen3.5 tokenizer.json (Split, Isolated) — qwen2's shape with
+/// `[\p{L}\p{M}]+` letter runs and `\p{M}` excluded from the punct class.
+pub const QWEN35_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// deepseek-v3 stage 1: digits (Split, Isolated)
 pub const DEEPSEEK_DIGITS_PATTERN: &str = r"\p{N}{1,3}";
 /// deepseek-v3 stage 2: CJK + Kana literal ranges (Split, Isolated)
@@ -58,6 +66,8 @@ static RE_CL100K: LazyLock<Regex> = LazyLock::new(|| Regex::new(CL100K_PATTERN).
 static RE_O200K: LazyLock<Regex> = LazyLock::new(|| Regex::new(O200K_PATTERN).unwrap());
 static RE_QWEN2: LazyLock<Regex> = LazyLock::new(|| Regex::new(QWEN2_PATTERN).unwrap());
 static RE_VOYAGE: LazyLock<Regex> = LazyLock::new(|| Regex::new(VOYAGE_PATTERN).unwrap());
+static RE_TEKKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(TEKKEN_PATTERN).unwrap());
+static RE_QWEN35: LazyLock<Regex> = LazyLock::new(|| Regex::new(QWEN35_PATTERN).unwrap());
 static RE_DS_DIGITS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(DEEPSEEK_DIGITS_PATTERN).unwrap());
 static RE_DS_CJK: LazyLock<Regex> = LazyLock::new(|| Regex::new(DEEPSEEK_CJK_PATTERN).unwrap());
@@ -169,6 +179,22 @@ pub const VOYAGE: Scheme = Scheme {
     ],
 };
 
+pub const TEKKEN: Scheme = Scheme {
+    name: "tekken",
+    stages: &[
+        Stage::Re { re: &RE_TEKKEN, behavior: Behavior::Isolated, invert: false },
+        Stage::ByteLevel { add_prefix_space: false, use_regex: false },
+    ],
+};
+
+pub const QWEN35: Scheme = Scheme {
+    name: "qwen35",
+    stages: &[
+        Stage::Re { re: &RE_QWEN35, behavior: Behavior::Isolated, invert: false },
+        Stage::ByteLevel { add_prefix_space: false, use_regex: false },
+    ],
+};
+
 pub const DEEPSEEK: Scheme = Scheme {
     name: "deepseek",
     stages: &[
@@ -203,8 +229,10 @@ pub const FALCON: Scheme = Scheme {
     ],
 };
 
-pub const ALL_SCHEMES: [&Scheme; 9] =
-    [&R50K, &CL100K, &O200K, &QWEN2, &VOYAGE, &DEEPSEEK, &SMOLLM, &BERT, &FALCON];
+pub const ALL_SCHEMES: [&Scheme; 11] = [
+    &R50K, &CL100K, &O200K, &QWEN2, &VOYAGE, &TEKKEN, &QWEN35, &DEEPSEEK, &SMOLLM, &BERT,
+    &FALCON,
+];
 
 // ---------------------------------------------------------------------------
 // Engine
@@ -382,11 +410,11 @@ fn apply_stage(input: &str, stage: &Stage, p: Piece) -> Vec<Piece> {
                 })
                 .collect()
         }
-        Stage::ByteLevel { add_prefix_space, use_regex } => {
+        Stage::ByteLevel { use_regex, .. } => {
             let text = piece_text(input, &p);
-            // Prepend happens per existing split in HF; we approximate at
-            // input level (see module doc) — per-piece it only matters for
-            // aps=true + Sequence pipelines, which no canonical scheme uses.
+            // `add_prefix_space` is honoured in `pretokens` (one input-level
+            // prepend; HF does it per existing split — see module doc — which
+            // only differs for aps=true + Sequence pipelines, none canonical).
             if *use_regex {
                 let splits = find_matches(&RE_R50K, &text);
                 apply_behavior(splits, Behavior::Isolated)
@@ -482,4 +510,28 @@ pub fn pretokens(scheme: &Scheme, text: &str) -> Vec<Vec<u8>> {
         .map(|p| input.as_bytes()[p.start..p.end].to_vec())
         .filter(|v| !v.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const APS: Scheme = Scheme {
+        name: "aps",
+        stages: &[Stage::ByteLevel { add_prefix_space: true, use_regex: true }],
+    };
+
+    fn strs(v: Vec<Vec<u8>>) -> Vec<String> {
+        v.into_iter().map(|b| String::from_utf8(b).unwrap()).collect()
+    }
+
+    /// HF ByteLevel `add_prefix_space`: prepend a space unless the text
+    /// already starts with one.
+    #[test]
+    fn byte_level_add_prefix_space() {
+        assert_eq!(strs(pretokens(&APS, "Hello world")), [" Hello", " world"]);
+        assert_eq!(strs(pretokens(&APS, " Hello")), [" Hello"]);
+        assert_eq!(strs(pretokens(&APS, "  x")), [" ", " x"]);
+        assert_eq!(strs(pretokens(&R50K, "Hello world")), ["Hello", " world"]);
+    }
 }

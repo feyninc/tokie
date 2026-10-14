@@ -10,11 +10,16 @@
 //! 4. Fuzz differential — short strings (scalar `Core` path) and long,
 //!    mostly-ASCII strings (the SIMD `Mask` batch path).
 //!
+//! Every `Mask` scheme runs under each classification backend the host
+//! supports (`MaskIsa::Scalar`/`Base`/`Avx2`), so AVX2 is covered without
+//! `PRETOKIE_ISA`.
+//!
 //! Every scheme matches the oracle on all layers; nothing is `#[ignore]`d.
 //! The divergence classes fixed to get here are listed in
 //! `docs/pretokie-v2/00-oracle-engine.md` §4b.
 
 use pretokie::oracle::{self, Scheme};
+use pretokie::MaskIsa;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -188,57 +193,87 @@ fn edge_cases(scheme: &str) -> Vec<&'static str> {
             "（括弧）「引用」 ⁅x⁆ «a» ‹b›",
             "ctl\u{1}inside\u{7f}word vt\u{b}ff\u{c}end",
         ]),
-        "falcon" => cases.extend(vec![
-            "1234567 890 12 345a",
-            "a1b2c3d4",
-            "Hello, world! How are you?!?",
-            "x  1 y22 z333",
+        "tekken" => cases.extend(vec![
+            "JSONParser iPhone XMLHttpRequest parseJSON MacBookPro",
+            "path/to/file //usr/bin /slash/run\n/x",
+            "1234567 89012345",
+            "IT'S DON'T O'BILL don't",
+            "XylemPhloem xylemPhloem XYLEM 한Q ǅungla ʰa",
+        ]),
+        "qwen35" => cases.extend(vec![
+            "1234567890 a1b2c3",
+            "IT'S DON'T O'BILL",
+            "text...\n\nmore\n",
+            "~abc ~123",
+            "combining\u{301}\u{301} \u{301}x +\u{301}y \u{903}z",
+            "हिन्दी नमस्ते ภาษาไทย",
         ]),
         _ => {}
     }
     cases
 }
 
-/// pretokie implementation for an oracle scheme name. Qwen2's pattern is
-/// byte-identical to Voyage's, and tokie serves it with `Voyage`
+/// Every Mask classification backend runnable on this host.
+fn isas() -> Vec<MaskIsa> {
+    [MaskIsa::Scalar, MaskIsa::Base, MaskIsa::Avx2]
+        .into_iter()
+        .filter(|i| i.supported())
+        .collect()
+}
+
+/// pretokie implementation for an oracle scheme name, under `isa`. Qwen2's
+/// pattern is byte-identical to Voyage's, and tokie serves it with `Voyage`
 /// (`hf.rs` detection); `pretokie::Qwen` is the Qwen3.5 variant
-/// (`[\p{L}\p{M}]+` letter runs), which this pattern does not describe.
-fn run_pretokie(scheme: &str, text: &str) -> Vec<Vec<u8>> {
+/// (`[\p{L}\p{M}]+` letter runs), tested as `qwen35`. Falcon-style models
+/// are served by tokie's regex fallback, so pretokie has no falcon scheme;
+/// the oracle's `FALCON` is only cross-checked against HF
+/// (`scripts/verify_oracle.py`). `Bert` is not a `Mask`, so `isa` is ignored.
+fn run_pretokie(scheme: &str, text: &str, isa: MaskIsa) -> Vec<Vec<u8>> {
+    macro_rules! mask {
+        ($ty:ident) => {
+            pretokie::$ty::with_isa(text, isa).map(|p| p.as_bytes().to_vec()).collect()
+        };
+    }
     match scheme {
-        "r50k" => pretokie::Gpt2::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "cl100k" => pretokie::Cl100k::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "o200k" => pretokie::O200k::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "qwen2" => pretokie::Voyage::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "voyage" => pretokie::Voyage::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "deepseek" => pretokie::DeepSeek::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "smollm" => pretokie::SmolLM::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "r50k" => mask!(Gpt2),
+        "cl100k" => mask!(Cl100k),
+        "o200k" => mask!(O200k),
+        "qwen2" | "voyage" => mask!(Voyage),
+        "tekken" => mask!(Tekken),
+        "qwen35" => mask!(Qwen),
+        "deepseek" => mask!(DeepSeek),
+        "smollm" => mask!(SmolLM),
         "bert" => pretokie::Bert::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        // Falcon-style models are served by the regex fallback in tokie;
-        // pretokie has no hand-written falcon scheme. The oracle still
-        // exercises it via examples/dump.rs for goldens.
-        "falcon" => Vec::new(),
         other => panic!("unknown scheme {other}"),
     }
 }
 
 /// Compare one scheme on one input; returns Err with a diff on mismatch.
+/// Every host-supported `MaskIsa` is checked against the same oracle output.
 fn diff_case(scheme: &Scheme, text: &str) -> Result<(), String> {
     let expected = oracle::pretokens(scheme, text);
-    let got = run_pretokie(scheme.name, text);
-    if expected == got {
-        return Ok(());
+    for isa in isas() {
+        let got = run_pretokie(scheme.name, text, isa);
+        if expected != got {
+            return Err(format!("[{isa:?}] {}", diff_pieces(&expected, &got)));
+        }
     }
+    Ok(())
+}
+
+/// Readable first-difference message for two pretoken lists.
+fn diff_pieces(expected: &[Vec<u8>], got: &[Vec<u8>]) -> String {
     // Find first difference for a readable message.
     let i = expected.iter().zip(got.iter()).position(|(a, b)| a != b);
     let show = |v: &[Vec<u8>]| {
         v.iter().map(|b| String::from_utf8_lossy(b).escape_debug().to_string()).collect::<Vec<_>>()
     };
-    let (expected, got) = (show(&expected), show(&got));
+    let (expected, got) = (show(expected), show(got));
     let ctx = |v: &[String], i: usize| {
         let lo = i.saturating_sub(2);
         v[lo..(i + 3).min(v.len())].join(", ")
     };
-    Err(match i {
+    match i {
         Some(i) => format!(
             "first diff at pretoken {i}:\n  oracle: [{}]\n  pretokie: [{}]",
             ctx(&expected, i),
@@ -251,7 +286,7 @@ fn diff_case(scheme: &Scheme, text: &str) -> Result<(), String> {
             &expected[..expected.len().min(6)],
             &got[..got.len().min(6)],
         ),
-    })
+    }
 }
 
 macro_rules! scheme_golden {
@@ -280,6 +315,8 @@ scheme_golden!(golden_deepseek, &oracle::DEEPSEEK);
 scheme_golden!(golden_smollm, &oracle::SMOLLM);
 scheme_golden!(golden_bert, &oracle::BERT);
 scheme_golden!(golden_voyage, &oracle::VOYAGE);
+scheme_golden!(golden_tekken, &oracle::TEKKEN);
+scheme_golden!(golden_qwen35, &oracle::QWEN35);
 
 // ---------------------------------------------------------------------------
 // 3. Data-file goldens (chunked enwik8 / OWT)
@@ -317,7 +354,7 @@ fn data_golden(scheme: &Scheme, file: &str) -> Result<(), String> {
         .join(file);
     let data = match std::fs::read(&path) {
         Ok(d) => d,
-        Err(_) => return Err(format!("data file missing: {}", path.display())),
+        Err(_) => return Err(format!("SKIPPED: {} missing", path.display())),
     };
     let cap = golden_bytes();
     let mut failures = 0u32;
@@ -351,7 +388,12 @@ macro_rules! data_golden_test {
         fn $fn_name() {
             match data_golden($scheme, $file) {
                 Ok(()) => {}
-                Err(e) if e.starts_with("data file missing") => eprintln!("skipped: {e}"),
+                Err(e) if e.starts_with("SKIPPED") => {
+                    if std::env::var_os("PRETOKIE_REQUIRE_DATA").is_some() {
+                        panic!("{e} and PRETOKIE_REQUIRE_DATA is set");
+                    }
+                    eprintln!("{e}");
+                }
                 Err(e) => panic!("{e}"),
             }
         }
@@ -367,6 +409,8 @@ data_golden_test!(data_deepseek, &oracle::DEEPSEEK, "enwik8");
 data_golden_test!(data_smollm, &oracle::SMOLLM, "enwik8");
 data_golden_test!(data_bert, &oracle::BERT, "enwik8");
 data_golden_test!(data_voyage, &oracle::VOYAGE, "enwik8");
+data_golden_test!(data_tekken, &oracle::TEKKEN, "enwik8");
+data_golden_test!(data_qwen35, &oracle::QWEN35, "enwik8");
 data_golden_test!(data_cl100k_owt, &oracle::CL100K, "owt_sample.txt");
 data_golden_test!(data_o200k_owt, &oracle::O200K, "owt_sample.txt");
 data_golden_test!(data_qwen2_owt, &oracle::QWEN2, "owt_sample.txt");
@@ -374,6 +418,8 @@ data_golden_test!(data_deepseek_owt, &oracle::DEEPSEEK, "owt_sample.txt");
 data_golden_test!(data_smollm_owt, &oracle::SMOLLM, "owt_sample.txt");
 data_golden_test!(data_bert_owt, &oracle::BERT, "owt_sample.txt");
 data_golden_test!(data_voyage_owt, &oracle::VOYAGE, "owt_sample.txt");
+data_golden_test!(data_tekken_owt, &oracle::TEKKEN, "owt_sample.txt");
+data_golden_test!(data_qwen35_owt, &oracle::QWEN35, "owt_sample.txt");
 
 // ---------------------------------------------------------------------------
 // 4. Fuzz differential: random strings vs the oracle
@@ -465,6 +511,8 @@ fuzz_golden!(fuzz_deepseek, &oracle::DEEPSEEK, false);
 fuzz_golden!(fuzz_smollm, &oracle::SMOLLM, false);
 fuzz_golden!(fuzz_bert, &oracle::BERT, false);
 fuzz_golden!(fuzz_voyage, &oracle::VOYAGE, false);
+fuzz_golden!(fuzz_tekken, &oracle::TEKKEN, false);
+fuzz_golden!(fuzz_qwen35, &oracle::QWEN35, false);
 
 fuzz_golden!(fuzz_long_r50k, &oracle::R50K, true);
 fuzz_golden!(fuzz_long_cl100k, &oracle::CL100K, true);
@@ -474,3 +522,5 @@ fuzz_golden!(fuzz_long_deepseek, &oracle::DEEPSEEK, true);
 fuzz_golden!(fuzz_long_smollm, &oracle::SMOLLM, true);
 fuzz_golden!(fuzz_long_bert, &oracle::BERT, true);
 fuzz_golden!(fuzz_long_voyage, &oracle::VOYAGE, true);
+fuzz_golden!(fuzz_long_tekken, &oracle::TEKKEN, true);
+fuzz_golden!(fuzz_long_qwen35, &oracle::QWEN35, true);

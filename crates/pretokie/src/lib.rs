@@ -10,6 +10,17 @@
 //! let pieces: Vec<&str> = Gpt2::new("Hello world").collect();
 //! assert_eq!(pieces, vec!["Hello", " world"]);
 //! ```
+//!
+//! # SIMD backend (`PRETOKIE_ISA`)
+//!
+//! [`Mask`]-based pretokenizers classify 64-byte batches with SIMD: NEON on
+//! aarch64, SSE2 on x86_64 (AVX2 is supported but opt-in). The
+//! `PRETOKIE_ISA` environment variable overrides the backend:
+//! `scalar` (no SIMD), `base` / `sse2` / `neon` (baseline, the default), or
+//! `avx2` (x86_64, runtime-detected). It is read once per process, on the
+//! first `Mask` construction, and cached; unsupported or unknown values fall
+//! back to the default. It is meant for benchmarking and differential
+//! testing — output is byte-identical across backends.
 
 mod core;
 mod configs;
@@ -18,7 +29,8 @@ pub mod util;
 
 /// Dev-only HuggingFace oracle (requires the `oracle` feature). See
 /// `docs/pretokie-v2/00-oracle-engine.md`; never part of published builds'
-/// default features.
+/// default features. Hidden from docs: semver-exempt test infrastructure.
+#[doc(hidden)]
 #[cfg(feature = "oracle")]
 pub mod oracle;
 

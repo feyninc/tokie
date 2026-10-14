@@ -5,9 +5,15 @@
 //! - Each punctuation character (ASCII punct or Unicode P) is a separate piece:
 //!   "..." → [".", ".", "."]
 //! - Everything else stays together in words: "18th" → ["18th"], "€100" → ["€100"]
+//! - Control characters (other than whitespace) are not delimiters: they stay
+//!   inside the surrounding word, as in HF
 //! - CJK ideographs are NOT split here: HF isolates them in `BertNormalizer`
 //!   (`handle_chinese_chars`) before pretokenization, and so does tokie's normalizer
 //! - No contractions, no space prefix
+//!
+//! **Changed in 0.2.0:** earlier versions isolated each CJK ideograph as its
+//! own piece. To get the old behaviour, pad CJK chars with spaces before
+//! calling [`Bert`] (or use tokie's BERT normalizer, which does it for you).
 
 use crate::util::decode_utf8;
 use unicode_general_category::{get_general_category, GeneralCategory};
@@ -45,6 +51,10 @@ fn is_unicode_punct(c: char) -> bool {
     )
 }
 
+/// HF `BertPreTokenizer`: splits on whitespace (dropped) and isolates each
+/// punctuation char. Does **not** isolate CJK ideographs (since 0.2.0) —
+/// pre-pad them yourself, or normalize with tokie's BERT normalizer
+/// (`handle_chinese_chars`), as HF does.
 pub struct Bert<'a> {
     bytes: &'a [u8],
     pos: usize,
