@@ -464,8 +464,31 @@ const FUZZ_ASCII: &[&str] = &[
     "\u{1b}", "\u{7f}",
 ];
 
+/// Non-Latin alphabet for the unicode long fuzz: case pairs (Cyrillic,
+/// Greek, Latin-1, Lt), caseless Lo/Lm letters (CJK, Hangul, Kana, Thai,
+/// Devanagari, Arabic, `ʰ`, `ª`), marks after letters and alone (Mn/Mc),
+/// non-ASCII digits, NBSP, and the ASCII uppercase/apostrophe chars the
+/// CamelCase split and contraction rules react to.
+const FUZZ_UNI: &[&str] = &[
+    "Ж", "ж", "Λ", "λ", "É", "é", "ǅ", "ß", "ʰ", "ª", "中", "日", "한", "ア", "ก", "\u{e31}",
+    "क", "\u{94d}", "\u{93e}", "ا", "\u{64e}", "\u{301}", "١", "½", "Ⅷ", "\u{a0}", "「",
+    "A", "Q", "x", "'", "s", "t", " ", " ", ".",
+];
+
 /// Short strings (≤ 40 picks) hit only `Core` — `Mask` needs 65 bytes for a
 /// SIMD batch; long ones (64..640 picks, 7/8 ASCII) exercise the mask algebra.
+/// Long strings (64..640 picks), half from [`FUZZ_UNI`]: keeps non-Latin
+/// letters, marks and case changes inside `Mask`'s 64-byte batches.
+fn fuzz_uni_one(rng: &mut Rng) -> String {
+    let len = 64 + rng.below(576);
+    let mut s = String::new();
+    for _ in 0..len {
+        let alpha = if rng.below(2) == 0 { FUZZ_UNI } else { FUZZ_ASCII };
+        s.push_str(alpha[rng.below(alpha.len())]);
+    }
+    s
+}
+
 fn fuzz_one(long: bool, rng: &mut Rng) -> String {
     let len = if long { 64 + rng.below(576) } else { 1 + rng.below(40) };
     let mut s = String::new();
@@ -524,3 +547,39 @@ fuzz_golden!(fuzz_long_bert, &oracle::BERT, true);
 fuzz_golden!(fuzz_long_voyage, &oracle::VOYAGE, true);
 fuzz_golden!(fuzz_long_tekken, &oracle::TEKKEN, true);
 fuzz_golden!(fuzz_long_qwen35, &oracle::QWEN35, true);
+
+macro_rules! fuzz_uni_golden {
+    ($fn_name:ident, $scheme:expr) => {
+        #[test]
+        fn $fn_name() {
+            let scheme: &Scheme = $scheme;
+            let iters: u32 = std::env::var("PRETOKIE_FUZZ_ITERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300);
+            let mut rng = Rng(0xA0761D6478BD642F);
+            let mut failures = Vec::new();
+            for i in 0..(iters / 10).max(30) {
+                let s = fuzz_uni_one(&mut rng);
+                if let Err(diff) = diff_case(scheme, &s) {
+                    failures.push(format!("iter {i} {s:?}: {diff}"));
+                    if failures.len() >= 5 {
+                        break;
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{} fuzz failures:\n{}", failures.len(), failures.join("\n"));
+        }
+    };
+}
+
+fuzz_uni_golden!(fuzz_uni_r50k, &oracle::R50K);
+fuzz_uni_golden!(fuzz_uni_cl100k, &oracle::CL100K);
+fuzz_uni_golden!(fuzz_uni_o200k, &oracle::O200K);
+fuzz_uni_golden!(fuzz_uni_qwen2, &oracle::QWEN2);
+fuzz_uni_golden!(fuzz_uni_deepseek, &oracle::DEEPSEEK);
+fuzz_uni_golden!(fuzz_uni_smollm, &oracle::SMOLLM);
+fuzz_uni_golden!(fuzz_uni_bert, &oracle::BERT);
+fuzz_uni_golden!(fuzz_uni_voyage, &oracle::VOYAGE);
+fuzz_uni_golden!(fuzz_uni_tekken, &oracle::TEKKEN);
+fuzz_uni_golden!(fuzz_uni_qwen35, &oracle::QWEN35);

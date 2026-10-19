@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 
 use crate::core::config::*;
-use crate::util::{is_cjk_char, ascii_letter_run, decode_utf8, is_ascii_letter, is_digit, is_lower, is_punct_or_symbol, is_tab_like, is_upper, is_unicode_letter, is_unicode_mark};
+use crate::util::{class_of, cls, is_cjk_char, ascii_letter_run, decode_utf8, is_ascii_letter, is_digit, is_lower, is_punct_or_symbol, is_tab_like, is_upper, is_unicode_letter, is_unicode_mark};
 
 pub struct Core<'a, C: PretokConfig> {
     bytes: &'a [u8],
@@ -49,22 +49,22 @@ impl<'a, C: PretokConfig> Core<'a, C> {
         loop {
             // SWAR fast path: consume whole ASCII-letter runs 8 bytes at a time
             self.pos += ascii_letter_run(&self.bytes[self.pos..self.len]);
-            if self.pos >= self.len {
-                return;
-            }
-            let b = self.at(self.pos);
-            if b >= 0x80 {
-                let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
-                if Self::isolated_cjk(ch) {
+            // Non-ASCII letters: stay here until an ASCII byte, so non-Latin
+            // words don't re-enter the SWAR probe for every char.
+            loop {
+                if self.pos >= self.len {
                     return;
-                } else if C::LETTER_MODE == LetterMode::PlainWithMarks {
-                    if crate::util::is_alpha(ch) || is_unicode_mark(ch) {
-                        self.pos += cl;
-                    } else { return; }
-                } else {
-                    if is_unicode_letter(ch) { self.pos += cl; } else { return; }
                 }
-            } else {
+                if self.at(self.pos) < 0x80 {
+                    break;
+                }
+                let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
+                if !Self::is_letter_char(ch) { // also stops at an isolated CJK char
+                    return;
+                }
+                self.pos += cl;
+            }
+            if !is_ascii_letter(self.at(self.pos)) {
                 return;
             }
         }
@@ -195,7 +195,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
                         self.pos += 1;
                     } else if b >= 0x80 {
                         let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
-                        if ch.is_numeric() { self.pos += cl; } else { break; }
+                        if crate::util::is_numeric(ch) { self.pos += cl; } else { break; }
                     } else {
                         break;
                     }
@@ -211,7 +211,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
                         count += 1;
                     } else if b >= 0x80 {
                         let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
-                        if ch.is_numeric() { self.pos += cl; count += 1; } else { break; }
+                        if crate::util::is_numeric(ch) { self.pos += cl; count += 1; } else { break; }
                     } else {
                         break;
                     }
@@ -277,9 +277,11 @@ impl<'a, C: PretokConfig> Core<'a, C> {
             // Qwen3.5 ` ?[^\s\p{L}\p{M}\p{N}]+`. O200K's ` ?[^\s\p{L}\p{N}]+`
             // keeps marks in the run (" ❤️" is one piece), so it takes the
             // default branch.
-            !crate::util::is_alpha(ch) && !ch.is_numeric() && !ch.is_whitespace() && !is_unicode_mark(ch)
+            class_of(ch) & (cls::ALPHA | cls::NUMERIC | cls::WS | cls::MARK) == 0
         } else {
-            !is_unicode_letter(ch) && !ch.is_numeric() && !ch.is_whitespace()
+            // `!is_unicode_letter`: not ALPHA, or ALPHA and MARK.
+            let k = class_of(ch);
+            k & (cls::ALPHA | cls::MARK) != cls::ALPHA && k & (cls::NUMERIC | cls::WS) == 0
         }
     }
 
@@ -343,7 +345,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
                 // SmolLM: don't back up before numerics (\p{N} incl. ½, ¹)
                 let next = self.at(self.pos);
                 let is_num = is_digit(next)
-                    || (next >= 0x80 && decode_utf8(&self.bytes[self.pos..]).0.is_numeric());
+                    || (next >= 0x80 && crate::util::is_numeric(decode_utf8(&self.bytes[self.pos..]).0));
                 if !is_num {
                     self.pos = prev_pos;
                 }
@@ -386,7 +388,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
                 let split_off = is_digit(next)
                     || (next >= 0x80
                         && (Self::is_cjk_start(&self.bytes[self.pos..])
-                            || decode_utf8(&self.bytes[self.pos..]).0.is_numeric()));
+                            || crate::util::is_numeric(decode_utf8(&self.bytes[self.pos..]).0)));
                 if !split_off {
                     self.pos = prev_pos;
                 }
@@ -461,7 +463,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
         if Self::isolated_cjk(ch) {
             false
         } else if C::LETTER_MODE == LetterMode::PlainWithMarks || C::LETTER_MODE == LetterMode::CamelCase {
-            crate::util::is_alpha(ch) || is_unicode_mark(ch)
+            class_of(ch) & (cls::ALPHA | cls::MARK) != 0
         } else {
             is_unicode_letter(ch)
         }
@@ -479,6 +481,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
             let clen = self.check_contraction();
             if clen > 0 { self.pos += clen; }
         } else {
+            self.pos += ch.len_utf8(); // `ch` is a letter: checked by the caller
             self.scan_letters();
         }
     }
@@ -533,7 +536,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
         let gap = !is_cjk_char(ch)
             && !crate::util::is_alpha(ch)
             && !is_unicode_mark(ch)
-            && !ch.is_numeric()
+            && !crate::util::is_numeric(ch)
             && !ch.is_whitespace()
             && !is_punct_or_symbol(ch);
         if gap { cl } else { 0 }
@@ -655,17 +658,18 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                             let clen = self.check_contraction();
                             if clen > 0 { self.pos += clen; }
                         } else {
+                            self.pos += ch.len_utf8(); // checked by `is_letter_char` above
                             self.scan_letters();
                             if let Some(piece) = self.handle_post_letters(start) {
                                 return Some(piece);
                             }
                         }
-                    } else if ch.is_numeric() && C::SPACE_PREFIXES_DIGITS {
+                    } else if crate::util::is_numeric(ch) && C::SPACE_PREFIXES_DIGITS {
                         // GPT-2 ` ?\p{N}+`: space attaches to a numeric run (incl. ¹, ❶)
                         let (_, cl) = decode_utf8(&self.bytes[self.pos + 1..]);
                         self.pos += 1 + cl;
                         self.scan_digits();
-                    } else if ch.is_whitespace() || ch.is_numeric() || Self::isolated_cjk(ch) {
+                    } else if ch.is_whitespace() || crate::util::is_numeric(ch) || Self::isolated_cjk(ch) {
                         self.scan_whitespace();
                     } else {
                         self.pos += 1;
@@ -729,7 +733,7 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                 self.scan_camel_letter(ch);
                 let clen = self.check_contraction();
                 if clen > 0 { self.pos += clen; }
-            } else if ch.is_numeric() {
+            } else if crate::util::is_numeric(ch) {
                 self.pos += cl;
                 self.scan_digits();
             } else if ch.is_whitespace() {
@@ -842,6 +846,7 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                             let clen = self.check_contraction();
                             if clen > 0 { self.pos += clen; }
                         } else {
+                            self.pos += ch.len_utf8(); // checked by `is_letter_char` above
                             self.scan_letters();
                             if let Some(piece) = self.handle_post_letters(start) {
                                 return Some(piece);

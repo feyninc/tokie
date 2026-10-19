@@ -102,7 +102,7 @@ pub fn decode_utf8(bytes: &[u8]) -> (char, usize) {
 /// above now return `false` (previously `true`).
 #[inline(always)]
 pub fn is_unicode_letter(c: char) -> bool {
-    is_alpha(c) && !is_unicode_mark(c)
+    class_of(c) & (cls::ALPHA | cls::MARK) == cls::ALPHA
 }
 
 /// `char::is_alphabetic()` minus letter numbers (Nl: `Ⅲ`, `ⅰ`, `〇`), which
@@ -112,9 +112,19 @@ pub fn is_unicode_letter(c: char) -> bool {
 /// letters and marks.
 #[inline(always)]
 pub fn is_alpha(c: char) -> bool {
-    c.is_alphabetic()
-        && !c.is_numeric()
-        && !matches!(c as u32, 0x24B6..=0x24E9 | 0x1F130..=0x1F189)
+    if (c as u32) < 0x80 {
+        return is_ascii_letter(c as u8);
+    }
+    class_of(c) & cls::ALPHA != 0
+}
+
+/// `char::is_numeric()` (`\p{N}`: Nd/Nl/No) from the class table.
+#[inline(always)]
+pub(crate) fn is_numeric(c: char) -> bool {
+    if (c as u32) < 0x80 {
+        return is_digit(c as u8);
+    }
+    class_of(c) & cls::NUMERIC != 0
 }
 
 /// Check if a Unicode char is in \p{P} or \p{S} (punctuation or symbol).
@@ -130,49 +140,168 @@ pub fn is_alpha(c: char) -> bool {
 /// treated as letters).
 #[inline]
 pub fn is_punct_or_symbol(c: char) -> bool {
-    !is_alpha(c)
-        && !c.is_numeric()
-        && !c.is_whitespace()
-        && !c.is_control()
-        && !is_unicode_mark(c)
-        && !is_format_or_private(c)
+    class_of(c) & cls::NOT_PUNCT == 0
 }
 
 /// Check if a Unicode char is a format (Cf) or private-use (Co) character.
 #[inline]
 pub fn is_format_or_private(c: char) -> bool {
-    let cp = c as u32;
-    matches!(cp,
-        0x00AD |                        // soft hyphen
-        0x0600..=0x0605 | 0x061C |      // Arabic format marks
-        0x06DD | 0x070F | 0x08E2 |
-        0x180E |                        // Mongolian vowel separator
-        0x200B..=0x200F |               // ZWSP..RLM
-        0x202A..=0x202E |               // bidi embeddings
-        0x2060..=0x2064 |               // word joiner..invisible plus
-        0x2066..=0x206F |               // bidi isolates
-        0xFEFF |                        // ZWNBSP/BOM
-        0xFFF9..=0xFFFB |               // interlinear annotation
-        0x110BD | 0x110CD |
-        0x13430..=0x1343F |
-        0x1BCA0..=0x1BCA3 |
-        0x1D173..=0x1D17A |
-        0xE0001 | 0xE0020..=0xE007F |   // tags
-        0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD  // private use
-    )
+    class_of(c) & cls::FMT != 0
 }
 
 /// Check if a Unicode character is a combining/spacing mark (M category).
 #[inline]
 pub fn is_unicode_mark(c: char) -> bool {
-    let cp = c as u32;
     // Fast reject: everything below the first combining block (covers all ASCII
     // and Latin-1, i.e. the overwhelming majority of real text)
-    if cp < 0x0300 {
+    if (c as u32) < 0x0300 {
         return false;
     }
-    let idx = MARK_RANGES.partition_point(|&(lo, _)| lo <= cp);
-    idx > 0 && cp <= MARK_RANGES[idx - 1].1
+    class_of(c) & cls::MARK != 0
+}
+
+/// Bits of a [`class_of`] byte. Each bit caches one of the `reference`
+/// predicates, so one table read answers all of them.
+pub(crate) mod cls {
+    /// [`super::is_alpha`]
+    pub const ALPHA: u8 = 1 << 0;
+    /// [`super::is_unicode_mark`]
+    pub const MARK: u8 = 1 << 1;
+    /// `char::is_numeric`
+    pub const NUMERIC: u8 = 1 << 2;
+    /// `char::is_whitespace`
+    pub const WS: u8 = 1 << 3;
+    /// `char::is_control`
+    pub const CONTROL: u8 = 1 << 4;
+    /// [`super::is_format_or_private`]
+    pub const FMT: u8 = 1 << 5;
+    /// The top two bits hold [`super::camel_class`].
+    pub const CAMEL_SHIFT: u32 = 6;
+    /// Any of these set means not [`super::is_punct_or_symbol`].
+    pub const NOT_PUNCT: u8 = ALPHA | MARK | NUMERIC | WS | CONTROL | FMT;
+}
+
+/// Class byte of `c` (see [`cls`]): one two-level table read in place of
+/// the std skip-list searches (`is_alphabetic`, `is_numeric`) and the mark
+/// binary search. Generated from `reference` and checked against it for
+/// every code point by `class_table_matches_reference`.
+#[inline(always)]
+pub(crate) fn class_of(c: char) -> u8 {
+    use crate::unicode_class::{BLOCKS, INDEX, SHIFT};
+    let cp = c as u32;
+    let block = INDEX[(cp >> SHIFT) as usize] as usize;
+    let at = (block << SHIFT) | (cp & ((1 << SHIFT) - 1)) as usize;
+    debug_assert!(at < BLOCKS.len());
+    // SAFETY: every INDEX entry is a block id below BLOCKS.len() >> SHIFT
+    // (checked by `class_table_matches_reference`) and the in-block offset
+    // is below 1 << SHIFT.
+    unsafe { *BLOCKS.get_unchecked(at) }
+}
+
+/// The original predicate implementations: the source of the class table
+/// and the oracle it is tested against. Slow (std skip-lists, a binary
+/// search over [`MARK_RANGES`]); not for hot paths.
+#[cfg_attr(not(test), allow(dead_code))]
+mod reference {
+    use super::MARK_RANGES;
+
+    pub fn is_alpha(c: char) -> bool {
+        c.is_alphabetic()
+            && !c.is_numeric()
+            && !matches!(c as u32, 0x24B6..=0x24E9 | 0x1F130..=0x1F189)
+    }
+
+    pub fn is_format_or_private(c: char) -> bool {
+        let cp = c as u32;
+        matches!(cp,
+            0x00AD |                        // soft hyphen
+            0x0600..=0x0605 | 0x061C |      // Arabic format marks
+            0x06DD | 0x070F | 0x08E2 |
+            0x180E |                        // Mongolian vowel separator
+            0x200B..=0x200F |               // ZWSP..RLM
+            0x202A..=0x202E |               // bidi embeddings
+            0x2060..=0x2064 |               // word joiner..invisible plus
+            0x2066..=0x206F |               // bidi isolates
+            0xFEFF |                        // ZWNBSP/BOM
+            0xFFF9..=0xFFFB |               // interlinear annotation
+            0x110BD | 0x110CD |
+            0x13430..=0x1343F |
+            0x1BCA0..=0x1BCA3 |
+            0x1D173..=0x1D17A |
+            0xE0001 | 0xE0020..=0xE007F |   // tags
+            0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD  // private use
+        )
+    }
+
+    pub fn is_unicode_mark(c: char) -> bool {
+        let cp = c as u32;
+        if cp < 0x0300 {
+            return false;
+        }
+        let idx = MARK_RANGES.partition_point(|&(lo, _)| lo <= cp);
+        idx > 0 && cp <= MARK_RANGES[idx - 1].1
+    }
+
+    pub fn camel_class(ch: char) -> u8 {
+        if is_unicode_mark(ch) {
+            return 3;
+        }
+        if !is_alpha(ch) {
+            return 0;
+        }
+        camel_class_of_letter(ch)
+    }
+
+    /// Uses std's `Uppercase`/`Lowercase` properties; they differ from
+    /// Lu/Ll only on the tables below (Other_Lowercase Lm/Lo letters, Lt,
+    /// `ʕ`).
+    pub fn camel_class_of_letter(ch: char) -> u8 {
+        if is_unicode_mark(ch) {
+            3
+        } else if ch.is_uppercase() {
+            1
+        } else if ch.is_lowercase() {
+            if is_other_lowercase_letter(ch) { 3 } else { 2 }
+        } else if is_titlecase(ch) {
+            1
+        } else if ch == '\u{295}' {
+            2 // ʕ: Ll without the Lowercase property
+        } else {
+            3
+        }
+    }
+
+    /// Lm/Lo letters with the Other_Lowercase property (`ª`, `ʰ`, `ᴬ`, …).
+    fn is_other_lowercase_letter(ch: char) -> bool {
+        matches!(ch as u32,
+            0x00AA | 0x00BA | 0x02B0..=0x02B8 | 0x02C0..=0x02C1 | 0x02E0..=0x02E4 | 0x037A
+            | 0x10FC | 0x1D2C..=0x1D6A | 0x1D78 | 0x1D9B..=0x1DBF | 0x2071 | 0x207F
+            | 0x2090..=0x209C | 0x2C7C..=0x2C7D | 0xA69C..=0xA69D | 0xA770 | 0xA7F2..=0xA7F4 | 0xA7F8..=0xA7F9
+            | 0xAB5C..=0xAB5F | 0xAB69 | 0x10780 | 0x10783..=0x10785 | 0x10787..=0x107B0
+            | 0x107B2..=0x107BA | 0x1E030..=0x1E06D
+        )
+    }
+
+    /// Titlecase letters (Lt): neither Uppercase nor Lowercase in std.
+    fn is_titlecase(ch: char) -> bool {
+        matches!(ch as u32,
+            0x01C5 | 0x01C8 | 0x01CB | 0x01F2 | 0x1F88..=0x1F8F | 0x1F98..=0x1F9F
+            | 0x1FA8..=0x1FAF | 0x1FBC | 0x1FCC | 0x1FFC
+        )
+    }
+
+    /// The byte [`super::class_of`] must return for `c`.
+    pub fn class_byte(c: char) -> u8 {
+        use super::cls::*;
+        let mut k = 0;
+        if is_alpha(c) { k |= ALPHA; }
+        if is_unicode_mark(c) { k |= MARK; }
+        if c.is_numeric() { k |= NUMERIC; }
+        if c.is_whitespace() { k |= WS; }
+        if c.is_control() { k |= CONTROL; }
+        if is_format_or_private(c) { k |= FMT; }
+        k | camel_class(c) << CAMEL_SHIFT
+    }
 }
 
 // GENERATED by scripts/gen_unicode_marks.py from Unicode 15.1.0 — do not edit by hand.
@@ -289,59 +418,26 @@ pub fn is_cjk_char(ch: char) -> bool {
 /// `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]`, bit 1 = in `[\p{Ll}\p{Lm}\p{Lo}\p{M}]`
 /// (so Lu/Lt → 1, Ll → 2, Lm/Lo/M → 3), 0 for non-letters (per [`is_alpha`]).
 ///
-/// Uses std's `Uppercase`/`Lowercase` properties (fast tables) instead of a
-/// general-category search. They differ from Lu/Ll only on the tables below
+/// Read from the class table, which takes it from std's
+/// `Uppercase`/`Lowercase` properties plus small exception tables
 /// (Other_Lowercase Lm/Lo letters, Lt, `ʕ`), checked exhaustively against
 /// `unicode-general-category` in `camel_class_matches_general_category`.
 #[inline(always)]
 pub fn camel_class(ch: char) -> u8 {
-    if is_unicode_mark(ch) {
-        return 3;
-    }
-    if !is_alpha(ch) {
-        return 0;
-    }
-    camel_class_of_letter(ch)
+    class_of(ch) >> cls::CAMEL_SHIFT
 }
 
 /// [`camel_class`] for a char already known to be a letter or mark
-/// (`is_alpha(ch) || is_unicode_mark(ch)`) — skips the costly `is_alpha`.
+/// (`is_alpha(ch) || is_unicode_mark(ch)`).
 #[inline(always)]
 pub fn camel_class_of_letter(ch: char) -> u8 {
-    if is_unicode_mark(ch) {
-        3
-    } else if ch.is_uppercase() {
-        1
-    } else if ch.is_lowercase() {
-        if is_other_lowercase_letter(ch) { 3 } else { 2 }
-    } else if is_titlecase(ch) {
-        1
-    } else if ch == '\u{295}' {
-        2 // ʕ: Ll without the Lowercase property
+    let k = class_of(ch);
+    if k & (cls::ALPHA | cls::MARK) != 0 {
+        k >> cls::CAMEL_SHIFT
     } else {
-        3
+        // Outside the documented domain: keep the old answer.
+        reference::camel_class_of_letter(ch)
     }
-}
-
-/// Lm/Lo letters with the Other_Lowercase property (`ª`, `ʰ`, `ᴬ`, …).
-#[inline]
-fn is_other_lowercase_letter(ch: char) -> bool {
-    matches!(ch as u32,
-        0x00AA | 0x00BA | 0x02B0..=0x02B8 | 0x02C0..=0x02C1 | 0x02E0..=0x02E4 | 0x037A
-        | 0x10FC | 0x1D2C..=0x1D6A | 0x1D78 | 0x1D9B..=0x1DBF | 0x2071 | 0x207F
-        | 0x2090..=0x209C | 0x2C7C..=0x2C7D | 0xA69C..=0xA69D | 0xA770 | 0xA7F2..=0xA7F4 | 0xA7F8..=0xA7F9
-        | 0xAB5C..=0xAB5F | 0xAB69 | 0x10780 | 0x10783..=0x10785 | 0x10787..=0x107B0
-        | 0x107B2..=0x107BA | 0x1E030..=0x1E06D
-    )
-}
-
-/// Titlecase letters (Lt): neither Uppercase nor Lowercase in std.
-#[inline]
-fn is_titlecase(ch: char) -> bool {
-    matches!(ch as u32,
-        0x01C5 | 0x01C8 | 0x01CB | 0x01F2 | 0x1F88..=0x1F8F | 0x1F98..=0x1F9F
-        | 0x1FA8..=0x1FAF | 0x1FBC | 0x1FCC | 0x1FFC
-    )
 }
 
 #[cfg(test)]
@@ -372,5 +468,84 @@ mod camel_tests {
             };
             assert_eq!(camel_class(ch), want, "U+{cp:04X} {gc:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod class_table_tests {
+    use super::*;
+
+    /// Every code point's [`class_of`] byte equals [`reference::class_byte`].
+    /// With `PRETOKIE_REGEN_CLASS_TABLE=1` this first rewrites
+    /// `src/unicode_class.rs` from the reference predicates (run it after a
+    /// toolchain update changes std's Unicode tables, or after editing
+    /// `reference`).
+    #[test]
+    fn class_table_matches_reference() {
+        let want: Vec<u8> = (0..0x110000u32)
+            .map(|cp| char::from_u32(cp).map_or(0, reference::class_byte))
+            .collect();
+        if std::env::var_os("PRETOKIE_REGEN_CLASS_TABLE").is_some() {
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/unicode_class.rs");
+            std::fs::write(path, render_table(&want)).unwrap();
+            panic!("regenerated {path}; rebuild and rerun without PRETOKIE_REGEN_CLASS_TABLE");
+        }
+        use crate::unicode_class::{BLOCKS, INDEX, SHIFT};
+        assert_eq!(INDEX.len(), 0x110000 >> SHIFT);
+        assert!(INDEX.iter().all(|&b| ((b as usize) << SHIFT) < BLOCKS.len()));
+        for (cp, &w) in want.iter().enumerate() {
+            let Some(ch) = char::from_u32(cp as u32) else { continue };
+            assert_eq!(class_of(ch), w, "U+{cp:04X}");
+            // The public predicates agree with their reference versions.
+            assert_eq!(is_alpha(ch), reference::is_alpha(ch), "is_alpha U+{cp:04X}");
+            assert_eq!(is_numeric(ch), ch.is_numeric(), "is_numeric U+{cp:04X}");
+            assert_eq!(is_unicode_mark(ch), reference::is_unicode_mark(ch), "mark U+{cp:04X}");
+            assert_eq!(is_format_or_private(ch), reference::is_format_or_private(ch));
+            assert_eq!(camel_class(ch), reference::camel_class(ch), "camel U+{cp:04X}");
+            assert_eq!(camel_class_of_letter(ch), reference::camel_class_of_letter(ch));
+        }
+    }
+
+    /// Render `want` (one class byte per code point) as a deduplicated
+    /// two-level table, picking the block size that minimizes total bytes.
+    fn render_table(want: &[u8]) -> String {
+        let (shift, index, blocks) = (4..=9)
+            .map(|shift| {
+                let size = 1usize << shift;
+                let mut blocks: Vec<&[u8]> = Vec::new();
+                let mut seen = std::collections::HashMap::new();
+                let index: Vec<u16> = want
+                    .chunks(size)
+                    .map(|c| {
+                        *seen.entry(c).or_insert_with(|| {
+                            blocks.push(c);
+                            (blocks.len() - 1) as u16
+                        })
+                    })
+                    .collect();
+                (shift, index, blocks)
+            })
+            .min_by_key(|(shift, index, blocks)| index.len() * 2 + (blocks.len() << shift))
+            .unwrap();
+        let mut s = String::new();
+        s += "// GENERATED by `PRETOKIE_REGEN_CLASS_TABLE=1 cargo test -p pretokie --lib\n";
+        s += "// class_table_matches_reference` from `util::reference` — do not edit by hand.\n";
+        s += "// One `util::cls` byte per code point: BLOCKS[(INDEX[cp >> SHIFT] << SHIFT) | (cp & mask)].\n\n";
+        s += &format!("pub(crate) const SHIFT: u32 = {shift};\n\n");
+        s += &format!("pub(crate) static INDEX: [u16; {}] = [\n", index.len());
+        for row in index.chunks(24) {
+            let r: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+            s += &format!("    {},\n", r.join(", "));
+        }
+        s += "];\n\n";
+        s += &format!("pub(crate) static BLOCKS: [u8; {}] = [\n", blocks.len() << shift);
+        for b in &blocks {
+            for row in b.chunks(32) {
+                let r: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                s += &format!("    {},\n", r.join(", "));
+            }
+        }
+        s += "];\n";
+        s
     }
 }

@@ -26,6 +26,7 @@ mod core;
 mod configs;
 mod impls;
 pub mod util;
+mod unicode_class;
 
 /// Dev-only HuggingFace oracle (requires the `oracle` feature). See
 /// `docs/pretokie-v2/00-oracle-engine.md`; never part of published builds'

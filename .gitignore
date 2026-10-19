@@ -42,3 +42,4 @@ benchmark_results.json
 
 # Claude Code session state and agent worktrees
 .claude/
+research/*

@@ -576,12 +576,12 @@ enum UClass {
 
 #[inline(always)]
 fn uclass<C: PretokConfig>(ch: char) -> UClass {
-    use crate::util::{is_punct_or_symbol, is_unicode_letter, is_unicode_mark};
+    use crate::util::cls;
+    // One table read answers every predicate below.
+    let k = crate::util::class_of(ch);
     let letter = match C::LETTER_MODE {
-        LetterMode::Plain => is_unicode_letter(ch),
-        LetterMode::PlainWithMarks | LetterMode::CamelCase => {
-            crate::util::is_alpha(ch) || is_unicode_mark(ch)
-        }
+        LetterMode::Plain => k & (cls::ALPHA | cls::MARK) == cls::ALPHA,
+        LetterMode::PlainWithMarks | LetterMode::CamelCase => k & (cls::ALPHA | cls::MARK) != 0,
     };
     if letter {
         return if C::LETTER_MODE == LetterMode::CamelCase {
@@ -590,18 +590,18 @@ fn uclass<C: PretokConfig>(ch: char) -> UClass {
             UClass::Letter
         };
     }
-    if ch.is_numeric() {
+    if k & cls::NUMERIC != 0 {
         return if C::DIGIT_MODE == DigitMode::Chunked3 {
             UClass::Defer
         } else {
             UClass::Number
         };
     }
-    if ch.is_whitespace() {
+    if k & cls::WS != 0 {
         return UClass::Defer;
     }
     if C::PUNCT_CLASS == PunctClass::PunctSymbolOnly {
-        if is_punct_or_symbol(ch) { UClass::Punct } else { UClass::Defer }
+        if k & cls::NOT_PUNCT == 0 { UClass::Punct } else { UClass::Defer }
     } else {
         UClass::Punct
     }
@@ -927,8 +927,8 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
             !ch.is_whitespace()
                 && match C::WS_EXCEPTION {
                     WsException::None => true,
-                    WsException::Digits => !ch.is_numeric(),
-                    WsException::Cjk => !is_cjk_char(ch) && !ch.is_numeric(),
+                    WsException::Digits => !crate::util::is_numeric(ch),
+                    WsException::Cjk => !is_cjk_char(ch) && !crate::util::is_numeric(ch),
                 }
         };
         split = (split & !(1 << 63)) | ((u64::from(keep) << 63) & split_base);
@@ -1605,6 +1605,9 @@ mod tests {
             "é", "ß", "ก", "\u{E31}", "中", "の", "・", "゛", "Ⅲ", "½", "¹", "❶",
             "\u{200B}", "\u{AD}", "\u{A0}", "\u{3000}", "\x01", "\x0b",
             "🎉", "👍",
+            // Non-ASCII case pairs, Lt, Lm, and marks after non-ASCII and
+            // ASCII letters (the CamelCase defer paths).
+            "Ж", "ж", "Λ", "λ", "ǅ", "ʰ", "ª", "한", "क", "\u{94D}", "\u{93E}", "\u{301}",
         ];
         let mut state = 0x243F6A8885A308D3u64;
         let mut next = || {

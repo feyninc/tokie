@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- **Unicode classification is one table read.** A generated per-code-point
+  class table (`src/unicode_class.rs`, two levels, about 45 KB) replaces the
+  std `is_alphabetic`/`is_numeric` skip-list searches and the mark range
+  binary search behind the `util` predicates. Output is unchanged: the table
+  is generated from the previous predicate implementations and checked
+  against them for every code point. The `util` predicates drop from
+  20–220 ns to about 1 ns per non-ASCII char, and pretokenization of
+  non-Latin text is about 9–15× faster (`Mask` and `Core`, geomean over 13
+  scripts); Latin text gains about 7–22%.
+- `Core` classifies each char once: non-ASCII letter runs no longer re-enter
+  the SWAR ASCII probe per char, and a letter already checked after a space,
+  apostrophe or punct prefix is not decoded again.
+
 ## 0.2.0
 
 ### Breaking changes
