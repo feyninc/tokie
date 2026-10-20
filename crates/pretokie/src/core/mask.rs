@@ -111,7 +111,7 @@ trait Classify {
     ) -> AsciiMasks;
 
     #[inline(always)]
-    fn batch<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64)
+    fn batch<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64, bool)
     where
         Self: Sized,
     {
@@ -176,7 +176,7 @@ impl Classify for Avx2 {
     /// runs inside one (`for_each_piece`), this inlines away; from the
     /// plain iterator it is one call per 64-byte batch.
     #[inline(always)]
-    fn batch<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
+    fn batch<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64, bool) {
         #[cfg(target_arch = "x86_64")]
         {
             // SAFETY: as above.
@@ -192,7 +192,7 @@ impl Classify for Avx2 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn avx2_batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
+unsafe fn avx2_batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64, bool) {
     batch_masks::<C, Avx2>(bytes, scan)
 }
 
@@ -679,14 +679,17 @@ fn classify_uni<C: PretokConfig>(bytes: &[u8], scan: usize, m: u64) -> UniMasks 
 /// Piece-start (`usable`) and scalar-territory (`bad`) bitmasks for
 /// `bytes[scan..scan+64]`. Bit k of `usable` = a trustworthy piece start
 /// at `scan + k`; `bad` marks bytes whose boundaries `Core` re-derives,
-/// and no piece is emitted across an unresolved bad zone.
+/// and no piece is emitted across an unresolved bad zone. The flag is
+/// [`MaskState::adapt`]'s "long non-ASCII pieces" signal: at least half
+/// the bytes are non-ASCII and at most 3 pieces start here.
 #[inline(always)]
-fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64, u64) {
-    // One byte of lookahead is required for the bit-63 whitespace-split
-    // test (reading a whole char there is safe: input is valid UTF-8, so
-    // a char starting in-bounds is fully in-bounds).
-    if scan + 65 > bytes.len() {
-        return (0, u64::MAX);
+fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64, u64, bool) {
+    // A full batch is required. The bit-63 whitespace-split test reads
+    // one char past it, or treats end of text as its lookahead (reading a
+    // whole char there is safe: input is valid UTF-8, so a char starting
+    // in-bounds is fully in-bounds).
+    if scan + 64 > bytes.len() {
+        return (0, u64::MAX, false);
     }
 
     let camel = C::LETTER_MODE == LetterMode::CamelCase;
@@ -916,10 +919,13 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
             }
         }
     }
-    // Bit 63 needs the real lookahead char.
+    // Bit 63 needs the real lookahead char. At the end of the text a run
+    // reaching bit 63 is taken whole (`\s+(?!\S)` matches at EOF): no split.
     if split_base >> 63 != 0 {
-        let nb64 = bytes[scan + 64];
-        let keep = if nb64 < 0x80 {
+        let keep = if scan + 64 == bytes.len() {
+            false
+        } else if bytes[scan + 64] < 0x80 {
+            let nb64 = bytes[scan + 64];
             !is_ascii_ws_byte(nb64)
                 && !(C::WS_EXCEPTION != WsException::None && crate::util::is_digit(nb64))
         } else {
@@ -1136,7 +1142,10 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
         }
     }
 
-    (boundary & !bad, bad)
+    let usable = boundary & !bad;
+    // Two popcounts of registers already live: no new loads in the walker.
+    let dense = hi.count_ones() >= 32 && usable.count_ones() <= 3;
+    (usable, bad, dense)
 }
 
 // =======================================================================
@@ -1164,7 +1173,8 @@ pub mod bench_internal {
     /// Stages (a)+(b): the full per-batch boundary computation.
     #[inline(always)]
     pub fn batch_masks<C: PretokConfig>(bytes: &[u8], scan: usize) -> (u64, u64) {
-        super::batch_masks::<C, super::Base>(bytes, scan)
+        let (usable, bad, _) = super::batch_masks::<C, super::Base>(bytes, scan);
+        (usable, bad)
     }
 
     /// The scalar ground-truth advance (bad-zone executor).
@@ -1202,6 +1212,7 @@ struct MaskState {
     pre_base: usize,
     pre_usable: u64,
     pre_bad: u64,
+    pre_dense: bool,
     /// Consecutive mostly-bad batches (see [`Self::adapt`]).
     bad_streak: u32,
 }
@@ -1221,19 +1232,25 @@ impl MaskState {
             pre_base: usize::MAX,
             pre_usable: 0,
             pre_bad: 0,
+            pre_dense: false,
             bad_streak: 0,
         }
     }
 
     /// Mostly-bad batches (e.g. CJK under o200k's letter classes) pay a
-    /// full classification yet yield few trusted boundaries. From the
-    /// second in a row, stay on the `Core` path for an exponentially
-    /// growing window before classifying again. This only moves the
-    /// mask/scalar switch point — `Core` from any piece start is exact —
-    /// so output is unchanged. Call after `load_segment` on a refill.
+    /// full classification yet yield few trusted boundaries. Batches of a
+    /// few long non-ASCII pieces (`dense`: Chinese, Japanese, Thai runs)
+    /// classify char by char in `classify_uni` and pop almost nothing,
+    /// which is slower than `Core` walking the same chars with the class
+    /// table; short dense pieces (Hangul words) don't qualify. From the
+    /// second such batch in a row, stay on the `Core` path for an
+    /// exponentially growing window before classifying again. This only
+    /// moves the mask/scalar switch point — `Core` from any piece start is
+    /// exact — so output is unchanged. Call after `load_segment` on a
+    /// refill.
     #[inline(always)]
-    fn adapt(&mut self, bad: u64) {
-        if bad.count_ones() >= 48 {
+    fn adapt(&mut self, bad: u64, dense: bool) {
+        if dense || bad.count_ones() >= 48 {
             self.bad_streak = (self.bad_streak + 1).min(6);
             if self.bad_streak >= 2 {
                 let until = self.mask_base + (64usize << self.bad_streak);
@@ -1312,8 +1329,8 @@ impl MaskState {
                 self.scalar_until = usize::MAX;
                 continue;
             }
-            let (usable, bad) = if self.pre_base == self.scan {
-                (self.pre_usable, self.pre_bad)
+            let (usable, bad, dense) = if self.pre_base == self.scan {
+                (self.pre_usable, self.pre_bad, self.pre_dense)
             } else {
                 K::batch::<C>(bytes, self.scan)
             };
@@ -1324,10 +1341,11 @@ impl MaskState {
             // Kick off the next batch now; its SIMD chain overlaps this
             // batch's pops instead of stalling the next refill.
             if self.scan + 64 <= len {
-                let (u2, b2) = K::batch::<C>(bytes, self.scan);
+                let (u2, b2, d2) = K::batch::<C>(bytes, self.scan);
                 self.pre_base = self.scan;
                 self.pre_usable = u2;
                 self.pre_bad = b2;
+                self.pre_dense = d2;
             } else {
                 self.pre_base = usize::MAX;
             }
@@ -1338,7 +1356,7 @@ impl MaskState {
             } else {
                 self.load_segment(0);
             }
-            self.adapt(bad);
+            self.adapt(bad, dense);
         }
     }
 
@@ -1393,8 +1411,8 @@ impl MaskState {
                 self.scalar_until = usize::MAX;
                 continue;
             }
-            let (usable, bad) = if self.pre_base == self.scan {
-                (self.pre_usable, self.pre_bad)
+            let (usable, bad, dense) = if self.pre_base == self.scan {
+                (self.pre_usable, self.pre_bad, self.pre_dense)
             } else {
                 K::batch::<C>(bytes, self.scan)
             };
@@ -1403,10 +1421,11 @@ impl MaskState {
             self.batch_usable = usable;
             self.batch_bad = bad;
             if self.scan + 64 <= len {
-                let (u2, b2) = K::batch::<C>(bytes, self.scan);
+                let (u2, b2, d2) = K::batch::<C>(bytes, self.scan);
                 self.pre_base = self.scan;
                 self.pre_usable = u2;
                 self.pre_bad = b2;
+                self.pre_dense = d2;
             } else {
                 self.pre_base = usize::MAX;
             }
@@ -1415,7 +1434,7 @@ impl MaskState {
             } else {
                 self.load_segment(0);
             }
-            self.adapt(bad);
+            self.adapt(bad, dense);
         }
     }
 }
@@ -1624,6 +1643,38 @@ mod tests {
                 s.push_str(atoms[(next() % atoms.len() as u64) as usize]);
             }
             check_all(&s);
+        }
+    }
+
+    /// Texts ending exactly at a 64-byte batch boundary: the final batch
+    /// runs vectorized with end of text as its bit-63 lookahead.
+    #[test]
+    fn tail_at_batch_boundary() {
+        let bodies = ["word ", "x\ty", "a'b ", "中文", "Жж ", "1234", "::", "\u{a0}", "don't"];
+        let ends = [" ", "  ", "\t", "\n", " \n", "\r\n", "  \n ", "a", "'s", "'", ".", "1", "\u{3000}", "é"];
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for _ in 0..3000 {
+            let mut s = String::new();
+            let target = 64 * (1 + next() % 4);
+            let end = ends[next() % ends.len()];
+            while s.len() + end.len() < target {
+                let b = bodies[next() % bodies.len()];
+                if s.len() + b.len() + end.len() > target {
+                    break;
+                }
+                s.push_str(b);
+            }
+            while s.len() + end.len() < target {
+                s.push('z');
+            }
+            s.push_str(end);
+            if s.len() == target {
+                check_all(&s);
+            }
         }
     }
 

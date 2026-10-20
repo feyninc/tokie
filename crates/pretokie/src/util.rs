@@ -532,12 +532,14 @@ mod class_table_tests {
         s += "// class_table_matches_reference` from `util::reference` — do not edit by hand.\n";
         s += "// One `util::cls` byte per code point: BLOCKS[(INDEX[cp >> SHIFT] << SHIFT) | (cp & mask)].\n\n";
         s += &format!("pub(crate) const SHIFT: u32 = {shift};\n\n");
+        s += "#[rustfmt::skip]\n";
         s += &format!("pub(crate) static INDEX: [u16; {}] = [\n", index.len());
         for row in index.chunks(24) {
             let r: Vec<String> = row.iter().map(|v| v.to_string()).collect();
             s += &format!("    {},\n", r.join(", "));
         }
         s += "];\n\n";
+        s += "#[rustfmt::skip]\n";
         s += &format!("pub(crate) static BLOCKS: [u8; {}] = [\n", blocks.len() << shift);
         for b in &blocks {
             for row in b.chunks(32) {

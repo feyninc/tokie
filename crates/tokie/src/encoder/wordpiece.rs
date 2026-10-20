@@ -166,6 +166,12 @@ impl WordPieceEncoder {
         cache: Option<&mut PretokenCache>,
         out: &mut Vec<TokenId>,
     ) {
+        // 1-byte pieces (mostly punctuation): `encode_word_into`'s direct
+        // lookup is cheaper than a cache probe.
+        if piece.len() == 1 && self.max_input_chars_per_word >= 1 {
+            out.push(self.byte_lut[piece[0] as usize]);
+            return;
+        }
         match cache {
             Some(c) if !piece.is_empty() && piece.len() <= PretokenCache::KEY_MAX => {
                 let (lo, hi) = key_words_within(doc, piece);

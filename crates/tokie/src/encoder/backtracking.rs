@@ -320,6 +320,10 @@ pub struct BacktrackingBytePairEncoder {
     /// Longest uncached piece routed to `merge_core` instead of the DAAC
     /// walk (see [`default_core_max_len`]).
     core_max_len: usize,
+    /// Token of each 1-byte piece (`TokenId::MAX` if it doesn't encode to
+    /// exactly one token), filled from [`Self::encode_uncached`] at build:
+    /// 1-byte pieces skip the cache probe.
+    byte_tok: [TokenId; 256],
 }
 
 /// Vocab size up to which the merge core beats the DAAC walk at every
@@ -420,7 +424,9 @@ impl BacktrackingBytePairEncoder {
             rank_table,
             merge_core,
             core_max_len,
-        };
+            byte_tok: [TokenId::MAX; 256],
+        }
+        .with_byte_tokens();
 
         (encoder, token_bytes)
     }
@@ -498,7 +504,9 @@ impl BacktrackingBytePairEncoder {
             rank_table,
             merge_core,
             core_max_len,
-        };
+            byte_tok: [TokenId::MAX; 256],
+        }
+        .with_byte_tokens();
 
         (encoder, token_bytes)
     }
@@ -535,7 +543,22 @@ impl BacktrackingBytePairEncoder {
             rank_table,
             merge_core,
             core_max_len,
+            byte_tok: [TokenId::MAX; 256],
         }
+        .with_byte_tokens()
+    }
+
+    /// Fill [`Self::byte_tok`] from the uncached reference path.
+    fn with_byte_tokens(mut self) -> Self {
+        let mut out = Vec::new();
+        for b in 0..=255u8 {
+            out.clear();
+            self.encode_uncached(&[b], &mut out);
+            if let [t] = out[..] {
+                self.byte_tok[b as usize] = t;
+            }
+        }
+        self
     }
 
     // === Builder Helpers ===
@@ -668,8 +691,15 @@ impl BacktrackingBytePairEncoder {
     /// path (and `encode_into` does exactly that with `doc == piece`).
     #[inline]
     pub fn encode_piece_into(&self, doc: &[u8], piece: &[u8], cache: Option<&mut PretokenCache>, out: &mut Vec<TokenId>) {
-        if piece.is_empty() {
-            return;
+        match piece.len() {
+            0 => return,
+            1 => {
+                let t = self.byte_tok[piece[0] as usize];
+                if t != TokenId::MAX {
+                    return out.push(t);
+                }
+            }
+            _ => {}
         }
         if let Some(c) = cache {
             if piece.len() <= CACHE_KEY_MAX {
@@ -1048,6 +1078,9 @@ impl BacktrackingBytePairEncoder {
 pub struct PretokenCache {
     entries: Box<[CacheEntry]>,
     mask: usize,
+    /// Occupied entries; the table doubles (up to `CACHE_MAX_BITS`) once
+    /// half full.
+    filled: usize,
     /// Pieces the inline table can't hold (longer than 15 bytes, or more
     /// than 3 tokens), allocated on first use.
     long: Option<Box<LongCache>>,
@@ -1186,7 +1219,12 @@ impl LongCache {
 }
 
 const CACHE_KEY_MAX: usize = 15;
-const CACHE_BITS: usize = 16; // 65536 entries * 32 B = 2 MiB (fits M-series shared L2 alongside 8 workers)
+const CACHE_BITS: usize = 16; // initial: 65536 entries * 32 B = 2 MiB (fits M-series shared L2 alongside 8 workers)
+/// Largest table the cache grows to: 2^18 entries * 32 B = 8 MiB. On 10 MB
+/// of OWT (gpt2) a 2^16 table still missed 2% of pieces warm (each miss a
+/// ~200 ns merge); 2^18 drops that to 0.4% and is 1.4x faster end to end,
+/// while 2^20 spills to L3 and gets slower again (research 12).
+const CACHE_MAX_BITS: usize = 18;
 const CACHE_PROBES: usize = 4;
 const CACHE_MAX_TOKENS: usize = 3;
 
@@ -1266,8 +1304,14 @@ impl PretokenCache {
     pub const MAX_TOKENS: usize = CACHE_MAX_TOKENS;
 
     pub fn new() -> Self {
+        let entries = Self::alloc_entries(CACHE_BITS);
+        Self { mask: entries.len() - 1, entries, filled: 0, long: None, dirty: false }
+    }
+
+    /// An empty table of `1 << bits` entries.
+    fn alloc_entries(bits: usize) -> Box<[CacheEntry]> {
         let empty = CacheEntry { key_lo: 0, key_hi: 0, toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
-        let n = 1usize << CACHE_BITS;
+        let n = 1usize << bits;
         let entries = vec![empty; n].into_boxed_slice();
         // Advise transparent huge pages for the table on Linux: the default
         // table is exactly one 2 MiB page, and probes are uniform-random, so
@@ -1290,7 +1334,24 @@ impl PretokenCache {
                 );
             }
         }
-        Self { entries, mask: n - 1, long: None, dirty: false }
+        entries
+    }
+
+    /// Double the table and re-insert every entry. Called once the table
+    /// is half full, so the 4-slot probe windows rarely overflow and evict.
+    #[cold]
+    fn grow(&mut self) {
+        let bits = self.entries.len().trailing_zeros() as usize + 1;
+        let old = std::mem::replace(&mut self.entries, Self::alloc_entries(bits));
+        self.mask = self.entries.len() - 1;
+        self.filled = 0;
+        for e in old.iter().filter(|e| e.key_hi != 0) {
+            let target = self.probe_target(e.key_lo, e.key_hi);
+            if self.entries[target].key_hi == 0 {
+                self.filled += 1;
+            }
+            self.entries[target] = *e;
+        }
     }
 
     /// Reset every entry to empty (for reuse under a different tokenizer).
@@ -1299,8 +1360,16 @@ impl PretokenCache {
             return;
         }
         self.dirty = false;
-        let empty = CacheEntry { key_lo: 0, key_hi: 0, toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
-        self.entries.fill(empty);
+        if self.entries.len() > 1 << CACHE_BITS {
+            // A grown table goes back to the initial size for the next
+            // tokenizer (frees the extra memory; it regrows if needed).
+            self.entries = Self::alloc_entries(CACHE_BITS);
+            self.mask = self.entries.len() - 1;
+        } else {
+            let empty = CacheEntry { key_lo: 0, key_hi: 0, toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
+            self.entries.fill(empty);
+        }
+        self.filled = 0;
         if let Some(l) = &mut self.long {
             l.clear();
         }
@@ -1358,9 +1427,18 @@ impl PretokenCache {
     #[doc(hidden)]
     #[inline(always)]
     pub fn get_with_key(&self, lo: u64, hi: u64, out: &mut Vec<TokenId>) -> bool {
-        let mut i = self.slot(lo, hi);
+        self.get_at(self.slot(lo, hi), lo, hi, out)
+    }
+
+    /// [`Self::get_with_key`] starting from the key's home `slot`.
+    #[inline(always)]
+    fn get_at(&self, slot: usize, lo: u64, hi: u64, out: &mut Vec<TokenId>) -> bool {
+        let mut i = slot & self.mask;
         for _ in 0..CACHE_PROBES {
-            let e = &self.entries[i];
+            debug_assert!(i < self.entries.len());
+            // SAFETY: `entries.len() == mask + 1` (kept together by `new`,
+            // `grow` and `clear`) and `i` is always reduced by `mask`.
+            let e = unsafe { self.entries.get_unchecked(i) };
             if e.key_lo == lo && e.key_hi == hi {
                 // Emit via a fixed-width store: always copy all 3 slots, then
                 // advance len by the real count. Avoids the variable-length
@@ -1401,23 +1479,35 @@ impl PretokenCache {
     #[inline]
     pub fn insert_with_key(&mut self, lo: u64, hi: u64, toks: &[TokenId]) {
         debug_assert!(!toks.is_empty() && toks.len() <= CACHE_MAX_TOKENS);
-        let home = self.slot(lo, hi);
-        let mut i = home;
-        let mut target = home;
-        for _ in 0..CACHE_PROBES {
-            let e = &self.entries[i];
-            if e.key_hi == 0 || (e.key_lo == lo && e.key_hi == hi) {
-                target = i;
-                break;
-            }
-            i = (i + 1) & self.mask;
-        }
+        let target = self.probe_target(lo, hi);
         self.dirty = true;
         let e = &mut self.entries[target];
+        if e.key_hi == 0 {
+            self.filled += 1;
+        }
         e.key_lo = lo;
         e.key_hi = hi;
         e.ntok = toks.len() as u32;
         e.toks[..toks.len()].copy_from_slice(toks);
+        if self.filled * 2 > self.entries.len() && self.entries.len() < 1 << CACHE_MAX_BITS {
+            self.grow();
+        }
+    }
+
+    /// Where `insert_with_key` writes a key: the first empty or equal
+    /// slot of its probe window, else (window full) its home slot.
+    #[inline]
+    fn probe_target(&self, lo: u64, hi: u64) -> usize {
+        let home = self.slot(lo, hi);
+        let mut i = home;
+        for _ in 0..CACHE_PROBES {
+            let e = &self.entries[i];
+            if e.key_hi == 0 || (e.key_lo == lo && e.key_hi == hi) {
+                return i;
+            }
+            i = (i + 1) & self.mask;
+        }
+        home
     }
 }
 

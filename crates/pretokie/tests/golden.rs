@@ -583,3 +583,55 @@ fuzz_uni_golden!(fuzz_uni_bert, &oracle::BERT);
 fuzz_uni_golden!(fuzz_uni_voyage, &oracle::VOYAGE);
 fuzz_uni_golden!(fuzz_uni_tekken, &oracle::TEKKEN);
 fuzz_uni_golden!(fuzz_uni_qwen35, &oracle::QWEN35);
+
+/// Long fuzz strings (half from [`FUZZ_UNI`]) padded with single-byte
+/// ASCII to an exact multiple of 64 bytes, so `Mask`'s final batch ends
+/// at the end of the text and its bit-63 lookahead is end-of-input, with
+/// every kind of last char (letters, digits, spaces, tabs, newlines,
+/// apostrophes, punctuation).
+fn fuzz_tail_one(rng: &mut Rng) -> String {
+    const PAD: &[u8] = b"aBz0 \t\n\r'./-_ ";
+    let mut s = fuzz_uni_one(rng);
+    let target = s.len().div_ceil(64) * 64 + 64 * rng.below(2);
+    while s.len() < target {
+        s.push(PAD[rng.below(PAD.len())] as char);
+    }
+    s
+}
+
+macro_rules! fuzz_tail_golden {
+    ($fn_name:ident, $scheme:expr) => {
+        #[test]
+        fn $fn_name() {
+            let scheme: &Scheme = $scheme;
+            let iters: u32 = std::env::var("PRETOKIE_FUZZ_ITERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300);
+            let mut rng = Rng(0x2545F4914F6CDD1D);
+            let mut failures = Vec::new();
+            for i in 0..(iters / 10).max(30) {
+                let s = fuzz_tail_one(&mut rng);
+                assert_eq!(s.len() % 64, 0);
+                if let Err(diff) = diff_case(scheme, &s) {
+                    failures.push(format!("iter {i} {s:?}: {diff}"));
+                    if failures.len() >= 5 {
+                        break;
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{} fuzz failures:\n{}", failures.len(), failures.join("\n"));
+        }
+    };
+}
+
+fuzz_tail_golden!(fuzz_tail_r50k, &oracle::R50K);
+fuzz_tail_golden!(fuzz_tail_cl100k, &oracle::CL100K);
+fuzz_tail_golden!(fuzz_tail_o200k, &oracle::O200K);
+fuzz_tail_golden!(fuzz_tail_qwen2, &oracle::QWEN2);
+fuzz_tail_golden!(fuzz_tail_deepseek, &oracle::DEEPSEEK);
+fuzz_tail_golden!(fuzz_tail_smollm, &oracle::SMOLLM);
+fuzz_tail_golden!(fuzz_tail_bert, &oracle::BERT);
+fuzz_tail_golden!(fuzz_tail_voyage, &oracle::VOYAGE);
+fuzz_tail_golden!(fuzz_tail_tekken, &oracle::TEKKEN);
+fuzz_tail_golden!(fuzz_tail_qwen35, &oracle::QWEN35);
