@@ -1,4 +1,4 @@
-//! Seven masks for a 64-byte window.
+//! Seven masks for a 64-byte window, inlined into the walker kernels.
 //!
 //! The masks are ASCII letters, ASCII digits, the space character, newlines
 //! (`\n` and `\r`), other ASCII whitespace (tab, vertical tab, form feed),

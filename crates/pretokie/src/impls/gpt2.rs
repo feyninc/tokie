@@ -6,10 +6,10 @@
 //! A tab or a newline does not.
 
 #[cfg(target_arch = "aarch64")]
-use crate::classify::classify_neon;
-use crate::classify::{class_of, classify_scalar, Class, Masks};
+use crate::walk::classify::classify_neon;
+use crate::walk::classify::{class_of, classify_scalar, Class, Masks};
 #[cfg(target_arch = "x86_64")]
-use crate::classify::{classify_avx2, classify_avx512};
+use crate::walk::classify::{classify_avx2, classify_avx512};
 #[cfg(target_arch = "aarch64")]
 use crate::walk::ISA_NEON;
 #[cfg(target_arch = "x86_64")]

@@ -3,8 +3,10 @@
 //! A pretokenizer implements [`Scheme::advance`]. When it can, it also
 //! reports every piece start in one 64-byte window. Count and fill each run
 //! in one kernel for the instruction set picked at the start of the call.
-//! That kernel inlines the scheme's window, including classification. The
-//! walker does not know the split rules.
+//! That kernel inlines the scheme's window and the matching function from
+//! [`classify`]. The walker does not know the split rules.
+
+pub(crate) mod classify;
 
 use crate::Span;
 
@@ -96,12 +98,12 @@ impl<'a, S: Scheme> Walk<'a, S> {
                 // SAFETY: `compress_available` checked AVX-512 F, BW, and VBMI2.
                 return unsafe { fill_avx512::<S>(self, out) };
             }
-            if crate::classify::avx512_available() {
+            if classify::avx512_available() {
                 // SAFETY: AVX-512 F and BW are present. Popcnt is present on
                 // every such CPU.
                 return unsafe { fill_avx512_scalar_pack::<S>(self, out) };
             }
-            if crate::classify::avx2_available() {
+            if classify::avx2_available() {
                 // SAFETY: AVX2 is present.
                 return unsafe { fill_avx2::<S>(self, out) };
             }
@@ -123,11 +125,11 @@ impl<'a, S: Scheme> Walk<'a, S> {
     pub fn count_upto(self, limit: usize) -> usize {
         #[cfg(target_arch = "x86_64")]
         {
-            if crate::classify::avx512_available() {
+            if classify::avx512_available() {
                 // SAFETY: AVX-512 F and BW are present.
                 return unsafe { count_avx512::<S>(self, limit) };
             }
-            if crate::classify::avx2_available() {
+            if classify::avx2_available() {
                 // SAFETY: AVX2 is present.
                 return unsafe { count_avx2::<S>(self, limit) };
             }
