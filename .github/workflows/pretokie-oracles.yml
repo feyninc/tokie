@@ -1,0 +1,30 @@
+name: Pretokie oracles
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  oracles:
+    name: Test pretokie oracles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `pretokie` is ambiguous: tokie depends on 0.1.3 from crates.io, and
+      # this workspace contains 0.2.0. The oracles live in crates/pretokie/tests.
+      - name: Run pretokie 0.2.0 oracles
+        run: cargo test -p pretokie@0.2.0 --tests
