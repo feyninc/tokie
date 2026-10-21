@@ -19,7 +19,7 @@ The workspace members are `crates/*`. Project docs are `README.md`, `docs/MIGRAT
 
 This branch deleted the old `crates/pretokie/src` and `examples/`. Do not restore `PretokConfig`, `Mask<C>`, or `Gpt2::new`.
 
-Each pretokenizer lives in its own file under `src/impls/`. `span.rs` holds `Span`. `src/walk/` is the shared walker: `mod.rs` is the kernel, and `classify.rs` emits seven masks for a 64-byte window (ASCII letter, digit, space, newline, other whitespace, apostrophe, and non-ASCII). The kernel inlines the classifier and the scheme's window. It does not know the split rules. `Gpt2::count`, `Gpt2::count_upto`, and `Gpt2::walk` are the calls. A pretokenizer is a zero-sized type. Callers pass text that is already normalized. Design notes, when present, are in `notes/` and gitignored.
+Each pretokenizer lives in its own file under `src/impls/`. Each pretokenizer's oracle tests live in their own file under `crates/pretokie/tests/`. Do not share a test file across pretokenizers. `span.rs` holds `Span`. `src/walk/` is the shared walker: `mod.rs` is the kernel, and `classify.rs` emits seven masks for a 64-byte window (ASCII letter, digit, space, newline, other whitespace, apostrophe, and non-ASCII). The kernel inlines the classifier and the scheme's window. It does not know the split rules. `Gpt2::count`, `Gpt2::count_upto`, and `Gpt2::walk` are the calls. A pretokenizer is a zero-sized type. Callers pass text that is already normalized. Design notes, when present, are in `notes/` and gitignored.
 
 `cargo check -p pretokie` succeeds. `crates/tokie` still names the deleted types, so tokie does not build until those calls change.
 
