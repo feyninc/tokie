@@ -613,6 +613,7 @@ fn finish(mut boundary: u64, cut: u32, finishes: bool) -> Option<Window> {
     }
     Some(Window {
         starts: boundary,
+        stops: None,
         finishes,
     })
 }

@@ -29,6 +29,17 @@ pub(crate) trait Scheme {
     /// `pos` is less than `bytes.len()` and sits on a piece boundary.
     fn advance(bytes: &[u8], pos: usize) -> usize;
 
+    /// Next piece boundary at or after `pos`.
+    ///
+    /// The default keeps `pos`. A scheme that drops bytes, such as
+    /// whitespace, skips them here. The result is `bytes.len()` when no
+    /// piece remains.
+    #[inline(always)]
+    fn align(bytes: &[u8], pos: usize) -> usize {
+        let _ = bytes;
+        pos
+    }
+
     /// Piece starts in the 64-byte window at `pos`.
     ///
     /// `pos` sits on a piece boundary. `None` means this piece stays on
@@ -44,13 +55,20 @@ pub(crate) trait Scheme {
 
 /// Piece starts for one 64-byte window.
 ///
-/// Bit 0 is the first byte of the window. Each later set bit is another
-/// piece start. When [`Window::finishes`] is set, the last of those pieces
-/// ends at the end of the window. Otherwise the highest set bit is the
-/// start of a piece this window cannot finish.
+/// Bit 0 is the first byte of the window. Each later set bit in [`Window::starts`]
+/// is another piece start. With [`Window::stops`] unset, each piece ends at
+/// the next start, and [`Window::finishes`] means the last piece ends at
+/// byte 64. With `stops` set, bit `k` is the exclusive end of a finished
+/// piece. A piece that ends at byte 64 has no stop bit, so a gap can sit
+/// between a piece's end and the next start.
+///
+/// When `finishes` is set, every start is a finished piece and the window
+/// consumed all 64 bytes. Otherwise the highest start is where the next
+/// call resumes, and that start is not a finished piece.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Window {
     pub starts: u64,
+    pub stops: Option<u64>,
     pub finishes: bool,
 }
 
@@ -69,6 +87,13 @@ pub struct Walk<'a, S> {
     cursor: u8,
     /// Entries used in [`Self::positions`].
     len: u8,
+    /// Exclusive ends for a window whose pieces leave gaps.
+    ///
+    /// Parallel to the finished pieces in [`Self::positions`]. Unused when
+    /// [`Self::gapped`] is false.
+    ends: [u8; 64],
+    /// The cached window reported [`Window::stops`].
+    gapped: bool,
     _scheme: core::marker::PhantomData<S>,
 }
 
@@ -85,6 +110,8 @@ impl<'a, S: Scheme> Walk<'a, S> {
             positions: [0; 65],
             cursor: 0,
             len: 0,
+            ends: [0; 64],
+            gapped: false,
             _scheme: core::marker::PhantomData,
         }
     }
@@ -174,9 +201,10 @@ fn fill_inner<S: Scheme, const COMPRESS: bool, const ISA: u8>(
             let take = ready.min(out.len() - n);
             let base = walk.window_at;
             let cursor = walk.cursor as usize;
-            write_pairs(&mut out[n..], base, &walk.positions, cursor, take);
+            let ends = if walk.gapped { Some(&walk.ends[..]) } else { None };
+            write_pairs(&mut out[n..], base, &walk.positions, ends, cursor, take);
             #[cfg(debug_assertions)]
-            check_pairs::<S>(walk.bytes, base, &walk.positions, cursor, take);
+            check_pairs::<S>(walk.bytes, base, &walk.positions, ends, cursor, take);
             let next = cursor + take;
             walk.cursor = next as u8;
             walk.pos = base + walk.positions[next] as usize;
@@ -184,6 +212,11 @@ fn fill_inner<S: Scheme, const COMPRESS: bool, const ISA: u8>(
             continue;
         }
         walk.len = 0;
+        walk.gapped = false;
+        walk.pos = S::align(walk.bytes, walk.pos);
+        if walk.pos >= walk.bytes.len() {
+            break;
+        }
         let Some(window) = S::try_window::<ISA>(walk.bytes, walk.pos) else {
             let end = S::advance(walk.bytes, walk.pos);
             walk.write(out, n, end);
@@ -204,10 +237,31 @@ fn fill_inner<S: Scheme, const COMPRESS: bool, const ISA: u8>(
         } else {
             flatten_scalar(window.starts, &mut positions)
         };
-        if window.finishes {
-            positions[count] = 64;
-            count += 1;
-        }
+        let mut ends = [0u8; 64];
+        let gapped = if let Some(stops) = window.stops {
+            let pieces = count;
+            let mut s = 0;
+            let mut bits = stops;
+            while bits != 0 {
+                ends[s] = bits.trailing_zeros() as u8;
+                s += 1;
+                bits &= bits.wrapping_sub(1);
+            }
+            if window.finishes {
+                positions[count] = 64;
+                count += 1;
+                if s + 1 == pieces {
+                    ends[s] = 64;
+                }
+            }
+            true
+        } else {
+            if window.finishes {
+                positions[count] = 64;
+                count += 1;
+            }
+            false
+        };
         if count < 2 {
             let end = S::advance(walk.bytes, walk.pos);
             walk.write(out, n, end);
@@ -216,13 +270,16 @@ fn fill_inner<S: Scheme, const COMPRESS: bool, const ISA: u8>(
         }
         let base = walk.pos;
         let take = (count - 1).min(out.len() - n);
-        write_pairs(&mut out[n..], base, &positions, 0, take);
+        let end_slice = if gapped { Some(&ends[..]) } else { None };
+        write_pairs(&mut out[n..], base, &positions, end_slice, 0, take);
         #[cfg(debug_assertions)]
-        check_pairs::<S>(walk.bytes, base, &positions, 0, take);
+        check_pairs::<S>(walk.bytes, base, &positions, end_slice, 0, take);
         n += take;
         walk.pos = base + positions[take] as usize;
         if take + 1 < count {
             walk.positions = positions;
+            walk.ends = ends;
+            walk.gapped = gapped;
             walk.window_at = base;
             walk.cursor = take as u8;
             walk.len = count as u8;
@@ -261,6 +318,10 @@ unsafe fn fill_neon<S: Scheme>(walk: &mut Walk<'_, S>, out: &mut [Span]) -> usiz
 fn count_inner<S: Scheme, const ISA: u8>(mut walk: Walk<'_, S>, limit: usize) -> usize {
     let mut n: usize = 0;
     while walk.pos < walk.bytes.len() {
+        walk.pos = S::align(walk.bytes, walk.pos);
+        if walk.pos >= walk.bytes.len() {
+            break;
+        }
         if let Some(window) = S::try_window::<ISA>(walk.bytes, walk.pos) {
             let ones = window.starts.count_ones() as usize;
             let complete = if window.finishes { ones } else { ones - 1 };
@@ -308,14 +369,27 @@ unsafe fn count_neon<S: Scheme>(walk: Walk<'_, S>, limit: usize) -> usize {
 }
 
 /// Write `take` pieces starting at `positions[cursor]`.
-fn write_pairs(out: &mut [Span], base: usize, positions: &[u8], cursor: usize, take: usize) {
+///
+/// `ends` is set when a piece can stop before the next start. Otherwise the
+/// next position entry is the end.
+fn write_pairs(
+    out: &mut [Span],
+    base: usize,
+    positions: &[u8],
+    ends: Option<&[u8]>,
+    cursor: usize,
+    take: usize,
+) {
     debug_assert!(take <= out.len());
     debug_assert!(cursor + take < positions.len());
     for k in 0..take {
         // SAFETY: `cursor + k + 1` is inside `positions`, and `k` is inside `out`.
         unsafe {
             let start = base + *positions.get_unchecked(cursor + k) as usize;
-            let end = base + *positions.get_unchecked(cursor + k + 1) as usize;
+            let end = match ends {
+                Some(ends) => base + *ends.get_unchecked(cursor + k) as usize,
+                None => base + *positions.get_unchecked(cursor + k + 1) as usize,
+            };
             *out.get_unchecked_mut(k) = Span {
                 start: start as u32,
                 end: end as u32,
@@ -325,10 +399,20 @@ fn write_pairs(out: &mut [Span], base: usize, positions: &[u8], cursor: usize, t
 }
 
 #[cfg(debug_assertions)]
-fn check_pairs<S: Scheme>(bytes: &[u8], base: usize, positions: &[u8], cursor: usize, take: usize) {
+fn check_pairs<S: Scheme>(
+    bytes: &[u8],
+    base: usize,
+    positions: &[u8],
+    ends: Option<&[u8]>,
+    cursor: usize,
+    take: usize,
+) {
     for k in 0..take {
         let start = base + positions[cursor + k] as usize;
-        let end = base + positions[cursor + k + 1] as usize;
+        let end = match ends {
+            Some(ends) => base + ends[cursor + k] as usize,
+            None => base + positions[cursor + k + 1] as usize,
+        };
         debug_assert!(end > start, "advance must consume at least one byte");
         let got = S::advance(bytes, start);
         debug_assert_eq!(
@@ -390,6 +474,28 @@ fn debug_assert_window<S: Scheme>(bytes: &[u8], pos: usize, window: Window, comp
     let mut prev = pos + bits.trailing_zeros() as usize;
     debug_assert_eq!(prev, pos);
     bits &= bits.wrapping_sub(1);
+    if let Some(mut stops) = window.stops {
+        for i in 0..complete {
+            let end_rel = if stops == 0 {
+                debug_assert!(window.finishes && i + 1 == complete);
+                64
+            } else {
+                let end_rel = stops.trailing_zeros() as usize;
+                stops &= stops.wrapping_sub(1);
+                end_rel
+            };
+            let end = pos + end_rel;
+            debug_assert!(end > prev, "advance must consume at least one byte");
+            debug_assert_eq!(end, S::advance(bytes, prev), "mask piece diverged at {prev}");
+            if bits != 0 {
+                let next = pos + bits.trailing_zeros() as usize;
+                debug_assert!(next >= end, "piece end passed the next start at {prev}");
+                prev = next;
+                bits &= bits.wrapping_sub(1);
+            }
+        }
+        return;
+    }
     for _ in 0..complete {
         let end = if bits == 0 {
             pos + 64

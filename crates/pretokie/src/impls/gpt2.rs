@@ -491,6 +491,7 @@ pub(crate) fn window<const ISA: u8, const SINGLE_DIGITS: bool>(
     }
     Some(Window {
         starts: boundary,
+        stops: None,
         finishes,
     })
 }
