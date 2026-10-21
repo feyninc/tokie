@@ -4,11 +4,12 @@
 //! popcounts boundaries. gigatoken iter yields each piece. gigatoken fill
 //! also packs a cache key and prefetches it.
 
+use gigatoken_rs::pretokenize::fast::FastO200kPretokenizer;
 use gigatoken_rs::pretokenize::{
     FastCl100kPretokenizer, FastOlmo3Pretokenizer, FastQwen2Pretokenizer, FastQwen35Pretokenizer,
     FastR50kPretokenizer, PretokenSpans, SpanBatch, PRETOKEN_CHUNK,
 };
-use pretokie::{Cl100k, Gpt2, Olmo, Qwen, SmolLM, Span, Voyage};
+use pretokie::{Cl100k, Gpt2, O200k, Olmo, Qwen, SmolLM, Span, Voyage};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -20,6 +21,7 @@ enum Mode {
     Voyage,
     Olmo,
     Qwen,
+    O200k,
 }
 
 fn main() {
@@ -61,6 +63,7 @@ fn main() {
             "--voyage" => mode = select(&mut chosen, Mode::Voyage),
             "--olmo" => mode = select(&mut chosen, Mode::Olmo),
             "--qwen" => mode = select(&mut chosen, Mode::Qwen),
+            "--o200k" => mode = select(&mut chosen, Mode::O200k),
             "--diff" => diff = true,
             other => panic!("unknown argument: {other}"),
         }
@@ -102,6 +105,7 @@ fn main() {
         Mode::Voyage => report(fill_name, measure(reps, valid, || fill_voyage(text))),
         Mode::Olmo => report(fill_name, measure(reps, valid, || fill_olmo(text))),
         Mode::Qwen => report(fill_name, measure(reps, valid, || fill_qwen(text))),
+        Mode::O200k => report(fill_name, measure(reps, valid, || fill_o200k(text))),
     };
     let count_pieces = match mode {
         Mode::Gpt2 => report(count_name, measure(reps, valid, || Gpt2::count(text))),
@@ -110,6 +114,7 @@ fn main() {
         Mode::Voyage => report(count_name, measure(reps, valid, || Voyage::count(text))),
         Mode::Olmo => report(count_name, measure(reps, valid, || Olmo::count(text))),
         Mode::Qwen => report(count_name, measure(reps, valid, || Qwen::count(text))),
+        Mode::O200k => report(count_name, measure(reps, valid, || O200k::count(text))),
     };
     let iter_pieces = match mode {
         Mode::Gpt2 | Mode::SmolLM => {
@@ -130,6 +135,10 @@ fn main() {
         Mode::Qwen => report(
             "gigatoken iter",
             measure(reps, valid, || iter_count(FastQwen35Pretokenizer::new(&bytes))),
+        ),
+        Mode::O200k => report(
+            "gigatoken iter",
+            measure(reps, valid, || iter_count(FastO200kPretokenizer::new(&bytes))),
         ),
     };
     let giga_pieces = match mode {
@@ -152,6 +161,10 @@ fn main() {
             "gigatoken fill",
             measure(reps, valid, || fill_spans(FastQwen35Pretokenizer::new(&bytes))),
         ),
+        Mode::O200k => report(
+            "gigatoken fill",
+            measure(reps, valid, || fill_spans(FastO200kPretokenizer::new(&bytes))),
+        ),
     };
     if count_pieces != fill_pieces {
         eprintln!("piece count mismatch: {fill_name}={fill_pieces} {count_name}={count_pieces}");
@@ -170,7 +183,10 @@ fn main() {
 }
 
 fn select(chosen: &mut bool, mode: Mode) -> Mode {
-    assert!(!*chosen, "pass only one of --smollm --cl100k --voyage --olmo --qwen");
+    assert!(
+        !*chosen,
+        "pass only one of --smollm --cl100k --voyage --olmo --qwen --o200k"
+    );
     *chosen = true;
     mode
 }
@@ -183,6 +199,7 @@ fn names(mode: Mode) -> (&'static str, &'static str) {
         Mode::Voyage => ("voyage fill", "voyage count"),
         Mode::Olmo => ("olmo fill", "olmo count"),
         Mode::Qwen => ("qwen fill", "qwen count"),
+        Mode::O200k => ("o200k fill", "o200k count"),
     }
 }
 
@@ -245,6 +262,11 @@ fn fill_qwen(text: &str) -> usize {
     fill_walk(|buf| walk.fill(buf))
 }
 
+fn fill_o200k(text: &str) -> usize {
+    let mut walk = O200k::walk(text);
+    fill_walk(|buf| walk.fill(buf))
+}
+
 fn show_diff(bytes: &[u8], mode: Mode) {
     let text = std::str::from_utf8(bytes).unwrap();
     match mode {
@@ -290,6 +312,15 @@ fn show_diff(bytes: &[u8], mode: Mode) {
                 bytes,
                 |buf| walk.fill(buf),
                 FastQwen35Pretokenizer::new(bytes),
+            );
+        }
+        Mode::O200k => {
+            let mut walk = O200k::walk(text);
+            diff_against(
+                text,
+                bytes,
+                |buf| walk.fill(buf),
+                FastO200kPretokenizer::new(bytes),
             );
         }
     }
