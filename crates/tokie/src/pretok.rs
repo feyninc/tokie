@@ -155,6 +155,27 @@ impl Pretokenizer {
         }
     }
 
+    /// [`Self::for_each_piece`] in blocks of contiguous pieces (see
+    /// `pretokie::Mask::for_each_block`): `f(start, ends)` where piece `i`
+    /// ends at `start + ends[i]`. Returns `false` without calling `f` for
+    /// pretokenizers that have no mask scanner (Bert, Regex), so callers
+    /// fall back to the per-piece path.
+    #[inline]
+    pub fn for_each_block(&self, text: &str, f: &mut dyn FnMut(usize, &[u32])) -> bool {
+        match self {
+            Pretokenizer::Gpt2 => pretokie::Gpt2::new(text).for_each_block(f),
+            Pretokenizer::Cl100k => pretokie::Cl100k::new(text).for_each_block(f),
+            Pretokenizer::O200k => pretokie::O200k::new(text).for_each_block(f),
+            Pretokenizer::Voyage => pretokie::Voyage::new(text).for_each_block(f),
+            Pretokenizer::SmolLM => pretokie::SmolLM::new(text).for_each_block(f),
+            Pretokenizer::DeepSeek => pretokie::DeepSeek::new(text).for_each_block(f),
+            Pretokenizer::Qwen => pretokie::Qwen::new(text).for_each_block(f),
+            Pretokenizer::Tekken => pretokie::Tekken::new(text).for_each_block(f),
+            Pretokenizer::Bert | Pretokenizer::Regex(_) => return false,
+        }
+        true
+    }
+
     /// Split text into pre-tokens using the fastest available implementation.
     #[inline]
     pub fn split<'a>(&'a self, text: &'a str) -> PretokenizerIter<'a> {

@@ -15,7 +15,8 @@
 //! old fresh build, paid only when more tokenizers are live than slots).
 //!
 //! Memory bound: at most `max(CPUs, MIN_SLOTS)` [`WorkerCaches`], each
-//! allocated on first use (2 MiB pretoken table, plus the `▁`-unit cache
+//! allocated on first use (a 2 MiB pretoken table that grows to at most
+//! 8 MiB once half full or once seeded, plus the `▁`-unit cache
 //! whose zeroed tables are only faulted in by Unigram / SentencePiece
 //! models).
 //!

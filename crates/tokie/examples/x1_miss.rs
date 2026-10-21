@@ -51,7 +51,25 @@ const MODELS: &[(&str, &str)] = &[
     ("qwen3", "tokiers/Qwen3-0.6B"),
     ("llama-3", "tokiers/Llama-3.2-1B"),
     ("bert", "tokiers/bert-base-uncased"),
+    // `json:<name>`: `<data-dir>/models/<name>/tokenizer.json`
+    ("deepseek-v4", "json:deepseek-v4"),
+    ("qwen2", "json:qwen2"),
+    ("llama-3-json", "json:llama-3"),
 ];
+
+/// Load a `MODELS` source: hub repo, or `json:<name>` under the data dir.
+fn load_one(repo: &str) -> Result<Tokenizer, String> {
+    match repo.strip_prefix("json:") {
+        Some(name) => {
+            let p = tokbench().join("models").join(name).join("tokenizer.json");
+            if !p.exists() {
+                return Err(format!("{} missing", p.display()));
+            }
+            Tokenizer::from_json(&p).map_err(|e| e.to_string())
+        }
+        None => Tokenizer::from_pretrained(repo).map_err(|e| e.to_string()),
+    }
+}
 
 fn load(filter: Option<&str>) -> Vec<(&'static str, Tokenizer)> {
     let mut v = Vec::new();
@@ -59,7 +77,7 @@ fn load(filter: Option<&str>) -> Vec<(&'static str, Tokenizer)> {
         if filter.is_some_and(|f| !f.split(',').any(|f| name.contains(f))) {
             continue;
         }
-        match Tokenizer::from_pretrained(repo) {
+        match load_one(repo) {
             Ok(t) => v.push((name, t)),
             Err(e) => eprintln!("  {name} ({repo}): {e}"),
         }
@@ -117,11 +135,49 @@ fn types(toks: &[(&str, Tokenizer)]) {
     }
 }
 
-/// Every unique pretoken piece: DAAC walk == rank merge (when available).
+/// Fixtures plus any extra ones named in `$X1_CORPUS` that exist.
+fn equiv_fixtures() -> Vec<String> {
+    let mut names: Vec<String> = FIXTURES.iter().map(|s| s.to_string()).collect();
+    if let Ok(c) = std::env::var("X1_CORPUS") {
+        for n in c.split(',') {
+            if !names.iter().any(|x| x == n) && tokbench().join("fixtures").join(format!("{n}.txt")).exists() {
+                names.push(n.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Every unique pretoken piece: DAAC walk == rank merge (when available)
+/// == merge core (folded and unfolded) == the routed `encode_into`.
+/// Simple encoders: `encode` (folded) == `encode_unfolded` == reference.
 fn equiv(toks: &[(&str, Tokenizer)]) {
     let mut corpora = vec![enwik8(4_000_000)];
-    for f in FIXTURES {
-        corpora.push(fixture(f));
+    for f in equiv_fixtures() {
+        corpora.push(fixture(&f));
+    }
+    for (name, t) in toks {
+        let Some(enc) = t.encoder().as_simple() else { continue };
+        let pretok = t.pretokenizer().expect("pretok");
+        let mut seen: HashSet<&[u8]> = HashSet::new();
+        let (mut n, mut bad) = (0usize, 0usize);
+        for c in &corpora {
+            let lines = c.lines().take(3000);
+            for b in pretok.split(c).map(|p| p.as_bytes()).chain(lines.map(|l| l.as_bytes())) {
+                if b.is_empty() || !seen.insert(b) {
+                    continue;
+                }
+                n += 1;
+                let (r, f, u) = (enc.encode_reference(b), enc.encode(b), enc.encode_unfolded(b));
+                if r != f || r != u {
+                    bad += 1;
+                    if bad <= 5 {
+                        println!("  {name} SIMPLE DIFF {:?} ref={r:?} fold={f:?} unfold={u:?}", String::from_utf8_lossy(b));
+                    }
+                }
+            }
+        }
+        println!("{name:12} simple: fold {:?}; unique pieces+lines {n}, mismatches {bad}", enc.fold_stats());
     }
     for (name, t) in toks {
         let Some(enc) = t.encoder().as_backtracking() else { continue };
@@ -144,10 +200,14 @@ fn equiv(toks: &[(&str, Tokenizer)]) {
                 enc.encode_rank_merge(b, &mut r);
                 let mut m = Vec::new();
                 enc.encode_merge_core(b, &mut m);
-                if a != m {
+                let mut u = Vec::new();
+                enc.encode_merge_core_unfolded(b, &mut u);
+                let mut d = Vec::new();
+                enc.encode_into(b, None, &mut d);
+                if a != m || a != u || a != d {
                     bad_core += 1;
                     if bad_core <= 5 {
-                        println!("  {name} CORE DIFF {:?} daac={a:?} core={m:?}", String::from_utf8_lossy(b));
+                        println!("  {name} CORE DIFF {:?} daac={a:?} core={m:?} unfolded={u:?} routed={d:?}", String::from_utf8_lossy(b));
                     }
                 }
                 n += 1;
@@ -159,7 +219,79 @@ fn equiv(toks: &[(&str, Tokenizer)]) {
                 }
             }
         }
-        println!("{name:12} unique pieces {n}, rank mismatches {bad}, core mismatches {bad_core}");
+        println!("{name:12} fold {:?}; unique pieces {n}, rank mismatches {bad}, core(fold/unfold/routed) mismatches {bad_core}", enc.fold_stats());
+    }
+}
+
+/// Merge-work counts per unique multi-token piece (no timing): symbols the
+/// merge loop starts from (bytes unfolded, seeds folded), merges = start
+/// symbols - output tokens, and modelled pair lookups = (start - 1) +
+/// 2 * merges (initial pairs + both neighbours of each merge), bucketed by
+/// piece bytes. Text: `$X1_CORPUS` fixtures (default chinese,japanese).
+fn counts(toks: &[(&str, Tokenizer)]) {
+    let corpus = std::env::var("X1_CORPUS").unwrap_or_else(|_| "chinese,japanese".into());
+    const BUCKETS: &[(usize, usize)] = &[(2, 15), (16, 64), (65, 256), (257, usize::MAX)];
+    for (name, t) in toks {
+        let enc = t.encoder();
+        let (bt, se) = (enc.as_backtracking(), enc.as_simple());
+        if bt.is_none() && se.is_none() {
+            continue;
+        }
+        let stats = bt.and_then(|b| b.fold_stats()).or_else(|| se.and_then(|s| s.fold_stats()));
+        println!("{name} fold {stats:?}");
+        let pretok = t.pretokenizer().expect("pretok");
+        for f in corpus.split(',') {
+            let text = fixture(f);
+            let mut seen: HashSet<&[u8]> = HashSet::new();
+            // per bucket: pieces, bytes, seeds, out tokens
+            let mut acc = vec![[0usize; 4]; BUCKETS.len()];
+            for p in pretok.split(&text) {
+                let b = p.as_bytes();
+                if b.len() < 2 || !seen.insert(b) {
+                    continue;
+                }
+                let (seeds, out) = match (bt, se) {
+                    (Some(e), _) => {
+                        if e.token_cache_get(b).is_some() || !e.has_merge_core() {
+                            continue;
+                        }
+                        let mut o = Vec::new();
+                        e.encode_merge_core(b, &mut o);
+                        (e.seed_len(b), o.len())
+                    }
+                    (_, Some(e)) => {
+                        let o = e.encode(b);
+                        if o.len() == 1 {
+                            continue; // (almost always) the whole-piece token shortcut
+                        }
+                        (e.seed_len(b), o.len())
+                    }
+                    _ => unreachable!(),
+                };
+                let Some(k) = BUCKETS.iter().position(|&(lo, hi)| (lo..=hi).contains(&b.len())) else { continue };
+                let a = &mut acc[k];
+                a[0] += 1;
+                a[1] += b.len();
+                a[2] += seeds;
+                a[3] += out;
+            }
+            for (k, &(lo, hi)) in BUCKETS.iter().enumerate() {
+                let [n, bytes, seeds, out] = acc[k];
+                if n == 0 {
+                    continue;
+                }
+                let per = |x: usize| x as f64 / n as f64;
+                let (m0, m1) = (per(bytes - out), per(seeds - out));
+                let (l0, l1) = (per(bytes - n) + 2.0 * m0, per(seeds - n) + 2.0 * m1);
+                println!(
+                    "  {f:9} len {lo:>3}..{:<4} n={n:<6} bytes {:5.1} seeds {:5.1} out {:4.1} | merges {m0:5.1} -> {m1:5.1} | lookups~ {l0:5.1} -> {l1:5.1}",
+                    if hi == usize::MAX { "inf".to_string() } else { hi.to_string() },
+                    per(bytes),
+                    per(seeds),
+                    per(out),
+                );
+            }
+        }
     }
 }
 
@@ -234,7 +366,7 @@ fn bench(toks: &[(&str, Tokenizer)]) {
             let nbytes: usize = cs.iter().map(|c| c.len()).sum();
             // cold: a freshly-loaded tokenizer (new cache generation)
             let repo = MODELS.iter().find(|m| m.0 == *name).unwrap().1;
-            let fresh = Tokenizer::from_pretrained(repo).unwrap();
+            let fresh = load_one(repo).unwrap();
             let t0 = Instant::now();
             let mut n = 0usize;
             for c in &cs {
@@ -368,13 +500,14 @@ fn vshf(_: &[(&str, Tokenizer)]) {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    init_tokbench(&mut args, "x1_miss [data-dir] types|equiv|miss|bench|fp|lens|vshf [filter]");
+    init_tokbench(&mut args, "x1_miss [data-dir] types|equiv|counts|miss|bench|fp|lens|vshf [filter]");
     args.insert(0, String::new());
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("types");
     let toks = load(args.get(2).map(|s| s.as_str()));
     match cmd {
         "types" => types(&toks),
         "equiv" => equiv(&toks),
+        "counts" => counts(&toks),
         "miss" => miss(&toks),
         "bench" => bench(&toks),
         "fp" => fp(&toks),

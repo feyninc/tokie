@@ -141,11 +141,12 @@ fn equiv() {
             n += 1;
             let want = enc.encode_reference(piece);
             let got = enc.encode(piece);
+            let unfolded = enc.encode_unfolded(piece);
             let mut via_cache = Vec::new();
             enc.encode_into(piece, Some(&mut cache), &mut via_cache);
             let mut via_cache2 = Vec::new();
             enc.encode_into(piece, Some(&mut cache), &mut via_cache2);
-            if want != got || want != via_cache || want != via_cache2 {
+            if want != got || want != unfolded || want != via_cache || want != via_cache2 {
                 bad += 1;
                 if bad <= 5 {
                     eprintln!("  MISMATCH {:?}: ref={want:?} new={got:?} cache={via_cache:?}/{via_cache2:?}", String::from_utf8_lossy(piece));
@@ -181,11 +182,17 @@ fn equiv() {
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
+                if x & 0x600 == 0x600 {
+                    // Whole multi-byte chars (exercise the character fold).
+                    const CHARS: &[&str] = &["中", "文", "日", "本", "語", "の", "é", "ж", "😀", "한", "ไ", "क"];
+                    buf.extend_from_slice(CHARS[(x >> 20) as usize % CHARS.len()].as_bytes());
+                    continue;
+                }
                 buf.push(if x & 0x100 == 0 { alphabet[(x >> 16) as usize % alphabet.len()] } else { (x >> 24) as u8 });
             }
             check(&buf);
         }
-        println!("{label:<28} pieces={n} mismatches={bad}");
+        println!("{label:<28} pieces={n} mismatches={bad} fold={:?}", enc.fold_stats());
     }
 }
 

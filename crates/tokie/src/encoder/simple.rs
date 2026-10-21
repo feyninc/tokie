@@ -10,15 +10,20 @@
 //!    looked up by rank), with per-pair codes carried between rounds and
 //!    all-occurrence merging for SAFE pairs; long pieces use a two-tier
 //!    (sorted cold + heap hot) queue over a linked list.
+//! 6. Character fold (`fold.rs`): complete UTF-8 characters whose byte
+//!    assembly is provably unaffected by their neighbours start the merge
+//!    loop as one symbol.
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
+use std::sync::OnceLock;
 use std::collections::BinaryHeap;
 
 use foldhash::HashMap as FoldHashMap;
 use smallvec::SmallVec;
 
-use super::backtracking::{key_words_within, PretokenCache};
+use super::backtracking::{cache_seeds, key_words_within, CacheSeed, PretokenCache, WholeTable};
+use super::fold::{self, CharFold, FoldStats};
 use crate::types::TokenId;
 
 /// Pack two u32 token IDs into a single u64 key for faster hashing.
@@ -37,9 +42,17 @@ const NO_MERGE: u32 = u32::MAX;
 const SAFE_BIT: u32 = 1;
 /// Pairs with both ids below this hit a dense grid instead of the hash.
 const DENSE_BOUND: usize = 512;
-/// Pieces up to this many bytes use the stack multipass merge loop;
-/// longer ones use the queue.
+/// Pieces of up to this many *symbols* use the stack multipass merge loop;
+/// longer ones use the queue. Without a character fold, symbols = bytes.
 const SHORT_MAX: usize = 64;
+/// [fold] Longest piece (bytes) whose folded symbols are seeded into a
+/// stack buffer, so pieces of `SHORT_MAX+1..=` this many bytes that fold to
+/// at most `SHORT_MAX` symbols still take the multipass loop.
+const SHORT_FOLD_MAX_BYTES: usize = 3 * SHORT_MAX;
+/// Most symbols of a non-ASCII piece merged by `merge_short` (O(n²) scan);
+/// longer ones take `merge_long`'s queue. Non-ASCII pieces need many more
+/// merge rounds per symbol than English words.
+const NONASCII_SHORT_MAX: usize = 32;
 /// Dead-symbol marker in the long-piece linked list.
 const DEAD: u32 = u32::MAX;
 
@@ -53,7 +66,6 @@ const DEAD: u32 = u32::MAX;
 struct PairTable {
     dense: Box<[u32]>,
     slots: Box<[u64]>,
-    shift: u32,
     id_bits: u32,
     code_bits: u32,
     merged_by_rank: Box<[TokenId]>,
@@ -85,9 +97,10 @@ impl PairTable {
         }
         let mut merged_by_rank = vec![0 as TokenId; max_rank as usize + 1].into_boxed_slice();
         let mut dense = vec![NO_MERGE; DENSE_BOUND * DENSE_BOUND].into_boxed_slice();
+        // Load 0.25..0.5: a 1.3x table (load ~0.77) measured 21-29% slower
+        // on CJK, whose many non-merging pairs walk long probe chains.
         let cap = (pair_lookup.len() * 2).next_power_of_two().max(16);
         let mut slots = vec![0u64; cap].into_boxed_slice();
-        let shift = 64 - cap.trailing_zeros();
         for (&k, &(merged, rank)) in pair_lookup {
             merged_by_rank[rank as usize] = merged;
             let code = (rank << 1) | if min_use[merged as usize] > rank { SAFE_BIT } else { 0 };
@@ -96,19 +109,23 @@ impl PairTable {
                 dense[l * DENSE_BOUND + r] = code;
             } else {
                 let key = ((l as u64) << id_bits) | r as u64;
-                let mut i = Self::home(key, shift);
+                let mut i = Self::home(key, cap);
                 while slots[i] != 0 {
-                    i = (i + 1) & (cap - 1);
+                    i += 1;
+                    if i == cap {
+                        i = 0;
+                    }
                 }
                 slots[i] = (key << code_bits) | code as u64;
             }
         }
-        Some(Self { dense, slots, shift, id_bits, code_bits, merged_by_rank })
+        Some(Self { dense, slots, id_bits, code_bits, merged_by_rank })
     }
 
+    /// Home slot: multiply-high of the mixed key onto `0..cap`.
     #[inline(always)]
-    fn home(key: u64, shift: u32) -> usize {
-        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize
+    fn home(key: u64, cap: usize) -> usize {
+        ((key.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128 * cap as u128) >> 64) as usize
     }
 
     /// Pair code for `(left, right)`, or `NO_MERGE`.
@@ -121,8 +138,8 @@ impl PairTable {
             return NO_MERGE;
         }
         let key = ((left as u64) << self.id_bits) | right as u64;
-        let mask = self.slots.len() - 1;
-        let mut i = Self::home(key, self.shift);
+        let cap = self.slots.len();
+        let mut i = Self::home(key, cap);
         loop {
             let e = self.slots[i];
             if e >> self.code_bits == key {
@@ -131,14 +148,22 @@ impl PairTable {
             if e == 0 {
                 return NO_MERGE;
             }
-            i = (i + 1) & mask;
+            i += 1;
+            if i == cap {
+                i = 0;
+            }
         }
     }
 
-    /// Merged token for a (real) pair code.
+    /// Merged token for a (real) pair code. `ID`: rank == merged id for
+    /// every pair (Backtracking cores), so the side array is skipped.
     #[inline(always)]
-    fn merged(&self, code: u32) -> TokenId {
-        self.merged_by_rank[(code >> 1) as usize]
+    fn merged<const ID: bool>(&self, code: u32) -> TokenId {
+        if ID {
+            code >> 1
+        } else {
+            self.merged_by_rank[(code >> 1) as usize]
+        }
     }
 }
 
@@ -148,6 +173,9 @@ struct LongScratch {
     toks: Vec<TokenId>,
     prev: Vec<u32>,
     next: Vec<u32>,
+    /// Current pair code of each symbol with its right neighbour
+    /// (`NO_MERGE` for dead/last symbols).
+    code: Vec<u32>,
     cold: Vec<u64>,
     hot: BinaryHeap<Reverse<u64>>,
 }
@@ -181,9 +209,16 @@ pub struct BytePairEncoder {
     /// HF `model.ignore_merges`; see `token_cache`.
     ignore_merges: bool,
 
-    /// `pair_lookup` flattened for the merge loop.
+    /// [`PretokenCache::seed`] entries (from `token_cache`), built on first
+    /// use.
+    seeds: OnceLock<Box<[CacheSeed]>>,
+
+    /// [`WholeTable`] of `token_cache`, built on first use.
+    whole: OnceLock<WholeTable>,
+
+    /// `pair_lookup` flattened for the merge loop (plus the character fold).
     /// `None` for vocabularies too wide to pack (reference loop).
-    pairs: Option<PairTable>,
+    core: Option<MergeCore>,
 
     /// Total vocabulary size.
     vocab_size: usize,
@@ -270,7 +305,7 @@ impl BytePairEncoder {
         let num_base_tokens = base_tokens.len();
 
         // No HF config here: plain BPE semantics (`ignore_merges = false`).
-        let encoder = Self::with_cache(pair_lookup, byte_lut, token_cache, false, vocab_size, num_base_tokens);
+        let encoder = Self::with_cache(pair_lookup, byte_lut, token_cache, false, vocab_size, num_base_tokens, Some(&token_bytes));
 
         (encoder, token_bytes)
     }
@@ -326,13 +361,16 @@ impl BytePairEncoder {
             token_cache.insert(bytes.clone(), token_id as TokenId);
         }
 
-        let encoder = Self::with_cache(pair_lookup, byte_lut, token_cache, ignore_merges, vocab.len(), num_base_tokens);
+        let encoder =
+            Self::with_cache(pair_lookup, byte_lut, token_cache, ignore_merges, vocab.len(), num_base_tokens, Some(&token_bytes));
 
         (encoder, token_bytes)
     }
 
     /// Assemble the encoder from a cache of every token, pruning the cache
-    /// to merge-reachable tokens unless `ignore_merges`.
+    /// to merge-reachable tokens unless `ignore_merges`. `token_bytes`
+    /// (by id) feeds the character fold; `None` reads `token_cache`, which
+    /// then must hold every token.
     fn with_cache(
         pair_lookup: FoldHashMap<u64, (TokenId, u32)>,
         byte_lut: [TokenId; 256],
@@ -340,13 +378,20 @@ impl BytePairEncoder {
         ignore_merges: bool,
         vocab_size: usize,
         num_base_tokens: usize,
+        token_bytes: Option<&[Vec<u8>]>,
     ) -> Self {
+        let core = match token_bytes {
+            Some(tb) => MergeCore::build(&pair_lookup, byte_lut, tb.iter().enumerate().map(|(i, b)| (i as TokenId, b.as_slice()))),
+            None => MergeCore::build(&pair_lookup, byte_lut, token_cache.iter().map(|(b, &id)| (id, b.as_slice()))),
+        };
         let mut encoder = Self {
-            pairs: PairTable::build(&pair_lookup),
+            core,
             pair_lookup,
             byte_lut,
             token_cache,
             ignore_merges,
+            seeds: OnceLock::new(),
+            whole: OnceLock::new(),
             vocab_size,
             num_base_tokens,
         };
@@ -447,7 +492,7 @@ impl BytePairEncoder {
             pair_lookup.insert(pack_pair(left, right), (merged_id, merge_index as u32));
         }
 
-        Self::with_cache(pair_lookup, byte_lut, token_cache, ignore_merges, vocab_size, num_base_tokens)
+        Self::with_cache(pair_lookup, byte_lut, token_cache, ignore_merges, vocab_size, num_base_tokens, None)
     }
 
     /// Encode bytes into BPE tokens.
@@ -494,6 +539,11 @@ impl BytePairEncoder {
         self.encode_uncached(piece, out)
     }
 
+    /// Whole-token [`PretokenCache::seed`] entries of this vocab.
+    pub(crate) fn cache_seeds(&self) -> &[CacheSeed] {
+        self.seeds.get_or_init(|| cache_seeds(&self.token_cache))
+    }
+
     /// Short-piece miss; results too many tokens for an inline entry go to
     /// the long-piece cache.
     #[inline(never)]
@@ -501,8 +551,16 @@ impl BytePairEncoder {
         if cache.get_long(text, out) {
             return;
         }
+        // `encode_uncached` would check the whole-piece map first; for a
+        // 2..=15-byte piece (1-byte pieces never get here) the flat table
+        // answers the same question.
+        debug_assert!(text.len() >= 2);
+        if let Some(t) = self.whole.get_or_init(|| WholeTable::build(&self.token_cache)).get(lo, hi) {
+            cache.insert_with_key(lo, hi, &[t]);
+            return out.push(t);
+        }
         let start = out.len();
-        self.encode_uncached(text, out);
+        self.merge_only(text, out);
         let toks = &out[start..];
         if toks.len() <= PretokenCache::MAX_TOKENS {
             if !toks.is_empty() {
@@ -534,11 +592,39 @@ impl BytePairEncoder {
 
     /// The merge loop alone (no whole-piece shortcut) on a piece of 2+ bytes.
     fn merge_only(&self, text: &[u8], out: &mut Vec<TokenId>) {
-        match &self.pairs {
-            Some(pairs) if text.len() <= SHORT_MAX => merge_short(pairs, &self.byte_lut, text, out),
-            Some(pairs) => merge_long(pairs, &self.byte_lut, text, out),
+        match &self.core {
+            Some(core) => core.encode(text, out),
             None => out.extend(self.merge_reference(text)),
         }
+    }
+
+    /// [fold] Like [`Self::encode`] but the merge loop starts from bytes
+    /// (no character fold). Equivalence oracle for the fold.
+    #[doc(hidden)]
+    pub fn encode_unfolded(&self, text: &[u8]) -> Vec<TokenId> {
+        let mut out = Vec::new();
+        match text.len() {
+            0 => {}
+            1 => out.push(self.byte_lut[text[0] as usize]),
+            _ => match (self.token_cache.get(text), &self.core) {
+                (Some(&t), _) => out.push(t),
+                (None, Some(core)) => core.encode_unfolded(text, &mut out),
+                (None, None) => out.extend(self.merge_reference(text)),
+            },
+        }
+        out
+    }
+
+    /// [fold] Build-time fold verdicts (`None` without a merge core).
+    #[doc(hidden)]
+    pub fn fold_stats(&self) -> Option<FoldStats> {
+        self.core.as_ref().map(|c| c.fold_stats())
+    }
+
+    /// [fold] Number of symbols the merge loop starts from for `text`.
+    #[doc(hidden)]
+    pub fn seed_len(&self, text: &[u8]) -> usize {
+        self.core.as_ref().map_or(text.len(), |c| c.seed_len(text))
     }
 
     /// The original O(n²) merge loop, kept as the equivalence oracle for
@@ -614,40 +700,132 @@ impl BytePairEncoder {
 pub(crate) struct MergeCore {
     pairs: PairTable,
     byte_lut: [TokenId; 256],
+    /// [fold] Characters seeded as one symbol (see `fold.rs`); `None` when
+    /// none fold or the switch is off.
+    fold: Option<CharFold>,
+    fold_stats: FoldStats,
+    /// Every pair's rank is its merged id (Backtracking cores): merged ids
+    /// come from the pair code itself.
+    rank_is_id: bool,
 }
 
 impl MergeCore {
     /// `pair_lookup` maps packed pairs to `(merged, rank)`; ranks must be
-    /// unique per pair. `None` when the table can't be packed.
-    pub(crate) fn build(pair_lookup: &FoldHashMap<u64, (TokenId, u32)>, byte_lut: [TokenId; 256]) -> Option<Self> {
-        Some(Self { pairs: PairTable::build(pair_lookup)?, byte_lut })
+    /// unique per pair. `tokens` lists every vocab token's bytes (used to
+    /// prove the character fold). `None` when the table can't be packed.
+    pub(crate) fn build<'a>(
+        pair_lookup: &FoldHashMap<u64, (TokenId, u32)>,
+        byte_lut: [TokenId; 256],
+        tokens: impl Iterator<Item = (TokenId, &'a [u8])>,
+    ) -> Option<Self> {
+        let pairs = PairTable::build(pair_lookup)?;
+        let rank_is_id = pair_lookup.values().all(|&(m, r)| m == r);
+        let (fold, fold_stats) = CharFold::build(pair_lookup, &byte_lut, tokens);
+        Some(Self { pairs, byte_lut, fold, fold_stats, rank_is_id })
     }
 
-    /// Encode a piece of 1+ bytes starting from per-byte base tokens.
+    /// Whether any character folds.
+    #[inline]
+    pub(crate) fn fold_stats(&self) -> FoldStats {
+        self.fold_stats
+    }
+
+    /// Whether every pair's rank is its merged id.
+    #[cfg(test)]
+    pub(crate) fn rank_is_id(&self) -> bool {
+        self.rank_is_id
+    }
+
+    /// Encode a piece of 1+ bytes (folded characters as one symbol, other
+    /// bytes as their base tokens).
     #[inline]
     pub(crate) fn encode(&self, text: &[u8], out: &mut Vec<TokenId>) {
+        self.encode_with(text, self.fold.as_ref(), out)
+    }
+
+    /// [fold] Encode starting from per-byte base tokens only.
+    pub(crate) fn encode_unfolded(&self, text: &[u8], out: &mut Vec<TokenId>) {
+        self.encode_with(text, None, out)
+    }
+
+    /// [fold] Symbols the merge loop starts from.
+    pub(crate) fn seed_len(&self, text: &[u8]) -> usize {
+        match &self.fold {
+            Some(f) => {
+                let mut n = 0;
+                fold::seed(f, &self.byte_lut, text, |_| n += 1);
+                n
+            }
+            None => text.len(),
+        }
+    }
+
+    #[inline]
+    fn encode_with(&self, text: &[u8], fold: Option<&CharFold>, out: &mut Vec<TokenId>) {
         match text.len() {
             0 => {}
             1 => out.push(self.byte_lut[text[0] as usize]),
-            n if n <= SHORT_MAX => merge_short(&self.pairs, &self.byte_lut, text, out),
-            _ => merge_long(&self.pairs, &self.byte_lut, text, out),
+            _ if self.rank_is_id => self.encode_impl::<true>(text, fold, out),
+            _ => self.encode_impl::<false>(text, fold, out),
         }
+    }
+
+    #[inline(always)]
+    fn encode_impl<const ID: bool>(&self, text: &[u8], fold: Option<&CharFold>, out: &mut Vec<TokenId>) {
+        let n = text.len();
+        let lut = &self.byte_lut;
+        let Some(f) = fold else {
+            if n <= SHORT_MAX {
+                let mut toks = [0 as TokenId; SHORT_MAX];
+                for (t, &b) in toks.iter_mut().zip(text) {
+                    *t = lut[b as usize];
+                }
+                return merge_short::<ID>(&self.pairs, &mut toks, n, out);
+            }
+            return merge_long::<ID>(&self.pairs, |t| t.extend(text.iter().map(|&b| lut[b as usize])), out);
+        };
+        let short_max = if n <= NONASCII_SHORT_MAX || text.is_ascii() { SHORT_MAX } else { NONASCII_SHORT_MAX };
+        if n <= SHORT_MAX {
+            let mut toks = [0 as TokenId; SHORT_MAX];
+            let mut w = 0;
+            fold::seed(f, lut, text, |t| {
+                toks[w] = t;
+                w += 1;
+            });
+            if w <= short_max {
+                return merge_short::<ID>(&self.pairs, &mut toks, w, out);
+            }
+            return merge_long::<ID>(&self.pairs, |t| t.extend_from_slice(&toks[..w]), out);
+        }
+        if n <= SHORT_FOLD_MAX_BYTES {
+            // [fold] Gate on symbol count: seed once into a byte-sized
+            // buffer, then pick the loop.
+            let mut toks = [0 as TokenId; SHORT_FOLD_MAX_BYTES];
+            let mut w = 0;
+            fold::seed(f, lut, text, |t| {
+                toks[w] = t;
+                w += 1;
+            });
+            if w <= short_max {
+                return merge_short::<ID>(&self.pairs, &mut toks, w, out);
+            }
+            return merge_long::<ID>(&self.pairs, |t| t.extend_from_slice(&toks[..w]), out);
+        }
+        merge_long::<ID>(&self.pairs, |t| fold::seed(f, lut, text, |x| t.push(x)), out)
     }
 }
 
-/// Multipass merge for short pieces: each round takes the lowest pair
-/// code (lowest rank, leftmost on ties; equal ranks are the same
-/// pair). Per-pair codes are carried between rounds so only pairs next
-/// to a merge are looked up again. A SAFE winner merges every
-/// non-overlapping occurrence in the same round.
-fn merge_short(pairs: &PairTable, byte_lut: &[TokenId; 256], text: &[u8], out: &mut Vec<TokenId>) {
-    let n = text.len();
-    debug_assert!((2..=SHORT_MAX).contains(&n));
-    let mut toks = [0 as TokenId; SHORT_MAX];
+/// Multipass merge for short pieces over the `len` seeded symbols in
+/// `toks` (`1..=SHORT_MAX`): each round takes the lowest pair code (lowest
+/// rank, leftmost on ties; equal ranks are the same pair). Per-pair codes
+/// are carried between rounds so only pairs next to a merge are looked up
+/// again. A SAFE winner merges every non-overlapping occurrence in the
+/// same round.
+#[inline(always)]
+fn merge_short<const ID: bool>(pairs: &PairTable, toks: &mut [TokenId], n: usize, out: &mut Vec<TokenId>) {
+    debug_assert!((1..=SHORT_MAX).contains(&n) && n <= toks.len());
+    let toks = &mut toks[..n];
     let mut pv = [NO_MERGE; SHORT_MAX];
-    for (t, &b) in toks.iter_mut().zip(text) {
-        *t = byte_lut[b as usize];
-    }
     for i in 0..n - 1 {
         pv[i] = pairs.get(toks[i], toks[i + 1]);
     }
@@ -664,7 +842,7 @@ fn merge_short(pairs: &PairTable, byte_lut: &[TokenId; 256], text: &[u8], out: &
         if best == NO_MERGE {
             break;
         }
-        let merged = pairs.merged(best);
+        let merged = pairs.merged::<ID>(best);
         if best & SAFE_BIT != 0 {
             // In-place compaction from `pos` (the leftmost occurrence).
             // Unchanged neighbours keep their pair value; pairs touching
@@ -713,32 +891,40 @@ fn merge_short(pairs: &PairTable, byte_lut: &[TokenId; 256], text: &[u8], out: &
     out.extend_from_slice(&toks[..len]);
 }
 
-/// Queue merge for long pieces: symbols in a linked list, candidate
-/// pairs keyed `code << 32 | left position`. Initial pairs sit in a
-/// sorted cold array; pairs created by merges go to a hot heap; the
-/// smaller head wins. Stale entries are dropped on pop (left symbol
-/// dead, no right neighbour, or the current pair's rank differs; ranks
-/// identify pairs uniquely).
-fn merge_long(pairs: &PairTable, byte_lut: &[TokenId; 256], text: &[u8], out: &mut Vec<TokenId>) {
+/// Queue merge for long pieces: `fill` seeds the symbols into a linked
+/// list, candidate pairs keyed `code << 32 | left position`. Initial pairs
+/// sit in a sorted cold array; pairs created by merges go to a hot heap;
+/// the smaller head wins. Each position carries its current pair code
+/// (`NO_MERGE` once dead or last), so a popped entry is stale exactly when
+/// its code differs from the carried one (ranks identify pairs uniquely):
+/// no pair-table probe on pop.
+fn merge_long<const ID: bool>(pairs: &PairTable, fill: impl FnOnce(&mut Vec<TokenId>), out: &mut Vec<TokenId>) {
     LONG_SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
-        let LongScratch { toks, prev, next, cold, hot } = &mut *s;
-        let n = text.len();
-        let n32 = n as u32;
+        let LongScratch { toks, prev, next, code, cold, hot } = &mut *s;
         toks.clear();
-        toks.extend(text.iter().map(|&b| byte_lut[b as usize]));
+        fill(toks);
+        let n = toks.len();
+        if n <= 1 {
+            out.extend_from_slice(toks);
+            return;
+        }
+        let n32 = n as u32;
         prev.clear();
         prev.extend((0..n32).map(|i| i.wrapping_sub(1)));
         next.clear();
         next.extend(1..=n32);
+        code.clear();
         cold.clear();
         hot.clear();
         for i in 0..n - 1 {
             let v = pairs.get(toks[i], toks[i + 1]);
+            code.push(v);
             if v != NO_MERGE {
                 cold.push(((v as u64) << 32) | i as u64);
             }
         }
+        code.push(NO_MERGE);
         cold.sort_unstable();
         let mut ci = 0;
         loop {
@@ -752,30 +938,32 @@ fn merge_long(pairs: &PairTable, byte_lut: &[TokenId; 256], text: &[u8], out: &m
                 (None, None) => break,
             };
             let pos = key as u32 as usize;
-            let nx = next[pos];
-            // Dead symbols have next == DEAD; the last one has next == n.
-            if nx >= n32 {
+            let c = (key >> 32) as u32;
+            if code[pos] != c {
                 continue;
             }
-            let code = (key >> 32) as u32;
-            if pairs.get(toks[pos], toks[nx as usize]) != code {
-                continue;
-            }
-            let merged = pairs.merged(code);
+            let nx = next[pos] as usize;
+            debug_assert!(nx < n);
+            let merged = pairs.merged::<ID>(c);
             toks[pos] = merged;
-            let nn = next[nx as usize];
-            next[nx as usize] = DEAD;
+            let nn = next[nx];
+            next[nx] = DEAD;
+            code[nx] = NO_MERGE;
             next[pos] = nn;
             if nn < n32 {
                 prev[nn as usize] = pos as u32;
                 let v = pairs.get(merged, toks[nn as usize]);
+                code[pos] = v;
                 if v != NO_MERGE {
                     hot.push(Reverse(((v as u64) << 32) | pos as u64));
                 }
+            } else {
+                code[pos] = NO_MERGE;
             }
             let pp = prev[pos];
             if pp < n32 {
                 let v = pairs.get(toks[pp as usize], merged);
+                code[pp as usize] = v;
                 if v != NO_MERGE {
                     hot.push(Reverse(((v as u64) << 32) | pp as u64));
                 }
@@ -992,6 +1180,240 @@ mod tests {
         for _ in 0..500 {
             let text: Vec<u8> = (0..rng.below(120)).map(|_| b'a' + rng.below(3) as u8).collect();
             assert_eq!(rebuilt.encode(&text), rebuilt.encode_reference(&text));
+        }
+    }
+
+    // ---- [fold] character fold ------------------------------------------
+
+    const FOLD_CHARS: &[&str] = &["é", "ж", "中", "文", "朝", "日", "😀", "ñ", "語"];
+
+    /// Byte-level vocab whose merges assemble some multi-byte characters
+    /// (in random association order) plus random merges across tokens,
+    /// including ones straddling character boundaries. `monotone`: every
+    /// merged id is new and above its operands (rank = merged id usable).
+    fn random_utf8_vocab(rng: &mut Rng, n_random: usize, monotone: bool) -> (Vec<(u32, Vec<u8>)>, Vec<(u32, u32)>) {
+        let mut vocab: Vec<(u32, Vec<u8>)> = (0..256u32).map(|b| (b, vec![b as u8])).collect();
+        let mut merges: Vec<(u32, u32)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut add = |vocab: &mut Vec<(u32, Vec<u8>)>, merges: &mut Vec<(u32, u32)>, l: u32, r: u32| -> Option<u32> {
+            let mut bytes = vocab[l as usize].1.clone();
+            bytes.extend_from_slice(&vocab[r as usize].1);
+            if bytes.len() > 12 || !seen.insert((l, r)) {
+                return None;
+            }
+            let id = match vocab.iter().position(|(_, b)| *b == bytes) {
+                Some(_) if monotone => return None,
+                Some(i) => i as u32,
+                None => {
+                    vocab.push((vocab.len() as u32, bytes));
+                    vocab.len() as u32 - 1
+                }
+            };
+            merges.push((l, r));
+            Some(id)
+        };
+        let ascii = b"xyz ";
+        for _ in 0..n_random {
+            match rng.below(3) {
+                0 => {
+                    // Assemble a character, left- or right-associated.
+                    let c = FOLD_CHARS[rng.below(FOLD_CHARS.len())].as_bytes();
+                    let mut toks: Vec<u32> = c.iter().map(|&b| b as u32).collect();
+                    while toks.len() > 1 {
+                        let i = rng.below(toks.len() - 1);
+                        let Some(m) = add(&mut vocab, &mut merges, toks[i], toks[i + 1]) else { break };
+                        toks[i] = m;
+                        toks.remove(i + 1);
+                    }
+                }
+                _ => {
+                    // Random pair of existing tokens / ascii / char bytes.
+                    let pick = |rng: &mut Rng, vocab: &Vec<(u32, Vec<u8>)>| -> u32 {
+                        match rng.below(3) {
+                            0 => ascii[rng.below(ascii.len())] as u32,
+                            1 => {
+                                let c = FOLD_CHARS[rng.below(FOLD_CHARS.len())].as_bytes();
+                                c[rng.below(c.len())] as u32
+                            }
+                            _ if vocab.len() > 256 => 256 + rng.below(vocab.len() - 256) as u32,
+                            _ => ascii[0] as u32,
+                        }
+                    };
+                    let (l, r) = (pick(rng, &vocab), pick(rng, &vocab));
+                    add(&mut vocab, &mut merges, l, r);
+                }
+            }
+        }
+        if !monotone {
+            for i in (1..merges.len()).rev() {
+                merges.swap(i, rng.below(i + 1));
+            }
+        }
+        (vocab, merges)
+    }
+
+    /// Text of random chars, ascii, stray bytes and truncated characters.
+    fn random_utf8_text(rng: &mut Rng, max_parts: usize) -> Vec<u8> {
+        let mut t = Vec::new();
+        for _ in 0..rng.below(max_parts + 1) {
+            match rng.below(10) {
+                0..=4 => t.extend_from_slice(FOLD_CHARS[rng.below(FOLD_CHARS.len())].as_bytes()),
+                5..=6 => t.push(b"xyz "[rng.below(4)]),
+                7 => t.push(rng.below(256) as u8),
+                8 => {
+                    let c = FOLD_CHARS[rng.below(FOLD_CHARS.len())].as_bytes();
+                    t.extend_from_slice(&c[..1 + rng.below(c.len())]);
+                }
+                _ => t.push([0x80, 0xBF, 0xC0, 0xC1, 0xE6, 0xF0, 0xFF][rng.below(7)]),
+            }
+        }
+        t
+    }
+
+    /// Plain BPE (lowest rank, leftmost) from bytes over `(merged, rank)`.
+    fn ref_bpe(pairs: &FoldHashMap<u64, (TokenId, u32)>, text: &[u8]) -> Vec<TokenId> {
+        let mut t: Vec<TokenId> = text.iter().map(|&b| b as TokenId).collect();
+        loop {
+            let best = (0..t.len().saturating_sub(1))
+                .filter_map(|i| pairs.get(&pack_pair(t[i], t[i + 1])).map(|&(m, r)| (r, i, m)))
+                .min();
+            let Some((_, i, m)) = best else { return t };
+            t[i] = m;
+            t.remove(i + 1);
+        }
+    }
+
+    #[test]
+    fn test_fold_matches_unfolded_on_random_utf8_vocabs() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let (mut folded_rounds, mut step_rejects, mut final_rejects) = (0, 0, 0);
+        for round in 0..200 {
+            let monotone = round % 2 == 1;
+            let (vocab, merges) = random_utf8_vocab(&mut rng, 20 + round % 60, monotone);
+            let token_bytes: Vec<Vec<u8>> = vocab.iter().map(|(_, b)| b.clone()).collect();
+            let lut: [TokenId; 256] = std::array::from_fn(|b| b as TokenId);
+            // Simple (merge-index ranks) and Backtracking-style (rank = id).
+            let mut pl: FoldHashMap<u64, (TokenId, u32)> = FoldHashMap::default();
+            let ids: FoldHashMap<&[u8], u32> = token_bytes.iter().enumerate().map(|(i, b)| (b.as_slice(), i as u32)).collect();
+            for (rank, &(l, r)) in merges.iter().enumerate() {
+                let mut b = token_bytes[l as usize].clone();
+                b.extend_from_slice(&token_bytes[r as usize]);
+                let m = ids[b.as_slice()];
+                pl.entry(pack_pair(l, r)).or_insert((m, if monotone { m } else { rank as u32 }));
+            }
+            let tokens = token_bytes.iter().enumerate().map(|(i, b)| (i as TokenId, b.as_slice()));
+            let core = MergeCore::build(&pl, lut, tokens).expect("packable");
+            assert_eq!(core.rank_is_id(), monotone);
+            let st = core.fold_stats();
+            folded_rounds += (st.folded > 0) as usize;
+            step_rejects += st.unsafe_step;
+            final_rejects += st.unsafe_final;
+            if monotone {
+                assert_eq!(st.unsafe_final, 0, "id-monotone vocabs satisfy the final guard");
+            }
+            let (enc, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, false);
+            for i in 0..300 {
+                let text = random_utf8_text(&mut rng, if i % 20 == 0 { 120 } else { 12 });
+                let want = ref_bpe(&pl, &text);
+                let (mut got, mut unf) = (Vec::new(), Vec::new());
+                core.encode(&text, &mut got);
+                core.encode_unfolded(&text, &mut unf);
+                assert_eq!(unf, want, "round {round} unfolded {text:x?}");
+                assert_eq!(got, want, "round {round} folded {text:x?} (seed {} syms)", core.seed_len(&text));
+                if !monotone {
+                    assert_eq!(enc.encode(&text), enc.encode_reference(&text), "round {round} simple {text:x?}");
+                }
+            }
+        }
+        assert!(folded_rounds > 50, "fold too rarely admitted: {folded_rounds}");
+        assert!(step_rejects > 0 && final_rejects > 0, "guards never exercised: {step_rejects} {final_rejects}");
+    }
+
+    /// Byte-level vocab over all 256 bytes plus `extra` tokens and merges
+    /// (`(left bytes, right bytes)` in rank order).
+    fn byte_vocab(merges: &[(&[u8], &[u8])]) -> (Vec<(u32, Vec<u8>)>, Vec<(u32, u32)>) {
+        let mut vocab: Vec<(u32, Vec<u8>)> = (0..256u32).map(|b| (b, vec![b as u8])).collect();
+        let mut ids = Vec::new();
+        for &(l, r) in merges {
+            let id_of = |vocab: &mut Vec<(u32, Vec<u8>)>, b: &[u8]| -> u32 {
+                match vocab.iter().position(|(_, x)| x == b) {
+                    Some(i) => i as u32,
+                    None => {
+                        vocab.push((vocab.len() as u32, b.to_vec()));
+                        vocab.len() as u32 - 1
+                    }
+                }
+            };
+            let (li, ri) = (id_of(&mut vocab, l), id_of(&mut vocab, r));
+            id_of(&mut vocab, &[l, r].concat());
+            ids.push((li, ri));
+        }
+        (vocab, ids)
+    }
+
+    #[test]
+    fn test_fold_rejects_boundary_steal() {
+        // 朝 = E6 9C 9D assembles via (E6,9C) then (E6 9C, 9D); the thief
+        // (9D, E6) at rank 0 straddles a boundary in "朝朝": HF's guard.
+        let thief: &[(&[u8], &[u8])] = &[(b"\x9d", b"\xe6"), (b"\xe6", b"\x9c"), (b"\xe6\x9c", b"\x9d")];
+        let (vocab, merges) = byte_vocab(thief);
+        let (enc, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, false);
+        let st = enc.fold_stats().unwrap();
+        assert_eq!((st.folded, st.unsafe_step), (0, 1));
+        let t = "朝朝".as_bytes();
+        assert_eq!(enc.encode(t), enc.merge_reference(t));
+        // Without the thief it folds.
+        let (vocab, merges) = byte_vocab(&thief[1..]);
+        let (enc, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, false);
+        assert_eq!(enc.fold_stats().unwrap().folded, 1);
+        assert_eq!(enc.seed_len(t), 2);
+        assert_eq!(enc.encode(t), enc.merge_reference(t));
+    }
+
+    #[test]
+    fn test_fold_rejects_low_rank_merge_into_folded_token() {
+        // HF's step guard passes for é (C3 A9, nothing takes C3 from the
+        // left or A9 from the right), but ("y", "é") outranks é's own
+        // assembly: folding "xyé" would give [x, yé], BPE gives [xy, é].
+        let (vocab, merges) = byte_vocab(&[(b"y", "é".as_bytes()), (b"x", b"y"), (b"\xc3", b"\xa9")]);
+        let (enc, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, false);
+        let st = enc.fold_stats().unwrap();
+        assert_eq!((st.folded, st.unsafe_step, st.unsafe_final), (0, 0, 1));
+        let t = "xyé".as_bytes();
+        let want = enc.merge_reference(t);
+        assert_eq!(want.len(), 2);
+        assert_eq!(vocab[want[0] as usize].1, b"xy");
+        assert_eq!(enc.encode(t), want);
+    }
+
+    #[test]
+    fn test_fold_skips_invalid_utf8_neighbours() {
+        // 朝 folds (no valid-UTF-8 neighbour can steal), but a stray lead
+        // byte E6 before it can: (E6, E6) is not a boundary merge, so the
+        // encoder must not fold there.
+        let (vocab, merges) = byte_vocab(&[(b"\xe6", b"\xe6"), (b"\xe6", b"\x9c"), (b"\xe6\x9c", b"\x9d"), (b"\x9d", b"\x80")]);
+        let (enc, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, false);
+        assert_eq!(enc.fold_stats().unwrap().folded, 1);
+        for t in [&b"\xe6\xe6\x9c\x9d"[..], b"\xe6\x9c\x9d\x80", b"a\xe6\x9c\x9d", b"\xe6\x9c\x9d\xe6\x9c"] {
+            assert_eq!(enc.encode(t), enc.merge_reference(t), "{t:x?}");
+            assert_eq!(enc.encode(t), enc.encode_unfolded(t), "{t:x?}");
+        }
+        assert_eq!(enc.seed_len(b"\xe6\xe6\x9c\x9d"), 4);
+        assert_eq!(enc.seed_len(b"a\xe6\x9c\x9d"), 2);
+    }
+
+    #[test]
+    fn test_fold_short_long_gate() {
+        // Pieces past SHORT_MAX bytes that fold to <= SHORT_MAX symbols, and
+        // longer ones, agree with the unfolded queue.
+        let (vocab, merges) = byte_vocab(&[(b"\xe4\xb8", b"\xad"), (b"\xe4", b"\xb8"), (b"\xe6\x96", b"\x87"), (b"\xe6", b"\x96")]);
+        let (enc, _) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, false);
+        assert_eq!(enc.fold_stats().unwrap().folded, 2);
+        for n in [20, 21, 22, 64, 65, 100, 300] {
+            let t: Vec<u8> = (0..n).flat_map(|i| if i % 3 == 0 { "文".as_bytes() } else { "中".as_bytes() }).copied().collect();
+            assert_eq!(enc.seed_len(&t), n);
+            assert_eq!(enc.encode(&t), enc.merge_reference(&t));
+            assert_eq!(enc.encode(&t), enc.encode_unfolded(&t));
         }
     }
 }

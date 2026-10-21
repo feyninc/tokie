@@ -319,22 +319,33 @@ struct FirstBytes {
     set: [bool; 256],
     few: [u8; 3],
     n: usize,
+    /// Second bytes of the patterns, and whether every pattern has one.
+    /// With a single shared first byte (`<` of `<|...|>`, `[` of BERT's
+    /// `[CLS]`) the scan checks the byte after each occurrence too, so
+    /// code with plain `<` / `[` still skips the matcher.
+    second: [bool; 256],
+    all_two: bool,
 }
 
 impl Default for FirstBytes {
     fn default() -> Self {
-        Self { set: [false; 256], few: [0; 3], n: 0 }
+        Self { set: [false; 256], few: [0; 3], n: 0, second: [false; 256], all_two: true }
     }
 }
 
 impl FirstBytes {
-    fn add(&mut self, b: u8) {
+    fn add(&mut self, pattern: &[u8]) {
+        let b = pattern[0];
         if !self.set[b as usize] {
             self.set[b as usize] = true;
             if self.n < 3 {
                 self.few[self.n] = b;
             }
             self.n += 1;
+        }
+        match pattern.get(1) {
+            Some(&b1) => self.second[b1 as usize] = true,
+            None => self.all_two = false,
         }
     }
 
@@ -343,6 +354,19 @@ impl FirstBytes {
     fn may_occur(&self, hay: &[u8]) -> bool {
         match self.n {
             0 => false,
+            1 if self.all_two => {
+                // A match starts with the first byte followed by one of the
+                // patterns' second bytes.
+                let mut from = 0;
+                while let Some(i) = memchr::memchr(self.few[0], &hay[from..]) {
+                    let j = from + i;
+                    if hay.get(j + 1).is_some_and(|&b| self.second[b as usize]) {
+                        return true;
+                    }
+                    from = j + 1;
+                }
+                false
+            }
             1 => memchr::memchr(self.few[0], hay).is_some(),
             2 => memchr::memchr2(self.few[0], self.few[1], hay).is_some(),
             3 => memchr::memchr3(self.few[0], self.few[1], self.few[2], hay).is_some(),
@@ -350,6 +374,13 @@ impl FirstBytes {
         }
     }
 }
+
+/// Shortest text that Backtracking/Simple encode through the
+/// pretokenizer's block drain and [`PretokenCache::encode_block`] (keys,
+/// then a paired probe with fixed-width emit) instead of one closure call
+/// per piece. Shorter ones (added-token segments, mostly) take the
+/// per-piece walk, whose setup is cheaper.
+const BLOCK_MIN_LEN: usize = 64;
 
 /// Approximation of the regex `\w` class HF uses for `single_word`
 /// boundaries: alphanumerics plus underscore.
@@ -528,19 +559,19 @@ impl Tokenizer {
                         let pattern = self.normalizer.normalize(s);
                         if !pattern.is_empty() {
                             norm_trie.add(pattern.as_ref().as_bytes(), idx as u32);
-                            norm_first.add(pattern.as_ref().as_bytes()[0]);
+                            norm_first.add(pattern.as_ref().as_bytes());
                             norm_count += 1;
                         }
                     }
                     Err(_) => {
                         raw_trie.add(&tok.bytes, idx as u32);
-                        raw_first.add(tok.bytes[0]);
+                        raw_first.add(&tok.bytes);
                         raw_count += 1;
                     }
                 }
             } else {
                 raw_trie.add(&tok.bytes, idx as u32);
-                raw_first.add(tok.bytes[0]);
+                raw_first.add(&tok.bytes);
                 raw_count += 1;
             }
         }
@@ -1192,9 +1223,19 @@ impl Tokenizer {
                 // the Backtracking fused path.
                 Some(c) => {
                     let pc = &mut c.pretok;
-                    pretok.for_each_piece(text, |p| {
-                        bt.encode_piece_into(db, p.as_bytes(), Some(&mut *pc), out)
-                    })
+                    if pc.wants_seed() {
+                        pc.seed(bt.cache_seeds());
+                    }
+                    // Block drain: keys and probes for a block of pieces run
+                    // in their own loops instead of inside the walker.
+                    let blocked = text.len() >= BLOCK_MIN_LEN && pretok.for_each_block(text, &mut |start, ends| {
+                        pc.encode_block(db, start, ends, out, |c, p, o| bt.encode_piece_into(db, p, Some(c), o))
+                    });
+                    if !blocked {
+                        pretok.for_each_piece(text, |p| {
+                            bt.encode_piece_into(db, p.as_bytes(), Some(&mut *pc), out)
+                        })
+                    }
                 }
                 None => pretok.for_each_piece(text, |p| {
                     bt.encode_piece_into(db, p.as_bytes(), None, out)
@@ -1207,9 +1248,22 @@ impl Tokenizer {
             })
         } else if let Some(se) = self.encoder.as_simple() {
             let mut pc = cache.map(|c| &mut c.pretok);
-            pretok.for_each_piece(text, |p| {
-                se.encode_piece_into(db, p.as_bytes(), pc.as_deref_mut(), out)
-            })
+            if let Some(c) = pc.as_deref_mut() {
+                if c.wants_seed() {
+                    c.seed(se.cache_seeds());
+                }
+            }
+            let blocked = match pc.as_deref_mut() {
+                Some(c) if text.len() >= BLOCK_MIN_LEN => pretok.for_each_block(text, &mut |start, ends| {
+                    c.encode_block(db, start, ends, out, |c, p, o| se.encode_piece_into(db, p, Some(c), o))
+                }),
+                _ => false,
+            };
+            if !blocked {
+                pretok.for_each_piece(text, |p| {
+                    se.encode_piece_into(db, p.as_bytes(), pc.as_deref_mut(), out)
+                })
+            }
         } else {
             for piece in pretok.split(text) {
                 self.encoder.encode_piece_into(db, piece.as_bytes(), cache.as_deref_mut(), out);
@@ -2451,5 +2505,38 @@ mod tests {
         let enc = tokenizer.encode_with_offsets("abcde", false);
         assert!(enc.ids.len() <= 2);
         assert_eq!(enc.ids.len(), enc.offsets.len());
+    }
+
+    /// The added-token prefilter never rules out a text in which some
+    /// pattern occurs.
+    #[test]
+    fn first_bytes_prefilter_is_conservative() {
+        let sets: &[&[&[u8]]] = &[
+            &[b"<|endoftext|>"],
+            &[b"<|im_start|>", b"<|im_end|>", b"<s>"],
+            &[b"[CLS]", b"[SEP]", b"[PAD]", b"[MASK]", b"[UNK]"],
+            &[b"a", b"bc"],
+            &[b"<", b"<|x"],
+            &[b"xy", b"zw", b"q", b"rs"],
+        ];
+        let alphabet = b"<|[]CSPMUabcxyzqrsw ";
+        let mut state = 0x9E3779B97F4A7C15u64;
+        for pats in sets {
+            let mut fb = FirstBytes::default();
+            for p in *pats {
+                fb.add(p);
+            }
+            for _ in 0..20_000 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let len = (state >> 58) as usize;
+                let hay: Vec<u8> = (0..len)
+                    .map(|k| alphabet[((state >> (k % 50)) as usize ^ k * 7) % alphabet.len()])
+                    .collect();
+                let occurs = pats.iter().any(|p| hay.windows(p.len()).any(|w| w == *p));
+                if occurs {
+                    assert!(fb.may_occur(&hay), "{pats:?} occur in {:?}", String::from_utf8_lossy(&hay));
+                }
+            }
+        }
     }
 }

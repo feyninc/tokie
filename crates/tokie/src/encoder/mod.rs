@@ -10,6 +10,7 @@
 //! The [`Encoder`] enum wraps these implementations for use in the Tokenizer.
 
 mod backtracking;
+mod fold;
 mod sentencepiece;
 mod simple;
 mod unigram;
@@ -17,6 +18,8 @@ mod units;
 mod wordpiece;
 
 pub use backtracking::{BacktrackingBytePairEncoder, EncodeIter, PretokenCache};
+#[doc(hidden)]
+pub use fold::FoldStats;
 pub use sentencepiece::{EncodeState, SentencePieceBPE};
 pub use simple::BytePairEncoder;
 pub use unigram::{UnigramEncoder, UnigramPieceCache};

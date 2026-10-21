@@ -183,6 +183,10 @@ name = "w3_simple"
 required-features = ["hf"]
 
 [[example]]
+name = "perf_encode"
+required-features = ["hf"]
+
+[[example]]
 name = "w4_split_audit"
 required-features = ["hf"]
 

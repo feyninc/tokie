@@ -1188,6 +1188,9 @@ pub mod bench_internal {
 // The batch walker
 // =======================================================================
 
+/// Pieces per [`Mask::for_each_block`] call.
+const SPAN_BLOCK: usize = 256;
+
 /// Scheme-agnostic mask-scanner state: pops trusted boundary bits, walks
 /// bad zones through `Core`, runs the buffer tail scalar, and precomputes
 /// one batch ahead so the SIMD chain retires under the previous batch's
@@ -1472,6 +1475,53 @@ impl<'a, C: PretokConfig> Mask<'a, C> {
         }
     }
 
+    /// Bulk drain in blocks: the same pieces as [`Self::for_each_piece`],
+    /// delivered as `f(start, ends)`. The block's first piece starts at
+    /// byte `start`; piece `i` ends at `start + ends[i]` and the next one
+    /// starts there (pieces are contiguous). Up to [`Self::BLOCK`] pieces
+    /// per call.
+    ///
+    /// The consumer runs behind a `dyn` call once per block, so it never
+    /// shares a register allocation with the walker: a consumer can build
+    /// keys and probe caches for a whole block in its own tight loops.
+    #[doc(hidden)]
+    pub fn for_each_block(&mut self, f: &mut dyn FnMut(usize, &[u32])) {
+        let mut buf = [std::mem::MaybeUninit::<u32>::uninit(); SPAN_BLOCK];
+        let mut n = 0usize;
+        let mut block_start = self.state.pos;
+        // Offsets from a block start always fit a u32 below 4 GiB of text.
+        let huge = self.text.len() > u32::MAX as usize;
+        let emit = |start: usize, end: usize| {
+            // Flush when full, or (texts over 4 GiB only) early when this
+            // piece's end would not fit a u32 offset from the block start.
+            if n == SPAN_BLOCK || (huge && n > 0 && end - block_start > u32::MAX as usize) {
+                // SAFETY: the first `n` slots were written below.
+                f(block_start, unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u32, n) });
+                block_start = start;
+                n = 0;
+            }
+            // A single piece over 4 GiB cannot be expressed; refuse it
+            // rather than wrap the offset.
+            assert!(!huge || end - block_start <= u32::MAX as usize, "piece over 4 GiB");
+            buf[n].write((end - block_start) as u32);
+            n += 1;
+        };
+        let text = self.text;
+        match self.isa {
+            // SAFETY: `isa` is only `Avx2` when AVX2 was detected.
+            #[cfg(target_arch = "x86_64")]
+            MaskIsa::Avx2 => unsafe { avx2_for_each_span::<C, _>(&mut self.state, text, emit) },
+            _ => self.state.for_each_span::<C, Base, _>(text, emit),
+        }
+        if n > 0 {
+            // SAFETY: as above.
+            f(block_start, unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u32, n) });
+        }
+    }
+
+    /// Most pieces per [`Self::for_each_block`] call.
+    pub const BLOCK: usize = SPAN_BLOCK;
+
     /// Visit every piece of `text` via an inline callback, byte-identical
     /// to iterating this `Mask` to exhaustion. Drains trusted boundary
     /// runs in a tight loop instead of one piece per `next()` — the
@@ -1545,7 +1595,25 @@ mod tests {
             let mut bulk: Vec<&str> = Vec::new();
             Mask::<C>::with_isa(text, isa).for_each_piece(|p| bulk.push(p));
             assert_eq!(bulk, scalar, "{isa:?}: for_each_piece vs core mismatch on {text:?}");
+            // So must the block drain (contiguous pieces, relative ends).
+            let mut blocks: Vec<&str> = Vec::new();
+            Mask::<C>::with_isa(text, isa).for_each_block(&mut |start, ends| {
+                let mut s = start;
+                for &e in ends {
+                    let e = start + e as usize;
+                    blocks.push(&text[s..e]);
+                    s = e;
+                }
+            });
+            assert_eq!(blocks, scalar, "{isa:?}: for_each_block vs core mismatch on {text:?}");
         }
+    }
+
+    /// Texts with more pieces than one block holds cross block boundaries.
+    #[test]
+    fn block_drain_spans_many_blocks() {
+        let text = "a b, c\td.\n".repeat(400);
+        check_all(&text);
     }
 
     fn check_all(text: &str) {
