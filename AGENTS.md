@@ -9,7 +9,7 @@ License is MIT OR Apache-2.0.
 | Path | Package | Role |
 | --- | --- | --- |
 | `crates/tokie` | `tokie` 0.1.4 | Tokenizer library. Encode, decode, and load from Hugging Face. |
-| `crates/pretokie` | `pretokie` 0.1.3 | Pretokenizers used by tokie. Splits text into pieces before the model encodes them. |
+| `crates/pretokie` | `pretokie` 0.2.0 | Pretokenizers used by tokie. Splits text into pieces before the model encodes them. |
 | `crates/tokie-python` | `tokie-python` | PyO3 bindings. The Python module name is `tokie`. |
 | `crates/tokie-cli` | `tokie-cli` | `tokie` binary for building, verifying, and uploading tokenizers. |
 
