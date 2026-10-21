@@ -4,12 +4,14 @@
 //! popcounts boundaries. gigatoken iter yields each piece. gigatoken fill
 //! also packs a cache key and prefetches it.
 
-use gigatoken_rs::pretokenize::fast::FastO200kPretokenizer;
+use gigatoken_rs::pretokenize::fast::{
+    FastKimiPretokenizer, FastNemotronPretokenizer, FastO200kPretokenizer,
+};
 use gigatoken_rs::pretokenize::{
     FastCl100kPretokenizer, FastOlmo3Pretokenizer, FastQwen2Pretokenizer, FastQwen35Pretokenizer,
     FastR50kPretokenizer, PretokenSpans, SpanBatch, PRETOKEN_CHUNK,
 };
-use pretokie::{Cl100k, Gpt2, O200k, Olmo, Qwen, SmolLM, Span, Voyage};
+use pretokie::{Cl100k, Gpt2, Kimi, Nemotron, O200k, Olmo, Qwen, SmolLM, Span, Voyage};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -22,6 +24,8 @@ enum Mode {
     Olmo,
     Qwen,
     O200k,
+    Nemotron,
+    Kimi,
 }
 
 fn main() {
@@ -64,6 +68,8 @@ fn main() {
             "--olmo" => mode = select(&mut chosen, Mode::Olmo),
             "--qwen" => mode = select(&mut chosen, Mode::Qwen),
             "--o200k" => mode = select(&mut chosen, Mode::O200k),
+            "--nemotron" => mode = select(&mut chosen, Mode::Nemotron),
+            "--kimi" => mode = select(&mut chosen, Mode::Kimi),
             "--diff" => diff = true,
             other => panic!("unknown argument: {other}"),
         }
@@ -106,6 +112,8 @@ fn main() {
         Mode::Olmo => report(fill_name, measure(reps, valid, || fill_olmo(text))),
         Mode::Qwen => report(fill_name, measure(reps, valid, || fill_qwen(text))),
         Mode::O200k => report(fill_name, measure(reps, valid, || fill_o200k(text))),
+        Mode::Nemotron => report(fill_name, measure(reps, valid, || fill_nemotron(text))),
+        Mode::Kimi => report(fill_name, measure(reps, valid, || fill_kimi(text))),
     };
     let count_pieces = match mode {
         Mode::Gpt2 => report(count_name, measure(reps, valid, || Gpt2::count(text))),
@@ -115,6 +123,8 @@ fn main() {
         Mode::Olmo => report(count_name, measure(reps, valid, || Olmo::count(text))),
         Mode::Qwen => report(count_name, measure(reps, valid, || Qwen::count(text))),
         Mode::O200k => report(count_name, measure(reps, valid, || O200k::count(text))),
+        Mode::Nemotron => report(count_name, measure(reps, valid, || Nemotron::count(text))),
+        Mode::Kimi => report(count_name, measure(reps, valid, || Kimi::count(text))),
     };
     let iter_pieces = match mode {
         Mode::Gpt2 | Mode::SmolLM => {
@@ -139,6 +149,14 @@ fn main() {
         Mode::O200k => report(
             "gigatoken iter",
             measure(reps, valid, || iter_count(FastO200kPretokenizer::new(&bytes))),
+        ),
+        Mode::Nemotron => report(
+            "gigatoken iter",
+            measure(reps, valid, || iter_count(FastNemotronPretokenizer::new(&bytes))),
+        ),
+        Mode::Kimi => report(
+            "gigatoken iter",
+            measure(reps, valid, || iter_count(FastKimiPretokenizer::new(&bytes))),
         ),
     };
     let giga_pieces = match mode {
@@ -165,6 +183,14 @@ fn main() {
             "gigatoken fill",
             measure(reps, valid, || fill_spans(FastO200kPretokenizer::new(&bytes))),
         ),
+        Mode::Nemotron => report(
+            "gigatoken fill",
+            measure(reps, valid, || fill_spans(FastNemotronPretokenizer::new(&bytes))),
+        ),
+        Mode::Kimi => report(
+            "gigatoken fill",
+            measure(reps, valid, || fill_spans(FastKimiPretokenizer::new(&bytes))),
+        ),
     };
     if count_pieces != fill_pieces {
         eprintln!("piece count mismatch: {fill_name}={fill_pieces} {count_name}={count_pieces}");
@@ -185,7 +211,7 @@ fn main() {
 fn select(chosen: &mut bool, mode: Mode) -> Mode {
     assert!(
         !*chosen,
-        "pass only one of --smollm --cl100k --voyage --olmo --qwen --o200k"
+        "pass only one of --smollm --cl100k --voyage --olmo --qwen --o200k --nemotron --kimi"
     );
     *chosen = true;
     mode
@@ -200,6 +226,8 @@ fn names(mode: Mode) -> (&'static str, &'static str) {
         Mode::Olmo => ("olmo fill", "olmo count"),
         Mode::Qwen => ("qwen fill", "qwen count"),
         Mode::O200k => ("o200k fill", "o200k count"),
+        Mode::Nemotron => ("nemotron fill", "nemotron count"),
+        Mode::Kimi => ("kimi fill", "kimi count"),
     }
 }
 
@@ -267,6 +295,16 @@ fn fill_o200k(text: &str) -> usize {
     fill_walk(|buf| walk.fill(buf))
 }
 
+fn fill_nemotron(text: &str) -> usize {
+    let mut walk = Nemotron::walk(text);
+    fill_walk(|buf| walk.fill(buf))
+}
+
+fn fill_kimi(text: &str) -> usize {
+    let mut walk = Kimi::walk(text);
+    fill_walk(|buf| walk.fill(buf))
+}
+
 fn show_diff(bytes: &[u8], mode: Mode) {
     let text = std::str::from_utf8(bytes).unwrap();
     match mode {
@@ -321,6 +359,24 @@ fn show_diff(bytes: &[u8], mode: Mode) {
                 bytes,
                 |buf| walk.fill(buf),
                 FastO200kPretokenizer::new(bytes),
+            );
+        }
+        Mode::Nemotron => {
+            let mut walk = Nemotron::walk(text);
+            diff_against(
+                text,
+                bytes,
+                |buf| walk.fill(buf),
+                FastNemotronPretokenizer::new(bytes),
+            );
+        }
+        Mode::Kimi => {
+            let mut walk = Kimi::walk(text);
+            diff_against(
+                text,
+                bytes,
+                |buf| walk.fill(buf),
+                FastKimiPretokenizer::new(bytes),
             );
         }
     }

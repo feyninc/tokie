@@ -1,70 +1,109 @@
-//! o200k split rules.
+//! o200k split rules, and the siblings that share them.
 //!
 //! A letter run is case-structured: capitals stay together until a
 //! lowercase letter, and a capital after a lowercase letter starts a new
-//! piece (`camelCase` is `camel` and `Case`). A contraction is a suffix of
-//! that piece (`don't` stays whole). Numbers come in groups of up to three.
-//! Punctuation keeps a following run of newlines and slashes. Whitespace
-//! keeps a newline run through its last newline.
+//! piece (`camelCase` is `camel` and `Case`). [`O200k`] and [`Kimi`] glue
+//! a contraction onto that piece (`don't` stays whole). [`Nemotron`] leaves
+//! the contraction as its own piece. [`O200k`] and [`Kimi`] take numbers in
+//! groups of up to three. [`Nemotron`] takes each number character alone.
+//! [`O200k`] and [`Nemotron`] keep a following run of newlines and slashes
+//! on punctuation. [`Kimi`] keeps newlines only, and a Han run is its own
+//! piece. Whitespace keeps a newline run through its last newline.
 
 use crate::walk::classify::{masks_for, Masks};
 use crate::walk::{Scheme, Walk, Window};
 use crate::Span;
 use unicode_general_category::{get_general_category, GeneralCategory};
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct O200k;
+macro_rules! family {
+    ($(#[$meta:meta])* $name:ident, $walk:ident, $contractions:literal, $digits3:literal, $slash:literal, $han:literal) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct $name;
 
-/// Pulls pieces in batches. Create one with [`O200k::walk`].
-pub struct O200kWalk<'a> {
-    inner: Walk<'a, O200k>,
-}
-
-impl O200k {
-    /// Number of pieces in `text`.
-    pub fn count(text: &str) -> usize {
-        Self::count_upto(text, usize::MAX)
-    }
-
-    /// Number of pieces, stopping once the count passes `limit`.
-    ///
-    /// Returns `limit + 1` when the text has more pieces than `limit`.
-    pub fn count_upto(text: &str, limit: usize) -> usize {
-        Walk::<O200k>::new(text).count_upto(limit)
-    }
-
-    /// Write every piece of `text` that fits in `out`. Returns how many were written.
-    pub fn fill(text: &str, out: &mut [Span]) -> usize {
-        Self::walk(text).fill(out)
-    }
-
-    /// Cursor for pulling pieces in batches.
-    pub fn walk(text: &str) -> O200kWalk<'_> {
-        O200kWalk {
-            inner: Walk::new(text),
+        /// Pulls pieces in batches. Create one with [`$name::walk`].
+        pub struct $walk<'a> {
+            inner: Walk<'a, $name>,
         }
-    }
+
+        impl $name {
+            /// Number of pieces in `text`.
+            pub fn count(text: &str) -> usize {
+                Self::count_upto(text, usize::MAX)
+            }
+
+            /// Number of pieces, stopping once the count passes `limit`.
+            ///
+            /// Returns `limit + 1` when the text has more pieces than `limit`.
+            pub fn count_upto(text: &str, limit: usize) -> usize {
+                Walk::<$name>::new(text).count_upto(limit)
+            }
+
+            /// Write every piece of `text` that fits in `out`. Returns how many were written.
+            pub fn fill(text: &str, out: &mut [Span]) -> usize {
+                Self::walk(text).fill(out)
+            }
+
+            /// Cursor for pulling pieces in batches.
+            pub fn walk(text: &str) -> $walk<'_> {
+                $walk {
+                    inner: Walk::new(text),
+                }
+            }
+        }
+
+        impl $walk<'_> {
+            /// Write the next pieces into `out`. Returns how many were written.
+            /// A short count means the text is finished.
+            pub fn fill(&mut self, out: &mut [Span]) -> usize {
+                self.inner.fill(out)
+            }
+        }
+
+        impl Scheme for $name {
+            #[inline]
+            fn advance(bytes: &[u8], pos: usize) -> usize {
+                advance::<$contractions, $digits3, $slash, $han>(bytes, pos)
+            }
+
+            #[inline(always)]
+            fn try_window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
+                window::<ISA, $contractions, $digits3, $slash, $han>(bytes, pos)
+            }
+        }
+    };
 }
 
-impl O200kWalk<'_> {
-    /// Write the next pieces into `out`. Returns how many were written.
-    /// A short count means the text is finished.
-    pub fn fill(&mut self, out: &mut [Span]) -> usize {
-        self.inner.fill(out)
-    }
-}
-
-impl Scheme for O200k {
-    #[inline]
-    fn advance(bytes: &[u8], pos: usize) -> usize {
-        advance(bytes, pos)
-    }
-
-    #[inline(always)]
-    fn try_window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
-        window::<ISA>(bytes, pos)
-    }
-}
+family!(
+    /// o200k pretokenizer. Contractions stay on the word, numbers come in
+    /// groups of up to three, and punctuation keeps newlines and slashes.
+    O200k,
+    O200kWalk,
+    true,
+    true,
+    true,
+    false
+);
+family!(
+    /// Nemotron pretokenizer. A contraction is its own piece, and each
+    /// number character stands alone.
+    Nemotron,
+    NemotronWalk,
+    false,
+    false,
+    true,
+    false
+);
+family!(
+    /// Kimi pretokenizer. Han is its own run, and punctuation keeps
+    /// newlines only.
+    Kimi,
+    KimiWalk,
+    true,
+    true,
+    false,
+    true
+);
 
 #[derive(Clone, Copy)]
 enum Case {
@@ -121,7 +160,10 @@ fn is_newline_byte(b: u8) -> bool {
     b == b'\n' || b == b'\r'
 }
 
-fn advance(bytes: &[u8], pos: usize) -> usize {
+fn advance<const CONTRACTIONS: bool, const DIGITS3: bool, const SLASH: bool, const HAN: bool>(
+    bytes: &[u8],
+    pos: usize,
+) -> usize {
     let b0 = bytes[pos];
     if is_letter_byte(b0) {
         let state = if is_upper_byte(b0) {
@@ -129,7 +171,7 @@ fn advance(bytes: &[u8], pos: usize) -> usize {
         } else {
             Case::Lower
         };
-        return suffix(bytes, scan_case(bytes, pos + 1, state));
+        return suffix::<CONTRACTIONS>(bytes, scan_case::<HAN>(bytes, pos + 1, state));
     }
     if b0 == b' ' {
         let Some(b1) = bytes.get(pos + 1).copied() else {
@@ -141,7 +183,7 @@ fn advance(bytes: &[u8], pos: usize) -> usize {
             } else {
                 Case::Lower
             };
-            return suffix(bytes, scan_case(bytes, pos + 2, state));
+            return suffix::<CONTRACTIONS>(bytes, scan_case::<HAN>(bytes, pos + 2, state));
         }
         if b1 < 0x80 {
             if is_digit_byte(b1) || is_ascii_ws(b1) {
@@ -151,74 +193,105 @@ fn advance(bytes: &[u8], pos: usize) -> usize {
                     ws_end(bytes, pos)
                 };
             }
-            return tail(bytes, scan_punct(bytes, pos + 2));
+            return tail::<SLASH>(bytes, scan_punct(bytes, pos + 2));
         }
-        return after_space(bytes, pos);
+        return after_space::<CONTRACTIONS, SLASH, HAN>(bytes, pos);
     }
     if b0 >= 0x80 {
         let (ch, n) = decode(bytes, pos);
         let next = pos + n;
+        if HAN && is_han(ch) {
+            return scan_han(bytes, next);
+        }
         return match kind(ch) {
-            Kind::Upper => suffix(bytes, scan_case(bytes, next, Case::Upper { last_soft: 0 })),
-            Kind::Lower => suffix(bytes, scan_case(bytes, next, Case::Lower)),
-            Kind::Caseless | Kind::Mark => suffix(
+            Kind::Upper => {
+                suffix::<CONTRACTIONS>(bytes, scan_case::<HAN>(bytes, next, Case::Upper { last_soft: 0 }))
+            }
+            Kind::Lower => suffix::<CONTRACTIONS>(bytes, scan_case::<HAN>(bytes, next, Case::Lower)),
+            Kind::Caseless | Kind::Mark => suffix::<CONTRACTIONS>(
                 bytes,
-                scan_case(bytes, next, Case::Upper { last_soft: next }),
+                scan_case::<HAN>(bytes, next, Case::Upper { last_soft: next }),
             ),
-            Kind::Number => numbers(bytes, next, 1),
+            Kind::Number => numbers::<DIGITS3>(bytes, next, 1),
             Kind::Whitespace => {
                 if ch == '\n' || ch == '\r' {
                     ws_end(bytes, pos)
                 } else {
-                    prefix_or_ws(bytes, pos, next)
+                    prefix_or_ws::<CONTRACTIONS, HAN>(bytes, pos, next)
                 }
             }
-            Kind::Other => prefix_or_punct(bytes, pos, next),
+            Kind::Other => prefix_or_punct::<CONTRACTIONS, SLASH, HAN>(bytes, next),
         };
     }
     if is_digit_byte(b0) {
-        return numbers(bytes, pos + 1, 1);
+        return numbers::<DIGITS3>(bytes, pos + 1, 1);
     }
     if is_newline_byte(b0) {
         return ws_end(bytes, pos);
     }
     if is_ascii_ws(b0) {
-        return prefix_or_ws(bytes, pos, pos + 1);
+        return prefix_or_ws::<CONTRACTIONS, HAN>(bytes, pos, pos + 1);
     }
-    prefix_or_punct(bytes, pos, pos + 1)
+    prefix_or_punct::<CONTRACTIONS, SLASH, HAN>(bytes, pos + 1)
 }
 
-fn after_space(bytes: &[u8], pos: usize) -> usize {
+fn after_space<const CONTRACTIONS: bool, const SLASH: bool, const HAN: bool>(
+    bytes: &[u8],
+    pos: usize,
+) -> usize {
     let (ch, n) = decode(bytes, pos + 1);
     let next = pos + 1 + n;
     match kind(ch) {
-        Kind::Upper => suffix(bytes, scan_case(bytes, next, Case::Upper { last_soft: 0 })),
-        Kind::Lower => suffix(bytes, scan_case(bytes, next, Case::Lower)),
-        Kind::Caseless | Kind::Mark => suffix(
-            bytes,
-            scan_case(bytes, next, Case::Upper { last_soft: next }),
-        ),
+        Kind::Upper => {
+            suffix::<CONTRACTIONS>(bytes, scan_case::<HAN>(bytes, next, Case::Upper { last_soft: 0 }))
+        }
+        Kind::Lower => suffix::<CONTRACTIONS>(bytes, scan_case::<HAN>(bytes, next, Case::Lower)),
+        Kind::Caseless => {
+            if HAN && is_han(ch) {
+                return pos + 1;
+            }
+            suffix::<CONTRACTIONS>(
+                bytes,
+                scan_case::<HAN>(bytes, next, Case::Upper { last_soft: next }),
+            )
+        }
+        Kind::Mark => {
+            if HAN && is_han(ch) {
+                return tail::<SLASH>(bytes, scan_punct(bytes, next));
+            }
+            suffix::<CONTRACTIONS>(
+                bytes,
+                scan_case::<HAN>(bytes, next, Case::Upper { last_soft: next }),
+            )
+        }
         Kind::Whitespace => ws_end(bytes, pos),
         Kind::Number => pos + 1,
-        Kind::Other => tail(bytes, scan_punct(bytes, next)),
+        Kind::Other => tail::<SLASH>(bytes, scan_punct(bytes, next)),
     }
 }
 
-fn prefix_or_ws(bytes: &[u8], pos: usize, next: usize) -> usize {
-    if let Some(end) = prefixed_letters(bytes, next) {
-        return suffix(bytes, end);
+fn prefix_or_ws<const CONTRACTIONS: bool, const HAN: bool>(
+    bytes: &[u8],
+    pos: usize,
+    next: usize,
+) -> usize {
+    if let Some(end) = prefixed_letters::<HAN>(bytes, next) {
+        return suffix::<CONTRACTIONS>(bytes, end);
     }
     ws_end(bytes, pos)
 }
 
-fn prefix_or_punct(bytes: &[u8], _pos: usize, next: usize) -> usize {
-    if let Some(end) = prefixed_letters(bytes, next) {
-        return suffix(bytes, end);
+fn prefix_or_punct<const CONTRACTIONS: bool, const SLASH: bool, const HAN: bool>(
+    bytes: &[u8],
+    next: usize,
+) -> usize {
+    if let Some(end) = prefixed_letters::<HAN>(bytes, next) {
+        return suffix::<CONTRACTIONS>(bytes, end);
     }
-    tail(bytes, scan_punct(bytes, next))
+    tail::<SLASH>(bytes, scan_punct(bytes, next))
 }
 
-fn prefixed_letters(bytes: &[u8], at: usize) -> Option<usize> {
+fn prefixed_letters<const HAN: bool>(bytes: &[u8], at: usize) -> Option<usize> {
     if at >= bytes.len() {
         return None;
     }
@@ -229,24 +302,27 @@ fn prefixed_letters(bytes: &[u8], at: usize) -> Option<usize> {
         } else {
             Case::Lower
         };
-        return Some(scan_case(bytes, at + 1, state));
+        return Some(scan_case::<HAN>(bytes, at + 1, state));
     }
     if b < 0x80 {
         return None;
     }
     let (ch, n) = decode(bytes, at);
     let next = at + n;
+    if HAN && is_han(ch) {
+        return None;
+    }
     match kind(ch) {
-        Kind::Upper => Some(scan_case(bytes, next, Case::Upper { last_soft: 0 })),
-        Kind::Lower => Some(scan_case(bytes, next, Case::Lower)),
+        Kind::Upper => Some(scan_case::<HAN>(bytes, next, Case::Upper { last_soft: 0 })),
+        Kind::Lower => Some(scan_case::<HAN>(bytes, next, Case::Lower)),
         Kind::Caseless | Kind::Mark => {
-            Some(scan_case(bytes, next, Case::Upper { last_soft: next }))
+            Some(scan_case::<HAN>(bytes, next, Case::Upper { last_soft: next }))
         }
         _ => None,
     }
 }
 
-fn scan_case(bytes: &[u8], mut pos: usize, mut state: Case) -> usize {
+fn scan_case<const HAN: bool>(bytes: &[u8], mut pos: usize, mut state: Case) -> usize {
     let len = bytes.len();
     loop {
         while pos < len {
@@ -277,6 +353,9 @@ fn scan_case(bytes: &[u8], mut pos: usize, mut state: Case) -> usize {
                     pos += n;
                 }
                 Kind::Caseless | Kind::Mark => {
+                    if HAN && is_han(ch) {
+                        break;
+                    }
                     pos += n;
                     if let Case::Upper { last_soft } = &mut state {
                         *last_soft = pos;
@@ -294,8 +373,8 @@ fn scan_case(bytes: &[u8], mut pos: usize, mut state: Case) -> usize {
     }
 }
 
-fn suffix(bytes: &[u8], end: usize) -> usize {
-    if bytes.get(end) != Some(&b'\'') {
+fn suffix<const CONTRACTIONS: bool>(bytes: &[u8], end: usize) -> usize {
+    if !CONTRACTIONS || bytes.get(end) != Some(&b'\'') {
         return end;
     }
     match bytes.get(end + 1).map(|b| b | 0x20) {
@@ -328,10 +407,10 @@ fn scan_punct(bytes: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-fn tail(bytes: &[u8], mut pos: usize) -> usize {
+fn tail<const SLASH: bool>(bytes: &[u8], mut pos: usize) -> usize {
     while pos < bytes.len() {
         let b = bytes[pos];
-        if b != b'\n' && b != b'\r' && b != b'/' {
+        if b != b'\n' && b != b'\r' && !(SLASH && b == b'/') {
             break;
         }
         pos += 1;
@@ -339,7 +418,25 @@ fn tail(bytes: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-fn numbers(bytes: &[u8], mut pos: usize, mut n: usize) -> usize {
+fn scan_han(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() {
+        let b = bytes[pos];
+        if b < 0x80 {
+            return pos;
+        }
+        let (ch, n) = decode(bytes, pos);
+        if !is_han(ch) {
+            return pos;
+        }
+        pos += n;
+    }
+    pos
+}
+
+fn numbers<const DIGITS3: bool>(bytes: &[u8], mut pos: usize, mut n: usize) -> usize {
+    if !DIGITS3 {
+        return pos;
+    }
     while n < 3 && pos < bytes.len() {
         let b = bytes[pos];
         if is_digit_byte(b) {
@@ -411,29 +508,43 @@ fn decode(bytes: &[u8], i: usize) -> (char, usize) {
 }
 
 #[inline(always)]
-fn window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
+fn window<
+    const ISA: u8,
+    const CONTRACTIONS: bool,
+    const DIGITS3: bool,
+    const SLASH: bool,
+    const HAN: bool,
+>(
+    bytes: &[u8],
+    pos: usize,
+) -> Option<Window> {
     if pos + 64 > bytes.len() {
         return None;
     }
     let masks = masks_for::<ISA>(bytes, pos);
     let (upper, slash) = extras::<ISA>(bytes, pos);
     if masks.non_ascii != 0 {
-        return window_unicode(bytes, pos, masks, upper, slash);
+        return window_unicode::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, pos, masks, upper, slash);
     }
-    bits(bytes, pos, masks, upper, slash, Uni::EMPTY, 64, false)
+    bits::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, pos, masks, upper, slash, Uni::EMPTY, 64, false)
 }
 
 #[inline(never)]
-fn window_unicode(
+fn window_unicode<
+    const CONTRACTIONS: bool,
+    const DIGITS3: bool,
+    const SLASH: bool,
+    const HAN: bool,
+>(
     bytes: &[u8],
     pos: usize,
     masks: Masks,
     mut upper: u64,
     slash: u64,
 ) -> Option<Window> {
-    let found = absorb(bytes, pos, masks.non_ascii);
+    let found = absorb::<HAN>(bytes, pos, masks.non_ascii);
     let mut stop = found.stop;
-    if found.number && stop > 0 {
+    if DIGITS3 && found.number && stop > 0 {
         let mut s = stop;
         while s > 0 && masks.digit & (1u64 << (s - 1)) != 0 {
             s -= 1;
@@ -444,7 +555,7 @@ fn window_unicode(
         return None;
     }
     upper |= found.uni.upper;
-    bits(
+    bits::<CONTRACTIONS, DIGITS3, SLASH, HAN>(
         bytes,
         pos,
         masks,
@@ -485,7 +596,7 @@ struct Absorbed {
     tail_nonws: bool,
 }
 
-fn absorb(bytes: &[u8], pos: usize, mut pending: u64) -> Absorbed {
+fn absorb<const HAN: bool>(bytes: &[u8], pos: usize, mut pending: u64) -> Absorbed {
     let mut uni = Uni::EMPTY;
     while pending != 0 {
         let i = pending.trailing_zeros() as usize;
@@ -500,7 +611,10 @@ fn absorb(bytes: &[u8], pos: usize, mut pending: u64) -> Absorbed {
         }
         let (ch, n) = decode(bytes, pos + i);
         let class = kind(ch);
-        if i + n > 64 || matches!(class, Kind::Caseless | Kind::Mark) {
+        if i + n > 64
+            || matches!(class, Kind::Caseless | Kind::Mark)
+            || (HAN && class == Kind::Other && is_han(ch))
+        {
             return Absorbed {
                 uni,
                 stop: i as u32,
@@ -556,7 +670,7 @@ fn utf8_width(b: u8) -> usize {
 }
 
 #[inline(always)]
-fn bits(
+fn bits<const CONTRACTIONS: bool, const DIGITS3: bool, const SLASH: bool, const HAN: bool>(
     bytes: &[u8],
     pos: usize,
     masks: Masks,
@@ -583,7 +697,7 @@ fn bits(
     let punct = !(letter | digit | ws) & keep;
     let eof = pos + 64 == bytes.len();
 
-    let tcls = nl | slash;
+    let tcls = if SLASH { nl | slash } else { nl };
     let prev_punct = punct << 1;
     let abs_seed = nl & prev_punct;
     let abs = if abs_seed == 0 {
@@ -610,7 +724,7 @@ fn bits(
     let letter_start = letter & !cont & !prev_letter & !prev_space & !prev_ows & !single_punct;
     let camel = upper & !cont & prev_lower;
     let punct_start = punct & !cont & !prev_punct & !prev_space;
-    let digit_start = splits3(digit);
+    let digit_start = if DIGITS3 { splits3(digit) } else { digit };
 
     let leads = ws & !cont;
     let nonws = !ws & keep;
@@ -618,7 +732,7 @@ fn bits(
     if tail_nonws && stop < 64 {
         seen_nonws |= 1u64 << stop;
     }
-    let (next_ws, next_tail) = byte_after(bytes, pos, eof);
+    let (next_ws, next_tail) = byte_after::<SLASH>(bytes, pos, eof);
     let ws_lead1 = leads & !(uni.lead2 | uni.lead3 | uni.lead4);
     let mut split_ok = (ws_lead1 & (seen_nonws >> 1))
         | ((leads & uni.lead2) & (seen_nonws >> 2))
@@ -673,28 +787,30 @@ fn bits(
         cut = cut.min(tail_owner(abs, punct, space, 63));
     }
 
-    let mut apostrophe = masks.apostrophe & boundary & prev_letter & keep;
-    while apostrophe != 0 {
-        let i = apostrophe.trailing_zeros();
-        apostrophe &= apostrophe - 1;
-        if i >= cut {
-            break;
-        }
-        if i <= 2 || i >= 61 || suffix_before(bytes, pos, i) {
-            cut = cut.min(i);
-            break;
-        }
-        let Some(k) = suffix_len(bytes, pos + i as usize) else {
-            continue;
-        };
-        let end = i + k;
-        if end > 64 || end > cut {
-            cut = cut.min(i);
-            break;
-        }
-        boundary &= !(((1u64 << (k - 1)) - 1) << i);
-        if end < 64 {
-            boundary |= 1u64 << end;
+    if CONTRACTIONS {
+        let mut apostrophe = masks.apostrophe & boundary & prev_letter & keep;
+        while apostrophe != 0 {
+            let i = apostrophe.trailing_zeros();
+            apostrophe &= apostrophe - 1;
+            if i >= cut {
+                break;
+            }
+            if i <= 2 || i >= 61 || suffix_before(bytes, pos, i) {
+                cut = cut.min(i);
+                break;
+            }
+            let Some(k) = suffix_len(bytes, pos + i as usize) else {
+                continue;
+            };
+            let end = i + k;
+            if end > 64 || end > cut {
+                cut = cut.min(i);
+                break;
+            }
+            boundary &= !(((1u64 << (k - 1)) - 1) << i);
+            if end < 64 {
+                boundary |= 1u64 << end;
+            }
         }
     }
 
@@ -702,7 +818,9 @@ fn bits(
         let before = boundary & mask_below(cut);
         if before != 0 {
             let start_rel = 63 - before.leading_zeros();
-            if advance(bytes, pos + start_rel as usize) > pos + cut as usize {
+            if advance::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, pos + start_rel as usize)
+                > pos + cut as usize
+            {
                 cut = start_rel;
             }
         }
@@ -774,7 +892,7 @@ fn tail_owner(abs: u64, punct: u64, space: u64, bit: u32) -> u32 {
     i
 }
 
-fn byte_after(bytes: &[u8], pos: usize, eof: bool) -> (bool, bool) {
+fn byte_after<const SLASH: bool>(bytes: &[u8], pos: usize, eof: bool) -> (bool, bool) {
     if eof {
         return (false, false);
     }
@@ -784,8 +902,38 @@ fn byte_after(bytes: &[u8], pos: usize, eof: bool) -> (bool, bool) {
     }
     (
         b == b' ' || b.wrapping_sub(9) < 5,
-        b == b'\n' || b == b'\r' || b == b'/',
+        b == b'\n' || b == b'\r' || (SLASH && b == b'/'),
     )
+}
+
+/// Unicode 16 `Script=Han`, the same ranges `\p{Han}` uses.
+fn is_han(ch: char) -> bool {
+    const HAN: &[(u32, u32)] = &[
+        (0x2E80, 0x2E99),
+        (0x2E9B, 0x2EF3),
+        (0x2F00, 0x2FD5),
+        (0x3005, 0x3005),
+        (0x3007, 0x3007),
+        (0x3021, 0x3029),
+        (0x3038, 0x303B),
+        (0x3400, 0x4DBF),
+        (0x4E00, 0x9FFF),
+        (0xF900, 0xFA6D),
+        (0xFA70, 0xFAD9),
+        (0x16FE2, 0x16FE3),
+        (0x16FF0, 0x16FF1),
+        (0x20000, 0x2A6DF),
+        (0x2A700, 0x2B739),
+        (0x2B740, 0x2B81D),
+        (0x2B820, 0x2CEA1),
+        (0x2CEB0, 0x2EBE0),
+        (0x2EBF0, 0x2EE5D),
+        (0x2F800, 0x2FA1D),
+        (0x30000, 0x3134A),
+        (0x31350, 0x323AF),
+    ];
+    let cp = ch as u32;
+    HAN.iter().any(|&(start, end)| cp >= start && cp <= end)
 }
 
 fn mask_below(bit: u32) -> u64 {
@@ -906,12 +1054,11 @@ unsafe fn extras_avx2(bytes: &[u8], pos: usize) -> (u64, u64) {
 mod tests {
     use super::*;
 
-    fn pieces(text: &str) -> Vec<String> {
-        let mut walk = O200k::walk(text);
+    fn pieces(text: &str, mut fill: impl FnMut(&mut [Span]) -> usize) -> Vec<String> {
         let mut buf = [Span { start: 0, end: 0 }; 32];
         let mut out = Vec::new();
         loop {
-            let n = walk.fill(&mut buf);
+            let n = fill(&mut buf);
             if n == 0 {
                 break;
             }
@@ -924,6 +1071,10 @@ mod tests {
 
     #[test]
     fn camel_and_contractions() {
+        let pieces = |text: &str| {
+            let mut walk = O200k::walk(text);
+            pieces(text, |buf| walk.fill(buf))
+        };
         assert_eq!(pieces("camelCase"), ["camel", "Case"]);
         assert_eq!(pieces("HTTPResponse"), ["HTTPResponse"]);
         assert_eq!(pieces("don't"), ["don't"]);
@@ -938,8 +1089,35 @@ mod tests {
     #[test]
     fn camel_inside_a_long_window() {
         let text = format!("note camelCase end {}", "word ".repeat(20));
-        let got = pieces(&text);
+        let mut walk = O200k::walk(&text);
+        let got = pieces(&text, |buf| walk.fill(buf));
         assert!(got.iter().any(|p| p == " camel"), "{got:?}");
         assert!(got.iter().any(|p| p == "Case"), "{got:?}");
+    }
+
+    #[test]
+    fn nemotron_splits_contractions_and_digits() {
+        let text = format!("note don't 12345 .\n// end {}", "word ".repeat(20));
+        let mut walk = Nemotron::walk(&text);
+        let got = pieces(&text, |buf| walk.fill(buf));
+        assert!(got.iter().any(|p| p == " don"), "{got:?}");
+        assert!(got.iter().any(|p| p == "'t"), "{got:?}");
+        assert!(got.iter().any(|p| p == "1"), "{got:?}");
+        assert!(got.iter().any(|p| p == " .\n//"), "{got:?}");
+        assert!(!got.iter().any(|p| p == "don't"), "{got:?}");
+        assert!(!got.iter().any(|p| p == "123"), "{got:?}");
+    }
+
+    #[test]
+    fn kimi_splits_han_and_leaves_slashes() {
+        let text = format!("note abc中文def 1〇2 .\n// end {}", "word ".repeat(20));
+        let mut walk = Kimi::walk(&text);
+        let got = pieces(&text, |buf| walk.fill(buf));
+        assert!(got.iter().any(|p| p == " abc"), "{got:?}");
+        assert!(got.iter().any(|p| p == "中文"), "{got:?}");
+        assert!(got.iter().any(|p| p == "def"), "{got:?}");
+        assert!(got.iter().any(|p| p == "1〇2"), "{got:?}");
+        assert!(got.iter().any(|p| p == " .\n"), "{got:?}");
+        assert!(got.iter().any(|p| p == "//"), "{got:?}");
     }
 }
