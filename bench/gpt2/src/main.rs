@@ -1,23 +1,34 @@
-//! Release comparison of the GPT-2 pretokenizer on one English file.
+//! Release comparison of one pretokenizer on one English file.
 //!
 //! pretokie fill writes spans in batches of 256. pretokie count only
 //! popcounts boundaries. gigatoken iter yields each piece. gigatoken fill
 //! also packs a cache key and prefetches it.
 
 use gigatoken_rs::pretokenize::{
-    FastCl100kPretokenizer, FastR50kPretokenizer, PretokenSpans, SpanBatch, PRETOKEN_CHUNK,
+    FastCl100kPretokenizer, FastOlmo3Pretokenizer, FastQwen2Pretokenizer, FastQwen35Pretokenizer,
+    FastR50kPretokenizer, PretokenSpans, SpanBatch, PRETOKEN_CHUNK,
 };
-use pretokie::{Cl100k, Gpt2, SmolLM, Span};
+use pretokie::{Cl100k, Gpt2, Olmo, Qwen, SmolLM, Span, Voyage};
 use std::hint::black_box;
 use std::time::Instant;
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Gpt2,
+    SmolLM,
+    Cl100k,
+    Voyage,
+    Olmo,
+    Qwen,
+}
 
 fn main() {
     let mut file = None;
     let mut reps = 5usize;
     let mut repeat = 1usize;
     let mut max_bytes = usize::MAX;
-    let mut smollm = false;
-    let mut cl100k = false;
+    let mut mode = Mode::Gpt2;
+    let mut chosen = false;
     let mut diff = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -45,8 +56,11 @@ fn main() {
                     .parse()
                     .expect("--bytes must be an integer");
             }
-            "--smollm" => smollm = true,
-            "--cl100k" => cl100k = true,
+            "--smollm" => mode = select(&mut chosen, Mode::SmolLM),
+            "--cl100k" => mode = select(&mut chosen, Mode::Cl100k),
+            "--voyage" => mode = select(&mut chosen, Mode::Voyage),
+            "--olmo" => mode = select(&mut chosen, Mode::Olmo),
+            "--qwen" => mode = select(&mut chosen, Mode::Qwen),
             "--diff" => diff = true,
             other => panic!("unknown argument: {other}"),
         }
@@ -63,12 +77,8 @@ fn main() {
             bytes.copy_within(0..once, i * once);
         }
     }
-    assert!(
-        !smollm || !cl100k,
-        "--smollm and --cl100k select different formulas"
-    );
     if diff {
-        show_diff(&bytes);
+        show_diff(&bytes, mode);
         return;
     }
     let text = std::str::from_utf8(&bytes).unwrap();
@@ -84,38 +94,69 @@ fn main() {
         "{:<16} {:>10} {:>10} {:>10} {:>12}",
         "impl", "min MB/s", "med MB/s", "med ms", "pieces"
     );
-    let (fill_name, count_name) = if cl100k {
-        ("cl100k fill", "cl100k count")
-    } else if smollm {
-        ("smollm fill", "smollm count")
-    } else {
-        ("pretokie fill", "pretokie count")
+    let (fill_name, count_name) = names(mode);
+    let fill_pieces = match mode {
+        Mode::Gpt2 => report(fill_name, measure(reps, valid, || fill_gpt2(text))),
+        Mode::SmolLM => report(fill_name, measure(reps, valid, || fill_smollm(text))),
+        Mode::Cl100k => report(fill_name, measure(reps, valid, || fill_cl100k(text))),
+        Mode::Voyage => report(fill_name, measure(reps, valid, || fill_voyage(text))),
+        Mode::Olmo => report(fill_name, measure(reps, valid, || fill_olmo(text))),
+        Mode::Qwen => report(fill_name, measure(reps, valid, || fill_qwen(text))),
     };
-    let fill_pieces = report(
-        fill_name,
-        measure(reps, valid, || fill_pretokie(text, smollm, cl100k)),
-    );
-    let count_pieces = report(count_name, measure(reps, valid, || {
-        if cl100k {
-            Cl100k::count(text)
-        } else if smollm {
-            SmolLM::count(text)
-        } else {
-            Gpt2::count(text)
+    let count_pieces = match mode {
+        Mode::Gpt2 => report(count_name, measure(reps, valid, || Gpt2::count(text))),
+        Mode::SmolLM => report(count_name, measure(reps, valid, || SmolLM::count(text))),
+        Mode::Cl100k => report(count_name, measure(reps, valid, || Cl100k::count(text))),
+        Mode::Voyage => report(count_name, measure(reps, valid, || Voyage::count(text))),
+        Mode::Olmo => report(count_name, measure(reps, valid, || Olmo::count(text))),
+        Mode::Qwen => report(count_name, measure(reps, valid, || Qwen::count(text))),
+    };
+    let iter_pieces = match mode {
+        Mode::Gpt2 | Mode::SmolLM => {
+            report("gigatoken iter", measure(reps, valid, || iter_count(FastR50kPretokenizer::new(&bytes))))
         }
-    }));
-    let iter_pieces = report(
-        "gigatoken iter",
-        measure(reps, valid, || iter_giga(&bytes, cl100k)),
-    );
-    let giga_pieces = report(
-        "gigatoken fill",
-        measure(reps, valid, || fill_giga(&bytes, cl100k)),
-    );
+        Mode::Cl100k => report(
+            "gigatoken iter",
+            measure(reps, valid, || iter_count(FastCl100kPretokenizer::new(&bytes))),
+        ),
+        Mode::Voyage => report(
+            "gigatoken iter",
+            measure(reps, valid, || iter_count(FastQwen2Pretokenizer::new(&bytes))),
+        ),
+        Mode::Olmo => report(
+            "gigatoken iter",
+            measure(reps, valid, || iter_count(FastOlmo3Pretokenizer::new(&bytes))),
+        ),
+        Mode::Qwen => report(
+            "gigatoken iter",
+            measure(reps, valid, || iter_count(FastQwen35Pretokenizer::new(&bytes))),
+        ),
+    };
+    let giga_pieces = match mode {
+        Mode::Gpt2 | Mode::SmolLM => {
+            report("gigatoken fill", measure(reps, valid, || fill_spans(FastR50kPretokenizer::new(&bytes))))
+        }
+        Mode::Cl100k => report(
+            "gigatoken fill",
+            measure(reps, valid, || fill_spans(FastCl100kPretokenizer::new(&bytes))),
+        ),
+        Mode::Voyage => report(
+            "gigatoken fill",
+            measure(reps, valid, || fill_spans(FastQwen2Pretokenizer::new(&bytes))),
+        ),
+        Mode::Olmo => report(
+            "gigatoken fill",
+            measure(reps, valid, || fill_spans(FastOlmo3Pretokenizer::new(&bytes))),
+        ),
+        Mode::Qwen => report(
+            "gigatoken fill",
+            measure(reps, valid, || fill_spans(FastQwen35Pretokenizer::new(&bytes))),
+        ),
+    };
     if count_pieces != fill_pieces {
         eprintln!("piece count mismatch: {fill_name}={fill_pieces} {count_name}={count_pieces}");
     }
-    if smollm {
+    if matches!(mode, Mode::SmolLM) {
         eprintln!(
             "cuts differ: smollm isolates digits, fastr50k keeps a number together ({fill_pieces} vs {giga_pieces} pieces)"
         );
@@ -125,6 +166,23 @@ fn main() {
                 eprintln!("piece count mismatch: pretokie fill={fill_pieces} {name}={count}");
             }
         }
+    }
+}
+
+fn select(chosen: &mut bool, mode: Mode) -> Mode {
+    assert!(!*chosen, "pass only one of --smollm --cl100k --voyage --olmo --qwen");
+    *chosen = true;
+    mode
+}
+
+fn names(mode: Mode) -> (&'static str, &'static str) {
+    match mode {
+        Mode::Gpt2 => ("pretokie fill", "pretokie count"),
+        Mode::SmolLM => ("smollm fill", "smollm count"),
+        Mode::Cl100k => ("cl100k fill", "cl100k count"),
+        Mode::Voyage => ("voyage fill", "voyage count"),
+        Mode::Olmo => ("olmo fill", "olmo count"),
+        Mode::Qwen => ("qwen fill", "qwen count"),
     }
 }
 
@@ -142,57 +200,113 @@ fn report(name: &str, (rates, millis, count): (Vec<f64>, Vec<f64>, usize)) -> us
     count
 }
 
-fn fill_pretokie(text: &str, smollm: bool, cl100k: bool) -> usize {
-    if cl100k {
-        fill_cl100k(text)
-    } else if smollm {
-        fill_smollm(text)
-    } else {
-        fill_gpt2(text)
+#[inline(always)]
+fn fill_walk(mut fill: impl FnMut(&mut [Span]) -> usize) -> usize {
+    let mut buf = [Span { start: 0, end: 0 }; PRETOKEN_CHUNK];
+    let mut n = 0;
+    loop {
+        let written = fill(&mut buf);
+        if written == 0 {
+            break;
+        }
+        black_box(&buf[..written]);
+        n += written;
     }
+    n
 }
 
 fn fill_gpt2(text: &str) -> usize {
-    let mut buf = [Span { start: 0, end: 0 }; PRETOKEN_CHUNK];
     let mut walk = Gpt2::walk(text);
-    let mut n = 0;
-    loop {
-        let written = walk.fill(&mut buf);
-        if written == 0 {
-            break;
-        }
-        black_box(&buf[..written]);
-        n += written;
-    }
-    n
+    fill_walk(|buf| walk.fill(buf))
 }
 
 fn fill_smollm(text: &str) -> usize {
-    let mut buf = [Span { start: 0, end: 0 }; PRETOKEN_CHUNK];
     let mut walk = SmolLM::walk(text);
-    let mut n = 0;
-    loop {
-        let written = walk.fill(&mut buf);
-        if written == 0 {
-            break;
-        }
-        black_box(&buf[..written]);
-        n += written;
-    }
-    n
+    fill_walk(|buf| walk.fill(buf))
 }
 
-fn show_diff(bytes: &[u8]) {
-    let text = std::str::from_utf8(bytes).unwrap();
+fn fill_cl100k(text: &str) -> usize {
     let mut walk = Cl100k::walk(text);
+    fill_walk(|buf| walk.fill(buf))
+}
+
+fn fill_voyage(text: &str) -> usize {
+    let mut walk = Voyage::walk(text);
+    fill_walk(|buf| walk.fill(buf))
+}
+
+fn fill_olmo(text: &str) -> usize {
+    let mut walk = Olmo::walk(text);
+    fill_walk(|buf| walk.fill(buf))
+}
+
+fn fill_qwen(text: &str) -> usize {
+    let mut walk = Qwen::walk(text);
+    fill_walk(|buf| walk.fill(buf))
+}
+
+fn show_diff(bytes: &[u8], mode: Mode) {
+    let text = std::str::from_utf8(bytes).unwrap();
+    match mode {
+        Mode::Gpt2 => {
+            let mut walk = Gpt2::walk(text);
+            diff_against(text, bytes, |buf| walk.fill(buf), FastR50kPretokenizer::new(bytes));
+        }
+        Mode::SmolLM => {
+            let mut walk = SmolLM::walk(text);
+            diff_against(text, bytes, |buf| walk.fill(buf), FastR50kPretokenizer::new(bytes));
+        }
+        Mode::Cl100k => {
+            let mut walk = Cl100k::walk(text);
+            diff_against(
+                text,
+                bytes,
+                |buf| walk.fill(buf),
+                FastCl100kPretokenizer::new(bytes),
+            );
+        }
+        Mode::Voyage => {
+            let mut walk = Voyage::walk(text);
+            diff_against(
+                text,
+                bytes,
+                |buf| walk.fill(buf),
+                FastQwen2Pretokenizer::new(bytes),
+            );
+        }
+        Mode::Olmo => {
+            let mut walk = Olmo::walk(text);
+            diff_against(
+                text,
+                bytes,
+                |buf| walk.fill(buf),
+                FastOlmo3Pretokenizer::new(bytes),
+            );
+        }
+        Mode::Qwen => {
+            let mut walk = Qwen::walk(text);
+            diff_against(
+                text,
+                bytes,
+                |buf| walk.fill(buf),
+                FastQwen35Pretokenizer::new(bytes),
+            );
+        }
+    }
+}
+
+fn diff_against<I, P>(text: &str, bytes: &[u8], mut fill: impl FnMut(&mut [Span]) -> usize, mut giga: I)
+where
+    I: Iterator<Item = P>,
+    P: AsRef<[u8]>,
+{
     let mut buf = [Span { start: 0, end: 0 }; 64];
-    let mut giga = FastCl100kPretokenizer::new(bytes);
     let mut filled = 0;
     let mut next = 0;
     let mut idx = 0usize;
     loop {
         if next == filled {
-            filled = walk.fill(&mut buf);
+            filled = fill(&mut buf);
             next = 0;
             if filled == 0 {
                 if giga.next().is_some() {
@@ -210,15 +324,15 @@ fn show_diff(bytes: &[u8]) {
             return;
         };
         let (start, end) = (span.start as usize, span.end as usize);
-        if piece.0 != &bytes[start..end] {
+        if piece.as_ref() != &bytes[start..end] {
             let from = start.saturating_sub(40);
             let to = (end + 40).min(bytes.len());
             eprintln!("mismatch at piece {idx}");
             eprintln!("pretokie {}..{} {:?}", start, end, &text[start..end]);
             eprintln!(
                 "gigatoken {} bytes {:?}",
-                piece.0.len(),
-                String::from_utf8_lossy(piece.0)
+                piece.as_ref().len(),
+                String::from_utf8_lossy(piece.as_ref())
             );
             eprintln!("context {:?}", &text[from..to]);
             return;
@@ -227,73 +341,37 @@ fn show_diff(bytes: &[u8]) {
     }
 }
 
-fn fill_cl100k(text: &str) -> usize {
-    let mut buf = [Span { start: 0, end: 0 }; PRETOKEN_CHUNK];
-    let mut walk = Cl100k::walk(text);
+#[inline(always)]
+fn iter_count<I, P>(iter: I) -> usize
+where
+    I: Iterator<Item = P>,
+    P: AsRef<[u8]>,
+{
+    let mut n = 0;
+    for piece in iter {
+        black_box(piece.as_ref());
+        n += 1;
+    }
+    n
+}
+
+#[inline(always)]
+fn fill_spans<'a>(mut pretok: impl PretokenSpans<'a>) -> usize {
+    let mut batch = SpanBatch::new();
     let mut n = 0;
     loop {
-        let written = walk.fill(&mut buf);
+        let written = pretok.fill_spans_keyed(&mut batch, &|_| {});
         if written == 0 {
             break;
         }
-        black_box(&buf[..written]);
+        black_box(written);
+        black_box(unsafe { batch.span(0) });
         n += written;
     }
     n
 }
 
-fn iter_giga(bytes: &[u8], cl100k: bool) -> usize {
-    if cl100k {
-        let mut n = 0;
-        for piece in FastCl100kPretokenizer::new(bytes) {
-            black_box(piece.0);
-            n += 1;
-        }
-        n
-    } else {
-        let mut n = 0;
-        for piece in FastR50kPretokenizer::new(bytes) {
-            black_box(piece.0);
-            n += 1;
-        }
-        n
-    }
-}
-
-fn fill_giga(bytes: &[u8], cl100k: bool) -> usize {
-    let mut batch = SpanBatch::new();
-    let mut n = 0;
-    if cl100k {
-        let mut pretok = FastCl100kPretokenizer::new(bytes);
-        loop {
-            let written = pretok.fill_spans_keyed(&mut batch, &|_| {});
-            if written == 0 {
-                break;
-            }
-            black_box(written);
-            black_box(unsafe { batch.span(0) });
-            n += written;
-        }
-    } else {
-        let mut pretok = FastR50kPretokenizer::new(bytes);
-        loop {
-            let written = pretok.fill_spans_keyed(&mut batch, &|_| {});
-            if written == 0 {
-                break;
-            }
-            black_box(written);
-            black_box(unsafe { batch.span(0) });
-            n += written;
-        }
-    }
-    n
-}
-
-fn measure(
-    reps: usize,
-    bytes: usize,
-    mut run: impl FnMut() -> usize,
-) -> (Vec<f64>, Vec<f64>, usize) {
+fn measure(reps: usize, bytes: usize, mut run: impl FnMut() -> usize) -> (Vec<f64>, Vec<f64>, usize) {
     let count = run();
     let mut rates = Vec::with_capacity(reps);
     let mut millis = Vec::with_capacity(reps);

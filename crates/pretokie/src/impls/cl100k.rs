@@ -1,84 +1,140 @@
-//! cl100k split rules.
+//! cl100k split rules, and the siblings that share them.
 //!
 //! The pattern is `(?i:'s|'t|'re|'ve|'m|'ll|'d)`, an optional prefix plus
-//! letters, up to three numbers, an optional space plus punctuation and
-//! its trailing newlines, then a whitespace run. A newline run is kept
-//! whole through its last newline. A space prefixes a word or punctuation,
-//! and does not prefix a number.
+//! letters, a run of numbers, an optional space plus punctuation and its
+//! trailing newlines, then a whitespace run. A newline run is kept whole
+//! through its last newline. A space prefixes a word or punctuation, and
+//! does not prefix a number.
+//!
+//! [`Voyage`] (Qwen2 and Qwen3) takes each number character alone. [`Olmo`]
+//! keeps cl100k's groups of three. [`Qwen`] (Qwen3.5) is Voyage with
+//! combining marks counted as letters.
 
 use crate::walk::classify::{class_of, masks_for, Class, Masks};
 use crate::walk::{Scheme, Walk, Window};
 use crate::Span;
+use unicode_general_category::{get_general_category, GeneralCategory};
 
-/// cl100k pretokenizer.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Cl100k;
+macro_rules! family {
+    ($(#[$meta:meta])* $name:ident, $walk:ident, $digits3:literal, $marks:literal) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct $name;
 
-/// Pulls pieces in batches. Create one with [`Cl100k::walk`].
-pub struct Cl100kWalk<'a> {
-    inner: Walk<'a, Cl100k>,
-}
-
-impl Cl100k {
-    /// Number of pieces in `text`.
-    pub fn count(text: &str) -> usize {
-        Self::count_upto(text, usize::MAX)
-    }
-
-    /// Number of pieces, stopping once the count passes `limit`.
-    ///
-    /// Returns `limit + 1` when the text has more pieces than `limit`.
-    pub fn count_upto(text: &str, limit: usize) -> usize {
-        Walk::<Cl100k>::new(text).count_upto(limit)
-    }
-
-    /// Write every piece of `text` that fits in `out`. Returns how many were written.
-    pub fn fill(text: &str, out: &mut [Span]) -> usize {
-        Self::walk(text).fill(out)
-    }
-
-    /// Cursor for pulling pieces in batches.
-    pub fn walk(text: &str) -> Cl100kWalk<'_> {
-        Cl100kWalk {
-            inner: Walk::new(text),
+        /// Pulls pieces in batches. Create one with [`$name::walk`].
+        pub struct $walk<'a> {
+            inner: Walk<'a, $name>,
         }
-    }
+
+        impl $name {
+            /// Number of pieces in `text`.
+            pub fn count(text: &str) -> usize {
+                Self::count_upto(text, usize::MAX)
+            }
+
+            /// Number of pieces, stopping once the count passes `limit`.
+            ///
+            /// Returns `limit + 1` when the text has more pieces than `limit`.
+            pub fn count_upto(text: &str, limit: usize) -> usize {
+                Walk::<$name>::new(text).count_upto(limit)
+            }
+
+            /// Write every piece of `text` that fits in `out`. Returns how many were written.
+            pub fn fill(text: &str, out: &mut [Span]) -> usize {
+                Self::walk(text).fill(out)
+            }
+
+            /// Cursor for pulling pieces in batches.
+            pub fn walk(text: &str) -> $walk<'_> {
+                $walk {
+                    inner: Walk::new(text),
+                }
+            }
+        }
+
+        impl $walk<'_> {
+            /// Write the next pieces into `out`. Returns how many were written.
+            /// A short count means the text is finished.
+            pub fn fill(&mut self, out: &mut [Span]) -> usize {
+                self.inner.fill(out)
+            }
+        }
+
+        impl Scheme for $name {
+            #[inline]
+            fn advance(bytes: &[u8], pos: usize) -> usize {
+                advance::<$digits3, $marks>(bytes, pos)
+            }
+
+            #[inline(always)]
+            fn try_window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
+                window::<ISA, $digits3, $marks>(bytes, pos)
+            }
+        }
+    };
 }
 
-impl Cl100kWalk<'_> {
-    /// Write the next pieces into `out`. Returns how many were written.
-    /// A short count means the text is finished.
-    pub fn fill(&mut self, out: &mut [Span]) -> usize {
-        self.inner.fill(out)
-    }
-}
+family!(
+    /// cl100k pretokenizer. Numbers come in groups of up to three.
+    Cl100k,
+    Cl100kWalk,
+    true,
+    false
+);
+family!(
+    /// Qwen2 and Qwen3 pretokenizer. Each number character is its own piece.
+    Voyage,
+    VoyageWalk,
+    false,
+    false
+);
+family!(
+    /// Olmo 2 and Olmo 3 pretokenizer. Numbers come in groups of up to three.
+    Olmo,
+    OlmoWalk,
+    true,
+    false
+);
+family!(
+    /// Qwen3.5 pretokenizer. Each number is its own piece, and a mark is a letter.
+    Qwen,
+    QwenWalk,
+    false,
+    true
+);
 
-impl Scheme for Cl100k {
-    #[inline]
-    fn advance(bytes: &[u8], pos: usize) -> usize {
-        advance(bytes, pos)
-    }
-
-    #[inline(always)]
-    fn try_window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
-        window::<ISA>(bytes, pos)
-    }
-}
-
-fn advance(bytes: &[u8], start: usize) -> usize {
+fn advance<const DIGITS3: bool, const MARKS: bool>(bytes: &[u8], start: usize) -> usize {
     if let Some(n) = contraction_len(bytes, start) {
         return start + n;
     }
-    if let Some(end) = take_letters(bytes, start) {
+    if let Some(end) = take_letters::<MARKS>(bytes, start) {
         return end;
     }
-    if let Some(end) = take_numbers(bytes, start) {
+    if let Some(end) = take_numbers::<DIGITS3, MARKS>(bytes, start) {
         return end;
     }
-    if let Some(end) = take_punct(bytes, start) {
+    if let Some(end) = take_punct::<MARKS>(bytes, start) {
         return end;
     }
-    take_whitespace(bytes, start)
+    take_whitespace::<MARKS>(bytes, start)
+}
+
+fn kind<const MARKS: bool>(ch: char) -> Class {
+    let class = class_of(ch);
+    if MARKS && class == Class::Other && is_mark(ch) {
+        Class::Letter
+    } else {
+        class
+    }
+}
+
+fn is_mark(ch: char) -> bool {
+    matches!(
+        get_general_category(ch),
+        GeneralCategory::NonspacingMark
+            | GeneralCategory::SpacingMark
+            | GeneralCategory::EnclosingMark
+    )
 }
 
 /// Case-insensitive `'s`, `'t`, `'re`, `'ve`, `'m`, `'ll`, or `'d`.
@@ -105,7 +161,7 @@ struct Char {
     whitespace: bool,
 }
 
-fn char_at(bytes: &[u8], i: usize) -> Char {
+fn char_at<const MARKS: bool>(bytes: &[u8], i: usize) -> Char {
     let b = bytes[i];
     if b < 0x80 {
         let letter = (b | 0x20).wrapping_sub(b'a') < 26;
@@ -123,7 +179,7 @@ fn char_at(bytes: &[u8], i: usize) -> Char {
         };
     }
     let (ch, len) = decode_char(bytes, i);
-    let class = class_of(ch);
+    let class = kind::<MARKS>(ch);
     Char {
         len,
         letter: class == Class::Letter,
@@ -153,23 +209,23 @@ fn is_prefix(ch: &Char) -> bool {
     !ch.letter && !ch.number && !ch.crlf
 }
 
-fn take_letters(bytes: &[u8], start: usize) -> Option<usize> {
-    let ch = char_at(bytes, start);
+fn take_letters<const MARKS: bool>(bytes: &[u8], start: usize) -> Option<usize> {
+    let ch = char_at::<MARKS>(bytes, start);
     if ch.letter {
-        return Some(scan_letters(bytes, start + ch.len));
+        return Some(scan_letters::<MARKS>(bytes, start + ch.len));
     }
     if is_prefix(&ch) && start + ch.len < bytes.len() {
-        let next = char_at(bytes, start + ch.len);
+        let next = char_at::<MARKS>(bytes, start + ch.len);
         if next.letter {
-            return Some(scan_letters(bytes, start + ch.len + next.len));
+            return Some(scan_letters::<MARKS>(bytes, start + ch.len + next.len));
         }
     }
     None
 }
 
-fn scan_letters(bytes: &[u8], mut p: usize) -> usize {
+fn scan_letters<const MARKS: bool>(bytes: &[u8], mut p: usize) -> usize {
     while p < bytes.len() {
-        let ch = char_at(bytes, p);
+        let ch = char_at::<MARKS>(bytes, p);
         if !ch.letter {
             break;
         }
@@ -178,15 +234,16 @@ fn scan_letters(bytes: &[u8], mut p: usize) -> usize {
     p
 }
 
-fn take_numbers(bytes: &[u8], start: usize) -> Option<usize> {
-    let ch = char_at(bytes, start);
+fn take_numbers<const DIGITS3: bool, const MARKS: bool>(bytes: &[u8], start: usize) -> Option<usize> {
+    let ch = char_at::<MARKS>(bytes, start);
     if !ch.number {
         return None;
     }
     let mut p = start + ch.len;
     let mut n = 1;
-    while n < 3 && p < bytes.len() {
-        let ch = char_at(bytes, p);
+    let limit = if DIGITS3 { 3 } else { 1 };
+    while n < limit && p < bytes.len() {
+        let ch = char_at::<MARKS>(bytes, p);
         if !ch.number {
             break;
         }
@@ -196,22 +253,22 @@ fn take_numbers(bytes: &[u8], start: usize) -> Option<usize> {
     Some(p)
 }
 
-fn take_punct(bytes: &[u8], start: usize) -> Option<usize> {
+fn take_punct<const MARKS: bool>(bytes: &[u8], start: usize) -> Option<usize> {
     let mut p = start;
-    let ch = char_at(bytes, p);
+    let ch = char_at::<MARKS>(bytes, p);
     if ch.space && p + 1 < bytes.len() {
-        let next = char_at(bytes, p + 1);
+        let next = char_at::<MARKS>(bytes, p + 1);
         if !next.whitespace && !next.letter && !next.number {
             p += 1;
         }
     }
-    let ch = char_at(bytes, p);
+    let ch = char_at::<MARKS>(bytes, p);
     if ch.whitespace || ch.letter || ch.number {
         return None;
     }
     p += ch.len;
     while p < bytes.len() {
-        let ch = char_at(bytes, p);
+        let ch = char_at::<MARKS>(bytes, p);
         if ch.whitespace || ch.letter || ch.number {
             break;
         }
@@ -223,11 +280,11 @@ fn take_punct(bytes: &[u8], start: usize) -> Option<usize> {
     Some(p)
 }
 
-fn take_whitespace(bytes: &[u8], start: usize) -> usize {
+fn take_whitespace<const MARKS: bool>(bytes: &[u8], start: usize) -> usize {
     let mut p = start;
     let mut last_newline = None;
     while p < bytes.len() {
-        let ch = char_at(bytes, p);
+        let ch = char_at::<MARKS>(bytes, p);
         if !ch.whitespace {
             break;
         }
@@ -252,15 +309,18 @@ fn take_whitespace(bytes: &[u8], start: usize) -> usize {
 }
 
 #[inline(always)]
-fn window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
+fn window<const ISA: u8, const DIGITS3: bool, const MARKS: bool>(
+    bytes: &[u8],
+    pos: usize,
+) -> Option<Window> {
     if pos + 64 > bytes.len() {
         return None;
     }
     let masks = masks_for::<ISA>(bytes, pos);
     if masks.non_ascii != 0 {
-        return window_unicode(bytes, pos, masks);
+        return window_unicode::<DIGITS3, MARKS>(bytes, pos, masks);
     }
-    bits(bytes, pos, masks, Uni::EMPTY, 64, false)
+    bits::<DIGITS3, MARKS>(bytes, pos, masks, Uni::EMPTY, 64, false)
 }
 
 /// Unicode bytes folded into the ASCII class masks. Empty on the ASCII path,
@@ -287,12 +347,17 @@ impl Uni {
 
 /// Classify non-ASCII characters into the masks and run the same bit rules.
 /// A Unicode number, or a character that does not fit in the window, ends
-/// the bit run: `\p{N}{1,3}` counts characters, which the byte masks cannot.
+/// the bit run. Groups of three count characters, which the byte masks cannot.
+/// A single number is one piece, so the preceding digits stay where they are.
 #[inline(never)]
-fn window_unicode(bytes: &[u8], pos: usize, masks: Masks) -> Option<Window> {
-    let found = absorb(bytes, pos, masks.non_ascii);
+fn window_unicode<const DIGITS3: bool, const MARKS: bool>(
+    bytes: &[u8],
+    pos: usize,
+    masks: Masks,
+) -> Option<Window> {
+    let found = absorb::<MARKS>(bytes, pos, masks.non_ascii);
     let mut stop = found.stop;
-    if found.number && stop > 0 {
+    if DIGITS3 && found.number && stop > 0 {
         let mut s = stop;
         while s > 0 && masks.digit & (1u64 << (s - 1)) != 0 {
             s -= 1;
@@ -302,16 +367,21 @@ fn window_unicode(bytes: &[u8], pos: usize, masks: Masks) -> Option<Window> {
     if stop == 0 {
         return None;
     }
-    bits(bytes, pos, masks, found.uni, stop, found.number)
+    bits::<DIGITS3, MARKS>(bytes, pos, masks, found.uni, stop, found.tail_nonws)
 }
 
 struct Absorbed {
     uni: Uni,
     stop: u32,
+    /// A Unicode number ended the run, so groups of three rewind into the
+    /// ASCII digits in front of it.
     number: bool,
+    /// The byte at the original stop is not whitespace. After a rewind this
+    /// bit sits on the first digit, which is also not whitespace.
+    tail_nonws: bool,
 }
 
-fn absorb(bytes: &[u8], pos: usize, mut bits: u64) -> Absorbed {
+fn absorb<const MARKS: bool>(bytes: &[u8], pos: usize, mut bits: u64) -> Absorbed {
     let mut uni = Uni::EMPTY;
     while bits != 0 {
         let i = bits.trailing_zeros() as usize;
@@ -321,21 +391,27 @@ fn absorb(bytes: &[u8], pos: usize, mut bits: u64) -> Absorbed {
                 uni,
                 stop: i as u32,
                 number: false,
+                tail_nonws: false,
             };
         }
         let (ch, n) = decode_char(bytes, pos + i);
+        let class = kind::<MARKS>(ch);
+        // The character starts in this window and continues past it. Its
+        // class still decides whether the whitespace run in front splits.
         if i + n > 64 {
             return Absorbed {
                 uni,
                 stop: i as u32,
-                number: false,
+                number: class == Class::Number,
+                tail_nonws: class != Class::Whitespace,
             };
         }
-        if class_of(ch) == Class::Number {
+        if class == Class::Number {
             return Absorbed {
                 uni,
                 stop: i as u32,
                 number: true,
+                tail_nonws: true,
             };
         }
         let char_bits = ((1u64 << n) - 1) << i;
@@ -349,7 +425,7 @@ fn absorb(bytes: &[u8], pos: usize, mut bits: u64) -> Absorbed {
             4 => uni.lead4 |= 1u64 << i,
             _ => {}
         }
-        match class_of(ch) {
+        match class {
             Class::Letter => uni.letter |= char_bits,
             Class::Whitespace => uni.ws |= char_bits,
             Class::Number | Class::Other => {}
@@ -359,6 +435,7 @@ fn absorb(bytes: &[u8], pos: usize, mut bits: u64) -> Absorbed {
         uni,
         stop: 64,
         number: false,
+        tail_nonws: false,
     }
 }
 
@@ -376,7 +453,7 @@ fn utf8_width(b: u8) -> usize {
 /// walker there. While more text follows, the last start is resumed rather
 /// than treated as a finished piece.
 #[inline(always)]
-fn bits(
+fn bits<const DIGITS3: bool, const MARKS: bool>(
     bytes: &[u8],
     pos: usize,
     masks: Masks,
@@ -417,7 +494,7 @@ fn bits(
     let single_punct = prev_punct & !two_back;
     let letter_start = letter & !cont & !prev_letter & !prev_space & !prev_ows & !single_punct;
     let punct_start = punct & !cont & !prev_punct & !prev_space;
-    let digit_start = splits3(digit);
+    let digit_start = if DIGITS3 { splits3(digit) } else { digit };
 
     let abs_seed = nl & prev_punct;
     let abs_n = if abs_seed == 0 {
@@ -523,7 +600,7 @@ fn bits(
         let before = boundary & mask_below(cut);
         if before != 0 {
             let start_rel = 63 - before.leading_zeros();
-            if advance(bytes, pos + start_rel as usize) > pos + cut as usize {
+            if advance::<DIGITS3, MARKS>(bytes, pos + start_rel as usize) > pos + cut as usize {
                 cut = start_rel;
             }
         }
@@ -698,5 +775,64 @@ mod tests {
         assert!(text.len() > 64);
         let got = pieces(&text);
         assert_eq!(&got[..4], &["the", " '", "they", " said"]);
+    }
+
+    fn drain(text: &str, mut next: impl FnMut(&mut [Span]) -> usize) -> Vec<String> {
+        let mut buf = [Span { start: 0, end: 0 }; 32];
+        let mut out = Vec::new();
+        loop {
+            let n = next(&mut buf);
+            if n == 0 {
+                break;
+            }
+            for span in &buf[..n] {
+                out.push(text[span.start as usize..span.end as usize].to_string());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn voyage_splits_every_number() {
+        let text = format!("id 12345 end {}", "word ".repeat(16));
+        let mut walk = Voyage::walk(&text);
+        let got = drain(&text, |buf| walk.fill(buf));
+        assert!(got.join("|").contains("1|2|3|4|5"), "{got:?}");
+        let mut walk = Voyage::walk("1¹23");
+        assert_eq!(drain("1¹23", |buf| walk.fill(buf)), ["1", "¹", "2", "3"]);
+    }
+
+    #[test]
+    fn olmo_groups_numbers_like_cl100k() {
+        let mut olmo = Olmo::walk("1¹23");
+        let mut cl = Cl100k::walk("1¹23");
+        assert_eq!(
+            drain("1¹23", |buf| olmo.fill(buf)),
+            drain("1¹23", |buf| cl.fill(buf))
+        );
+        let mut walk = Olmo::walk("12345");
+        assert_eq!(drain("12345", |buf| walk.fill(buf)), ["123", "45"]);
+    }
+
+    #[test]
+    fn qwen_counts_a_mark_as_a_letter() {
+        let word = format!("e{}", "\u{0301}");
+        let mut walk = Qwen::walk(&word);
+        assert_eq!(drain(&word, |buf| walk.fill(buf)), [word.clone()]);
+        let bang = format!("!!{}", "\u{0301}");
+        let mut walk = Qwen::walk(&bang);
+        assert_eq!(
+            drain(&bang, |buf| walk.fill(buf)),
+            ["!!".to_string(), "\u{0301}".to_string()]
+        );
+        let text = format!("cafe{} {}", "\u{0301}", "word ".repeat(16));
+        let mut walk = Qwen::walk(&text);
+        let got = drain(&text, |buf| walk.fill(buf));
+        assert_eq!(got[0], format!("cafe{}", "\u{0301}"));
+        let mut walk = Qwen::walk("12345");
+        assert_eq!(
+            drain("12345", |buf| walk.fill(buf)),
+            ["1", "2", "3", "4", "5"]
+        );
     }
 }
