@@ -21,7 +21,7 @@ This branch deleted the old `crates/pretokie/src` and `examples/`. Do not restor
 
 Each pretokenizer lives in its own file under `src/impls/`. Each pretokenizer's oracle tests live in their own file under `crates/pretokie/tests/`. Do not share a test file across pretokenizers. `span.rs` holds `Span`. `src/walk/` is the shared walker: `mod.rs` is the kernel, and `classify.rs` emits seven masks for a 64-byte window (ASCII letter, digit, space, newline, other whitespace, apostrophe, and non-ASCII). The kernel inlines the classifier and the scheme's window. It does not know the split rules. `Gpt2::count`, `Gpt2::count_upto`, and `Gpt2::walk` are the calls. A pretokenizer is a zero-sized type. Callers pass text that is already normalized. Design notes, when present, are in `notes/` and gitignored.
 
-`cargo check -p pretokie` succeeds. `crates/tokie` still names the deleted types, so tokie does not build until those calls change.
+`cargo check -p pretokie` succeeds. `tokie` depends on pretokie 0.1.3 from crates.io until it is rewritten onto these cuts. Do not point that dependency at this crate.
 
 ## Commands
 
@@ -31,7 +31,7 @@ cargo test -p pretokie
 cargo test -p tokie
 ```
 
-Check or test one package. The workspace build fails while tokie still calls the deleted pretokie types.
+Check or test one package. `tokie` builds against pretokie 0.1.3. This crate is 0.2.0.
 
 ## Commit messages
 
