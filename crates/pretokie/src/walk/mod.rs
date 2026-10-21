@@ -330,7 +330,13 @@ fn check_pairs<S: Scheme>(bytes: &[u8], base: usize, positions: &[u8], cursor: u
         let start = base + positions[cursor + k] as usize;
         let end = base + positions[cursor + k + 1] as usize;
         debug_assert!(end > start, "advance must consume at least one byte");
-        debug_assert_eq!(end, S::advance(bytes, start));
+        let got = S::advance(bytes, start);
+        debug_assert_eq!(
+            end,
+            got,
+            "window {start}..{end} advance {start}..{got} around {:?}",
+            bytes.get(start.saturating_sub(24)..end.max(got).saturating_add(24).min(bytes.len()))
+        );
     }
 }
 

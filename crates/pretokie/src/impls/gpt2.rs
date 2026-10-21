@@ -5,16 +5,8 @@
 //! then a whitespace run. Only a single ASCII space prefixes the next piece.
 //! A tab or a newline does not.
 
-#[cfg(target_arch = "aarch64")]
-use crate::walk::classify::classify_neon;
-use crate::walk::classify::{class_of, classify_scalar, Class, Masks};
-#[cfg(target_arch = "x86_64")]
-use crate::walk::classify::{classify_avx2, classify_avx512};
-#[cfg(target_arch = "aarch64")]
-use crate::walk::ISA_NEON;
-#[cfg(target_arch = "x86_64")]
-use crate::walk::{ISA_AVX2, ISA_AVX512};
-use crate::walk::{ISA_SCALAR, Scheme, Walk, Window};
+use crate::walk::classify::{class_of, masks_for, Class, Masks};
+use crate::walk::{Scheme, Walk, Window};
 use crate::Span;
 
 /// GPT-2 pretokenizer.
@@ -64,12 +56,12 @@ impl Gpt2Walk<'_> {
 impl Scheme for Gpt2 {
     #[inline]
     fn advance(bytes: &[u8], pos: usize) -> usize {
-        advance(bytes, pos)
+        advance::<false>(bytes, pos)
     }
 
     #[inline(always)]
     fn try_window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
-        window::<ISA>(bytes, pos)
+        window::<ISA, false>(bytes, pos)
     }
 }
 
@@ -89,7 +81,7 @@ fn is_ascii_ws(b: u8) -> bool {
 }
 
 /// `bytes[at]` is whitespace, including a continuation byte of a whitespace character.
-fn byte_is_whitespace(bytes: &[u8], at: usize) -> bool {
+pub(crate) fn byte_is_whitespace(bytes: &[u8], at: usize) -> bool {
     if at >= bytes.len() {
         return false;
     }
@@ -102,6 +94,22 @@ fn byte_is_whitespace(bytes: &[u8], at: usize) -> bool {
         let (ch, _) = decode_char(bytes, at);
         class_of(ch) == Class::Whitespace
     }
+}
+
+/// `bytes[at]` starts a numeric character. A continuation byte does not.
+pub(crate) fn byte_is_number(bytes: &[u8], at: usize) -> bool {
+    if at >= bytes.len() {
+        return false;
+    }
+    let b = bytes[at];
+    if b < 0x80 {
+        return is_ascii_digit(b);
+    }
+    if b & 0xC0 == 0x80 {
+        return false;
+    }
+    let (ch, _) = decode_char(bytes, at);
+    class_of(ch) == Class::Number
 }
 
 /// `bytes[i..]` is valid UTF-8 and `i` is a character boundary.
@@ -123,37 +131,45 @@ fn decode_char(bytes: &[u8], i: usize) -> (char, usize) {
     (ch, ch.len_utf8())
 }
 
-fn advance(bytes: &[u8], start: usize) -> usize {
+/// End of the piece at `start`.
+///
+/// `SINGLE_DIGITS` keeps each numeric character as its own piece and leaves
+/// a whitespace run whole when a number follows it.
+pub(crate) fn advance<const SINGLE_DIGITS: bool>(bytes: &[u8], start: usize) -> usize {
     let b0 = bytes[start];
     if is_ascii_letter(b0) {
         return scan_letters(bytes, start + 1);
     }
     if b0 == b' ' {
-        return advance_space(bytes, start);
+        return advance_space::<SINGLE_DIGITS>(bytes, start);
     }
     if b0 >= 0x80 {
         let (ch, n) = decode_char(bytes, start);
         let next = start + n;
         return match class_of(ch) {
             Class::Letter => scan_letters(bytes, next),
+            Class::Number if SINGLE_DIGITS => next,
             Class::Number => scan_digits(bytes, next),
-            Class::Whitespace => advance_ws(bytes, next, start),
+            Class::Whitespace => advance_ws::<SINGLE_DIGITS>(bytes, next, start),
             Class::Other => scan_other(bytes, next),
         };
     }
     if is_ascii_digit(b0) {
+        if SINGLE_DIGITS {
+            return start + 1;
+        }
         return scan_digits(bytes, start + 1);
     }
     if b0 == b'\'' {
         return advance_apostrophe(bytes, start);
     }
     if is_ascii_ws(b0) {
-        return advance_ws(bytes, start + 1, start);
+        return advance_ws::<SINGLE_DIGITS>(bytes, start + 1, start);
     }
     scan_other(bytes, start + 1)
 }
 
-fn advance_space(bytes: &[u8], start: usize) -> usize {
+fn advance_space<const SINGLE_DIGITS: bool>(bytes: &[u8], start: usize) -> usize {
     if start + 1 >= bytes.len() {
         return start + 1;
     }
@@ -162,6 +178,9 @@ fn advance_space(bytes: &[u8], start: usize) -> usize {
         return scan_letters(bytes, start + 2);
     }
     if is_ascii_digit(b1) {
+        if SINGLE_DIGITS {
+            return start + 1;
+        }
         return scan_digits(bytes, start + 2);
     }
     if b1 >= 0x80 {
@@ -169,13 +188,14 @@ fn advance_space(bytes: &[u8], start: usize) -> usize {
         let next = start + 1 + n;
         return match class_of(ch) {
             Class::Letter => scan_letters(bytes, next),
+            Class::Number if SINGLE_DIGITS => start + 1,
             Class::Number => scan_digits(bytes, next),
-            Class::Whitespace => advance_ws(bytes, next, start),
+            Class::Whitespace => advance_ws::<SINGLE_DIGITS>(bytes, next, start),
             Class::Other => scan_other(bytes, next),
         };
     }
     if is_ascii_ws(b1) {
-        return advance_ws(bytes, start + 1, start);
+        return advance_ws::<SINGLE_DIGITS>(bytes, start + 1, start);
     }
     scan_other(bytes, start + 2)
 }
@@ -252,7 +272,7 @@ fn scan_other(bytes: &[u8], mut p: usize) -> usize {
 /// `scan` is the first byte not yet classified. When content follows a run
 /// of two or more whitespace characters, the last of those characters is
 /// left for the next piece. A trailing run is consumed whole.
-fn advance_ws(bytes: &[u8], scan: usize, token_start: usize) -> usize {
+fn advance_ws<const SINGLE_DIGITS: bool>(bytes: &[u8], scan: usize, token_start: usize) -> usize {
     let mut p = scan;
     while p < bytes.len() {
         let b = bytes[p];
@@ -269,7 +289,7 @@ fn advance_ws(bytes: &[u8], scan: usize, token_start: usize) -> usize {
         }
         p += n;
     }
-    if p < bytes.len() {
+    if p < bytes.len() && !(SINGLE_DIGITS && byte_is_number(bytes, p)) {
         let mut last = p - 1;
         while last > token_start && bytes[last] & 0xC0 == 0x80 {
             last -= 1;
@@ -286,7 +306,13 @@ fn advance_ws(bytes: &[u8], scan: usize, token_start: usize) -> usize {
 /// A multibyte whitespace character occupies several whitespace bytes. The
 /// split belongs on its lead, not on its last byte. ASCII whitespace is
 /// handled in the kernel.
-fn ws_multibyte_splits(whitespace: u64, cont: u64, bytes: &[u8], pos: usize) -> u64 {
+fn ws_multibyte_splits<const SINGLE_DIGITS: bool>(
+    whitespace: u64,
+    cont: u64,
+    digit: u64,
+    bytes: &[u8],
+    pos: usize,
+) -> u64 {
     let mut split = 0u64;
     let mut leads = whitespace & !cont;
     while leads != 0 {
@@ -302,7 +328,13 @@ fn ws_multibyte_splits(whitespace: u64, cont: u64, bytes: &[u8], pos: usize) -> 
         } else {
             byte_is_whitespace(bytes, pos + next)
         };
-        if !next_is_ws {
+        let next_is_number = SINGLE_DIGITS
+            && if next < 64 {
+                digit & (1u64 << next) != 0
+            } else {
+                byte_is_number(bytes, pos + next)
+            };
+        if !next_is_ws && !next_is_number {
             split |= 1u64 << i;
         }
     }
@@ -362,7 +394,10 @@ fn absorb_non_ascii(bytes: &[u8], pos: usize, masks: &Masks) -> (u64, u64, u64, 
 /// is unfinished unless the window reaches the end of the text, or a
 /// contraction consumes the rest of it.
 #[inline(always)]
-fn window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
+pub(crate) fn window<const ISA: u8, const SINGLE_DIGITS: bool>(
+    bytes: &[u8],
+    pos: usize,
+) -> Option<Window> {
     if pos + 64 > bytes.len() {
         return None;
     }
@@ -378,16 +413,27 @@ fn window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
     let eof = pos + 64 == bytes.len();
     let whitespace = masks.space | masks.newline | masks.other_ws | uni_ws;
     let other = !(letter | digit | whitespace);
-    let cont_same = (letter & (letter << 1))
-        | (digit & (digit << 1))
-        | (other & (other << 1));
+    let digit_run = if SINGLE_DIGITS {
+        0
+    } else {
+        digit & (digit << 1)
+    };
+    let cont_same = (letter & (letter << 1)) | digit_run | (other & (other << 1));
     let after_space = masks.space << 1;
-    let content_start = !whitespace & !cont_same & !after_space;
+    let prefixed = if SINGLE_DIGITS {
+        after_space & !digit
+    } else {
+        after_space
+    };
+    let content_start = !whitespace & !cont_same & !prefixed;
 
     let split_ok = if eof || whitespace == 0 {
         0
     } else if cont == 0 {
         let mut split = whitespace & (!whitespace >> 1);
+        if SINGLE_DIGITS {
+            split &= !(digit >> 1);
+        }
         // SAFETY: `eof` is false, so `pos + 64` is inside `bytes`.
         let next = unsafe { *bytes.get_unchecked(pos + 64) };
         let next_is_ws = if next < 0x80 {
@@ -395,12 +441,13 @@ fn window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
         } else {
             byte_is_whitespace(bytes, pos + 64)
         };
-        if !next_is_ws {
+        let next_is_number = SINGLE_DIGITS && byte_is_number(bytes, pos + 64);
+        if !next_is_ws && !next_is_number {
             split |= whitespace & (1u64 << 63);
         }
         split
     } else {
-        ws_multibyte_splits(whitespace, cont, bytes, pos)
+        ws_multibyte_splits::<SINGLE_DIGITS>(whitespace, cont, digit, bytes, pos)
     };
     let run_start = !(whitespace << 1);
     let ws_start = whitespace & (run_start | split_ok);
@@ -446,33 +493,6 @@ fn window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
         starts: boundary,
         finishes,
     })
-}
-
-/// Classifier for the kernel that called [`window`].
-#[inline(always)]
-fn masks_for<const ISA: u8>(bytes: &[u8], pos: usize) -> Masks {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if ISA == ISA_AVX512 {
-            // SAFETY: the AVX-512 kernel is the only caller of this isa.
-            return unsafe { classify_avx512(bytes, pos) };
-        }
-        if ISA == ISA_AVX2 {
-            // SAFETY: the AVX2 kernel is the only caller of this isa.
-            return unsafe { classify_avx2(bytes, pos) };
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        if ISA == ISA_NEON {
-            // SAFETY: the NEON kernel is the only caller of this isa.
-            return unsafe { classify_neon(bytes, pos) };
-        }
-    }
-    if ISA != ISA_SCALAR {
-        debug_assert!(false, "scalar classifier received a simd isa");
-    }
-    classify_scalar(bytes, pos)
 }
 
 /// Length of a lowercase contraction starting at an apostrophe, including
@@ -576,7 +596,7 @@ mod tests {
         let mut expected = Vec::new();
         let mut pos = 0;
         while pos < text.len() {
-            let end = advance(text.as_bytes(), pos);
+            let end = advance::<false>(text.as_bytes(), pos);
             expected.push(&text[pos..end]);
             pos = end;
         }
@@ -632,7 +652,7 @@ mod tests {
             let mut expected = Vec::new();
             let mut pos = 0;
             while pos < text.len() {
-                let end = advance(text.as_bytes(), pos);
+                let end = advance::<false>(text.as_bytes(), pos);
                 expected.push(&text[pos..end]);
                 pos = end;
             }

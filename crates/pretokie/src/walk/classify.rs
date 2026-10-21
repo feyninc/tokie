@@ -82,9 +82,41 @@ fn is_other_ws(b: u8) -> bool {
     b.wrapping_sub(9) < 5 && !is_newline(b)
 }
 
+/// Classifier for the kernel that called a scheme window.
+///
+/// `ISA` selects the implementation. Passing a SIMD isa from a function
+/// without that instruction set is undefined.
+#[inline(always)]
+pub(crate) fn masks_for<const ISA: u8>(text: &[u8], at: usize) -> Masks {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::walk::{ISA_AVX2, ISA_AVX512};
+        if ISA == ISA_AVX512 {
+            // SAFETY: the AVX-512 kernel is the only caller of this isa.
+            return unsafe { classify_avx512(text, at) };
+        }
+        if ISA == ISA_AVX2 {
+            // SAFETY: the AVX2 kernel is the only caller of this isa.
+            return unsafe { classify_avx2(text, at) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::walk::ISA_NEON;
+        if ISA == ISA_NEON {
+            // SAFETY: the NEON kernel is the only caller of this isa.
+            return unsafe { classify_neon(text, at) };
+        }
+    }
+    if ISA != crate::walk::ISA_SCALAR {
+        debug_assert!(false, "scalar classifier received a simd isa");
+    }
+    classify_scalar(text, at)
+}
+
 /// Classify `text[at..at + 64]`. `at + 64` must be at most `text.len()`.
 ///
-/// Kernels call the matching classifier directly. This dispatch remains for tests.
+/// Kernels call [`masks_for`] directly. This dispatch remains for tests.
 #[cfg(test)]
 pub(crate) fn classify(text: &[u8], at: usize) -> Masks {
     debug_assert!(at + 64 <= text.len());
