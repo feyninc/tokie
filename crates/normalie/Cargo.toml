@@ -1,0 +1,16 @@
+[package]
+name = "normalie"
+version = "0.1.0"
+edition = "2024"
+description = "Fast normalizers for tokie"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/chonkie-inc/tokie"
+keywords = ["tokenizer", "normalizer", "unicode", "nlp"]
+categories = ["text-processing"]
+
+[dependencies]
+icu_normalizer = "2.2"
+memchr = "2.7"
+unicode-normalization = "0.1.25"
+unicode-segmentation = "1.12"
+unicode_categories = "0.1"
