@@ -9,3 +9,8 @@ pub use impls::{
     UnsupportedPattern, Voyage,
 };
 pub use span::Span;
+
+/// The mask-based pretokenizers tokie runs today: [`mask::Mask`] over a
+/// per-scheme config, with piece and block callbacks, plus [`mask::Bert`]
+/// and the `regex` fallback. They stay until tokie moves onto the cuts above.
+pub mod mask;

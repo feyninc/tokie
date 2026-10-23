@@ -140,7 +140,7 @@ fn load_from_json_value_with_encoder(
     encoder_type: EncoderType,
 ) -> Result<Tokenizer, JsonLoadError> {
     let model = &data["model"];
-    let normalizer = detect_normalizer(data);
+    let normalizer = detect_normalizer(data)?;
 
     // Check if this is a Unigram tokenizer
     // Unigram can be detected by:
@@ -347,7 +347,7 @@ fn load_byte_level_bpe(
         }
         EncoderType::Simple => {
             let (enc, bytes) =
-                BytePairEncoder::from_vocab_and_merges(&full_vocab, &merges, num_base_tokens);
+                BytePairEncoder::from_vocab_and_merges(&full_vocab, &merges, num_base_tokens, ignore_merges(data));
             (Encoder::Simple(enc), bytes)
         }
     };
@@ -446,7 +446,7 @@ fn load_vocab_defined_bpe(
     } else if use_simple || encoder_type == EncoderType::Simple {
         // Simple encoder for ByteLevel vocab-defined BPE or explicit request
         let (enc, bytes) =
-            BytePairEncoder::from_vocab_and_merges(&full_vocab, &merges, num_base_tokens);
+            BytePairEncoder::from_vocab_and_merges(&full_vocab, &merges, num_base_tokens, ignore_merges(data));
         (Encoder::Simple(enc), bytes)
     } else {
         // Backtracking for sequential-ID BPE (GPT-2, cl100k, o200k)
@@ -463,6 +463,12 @@ fn load_vocab_defined_bpe(
     }
     setup_added_tokens(&mut tokenizer, data);
     Ok(tokenizer)
+}
+
+/// HF BPE `model.ignore_merges` (Llama-3, Mistral-Nemo, gpt-oss): a piece
+/// that is itself a vocab token skips the merges. Absent means false.
+fn ignore_merges(data: &serde_json::Value) -> bool {
+    data["model"]["ignore_merges"].as_bool().unwrap_or(false)
 }
 
 /// Parse a byte fallback token like `<0x0A>` and return the byte value.
@@ -505,7 +511,7 @@ fn apply_regex_fallback(tok: &mut Tokenizer, detected: &DetectedPretokenizer) {
                 .map(|(p, l)| (p.as_str(), *l))
                 .collect();
 
-            if let Ok(regex) = pretokie::Regex::new(&pat_refs) {
+            if let Ok(regex) = pretokie::mask::Regex::new(&pat_refs) {
                 tok.set_pretokenizer(Some(Pretokenizer::from_regex(regex)));
             }
         }
@@ -566,7 +572,29 @@ fn detect_pretokenizer_type(data: &serde_json::Value) -> DetectedPretokenizer {
                                     || pattern.contains("\\p{Ll}");
 
                                 if is_case_aware {
-                                    return DetectedPretokenizer { pretok_type: PretokType::O200k, fallback_pattern: None };
+                                    let has_contractions = pattern.contains("'s|'t") || pattern.contains("'[sS]");
+                                    let has_single_digits =
+                                        pattern.contains("|\\p{N}|") || pattern.starts_with("\\p{N}|");
+                                    // Tekken (Mistral-Nemo, Nemotron) is o200k without the
+                                    // `(?i:'s|'t|...)?` contraction suffix and with single digits
+                                    // (no digit chunking in any stage).
+                                    if !has_contractions && has_single_digits && !has_chunked_digits {
+                                        return DetectedPretokenizer { pretok_type: PretokType::Tekken, fallback_pattern: None };
+                                    }
+                                    if has_contractions && pattern.contains("\\p{N}{1,3}") {
+                                        return DetectedPretokenizer { pretok_type: PretokType::O200k, fallback_pattern: None };
+                                    }
+                                    // Case-aware but neither scheme: run the raw regex
+                                    // rather than guess.
+                                    let all_splits: Vec<&str> = pretokenizers
+                                        .iter()
+                                        .filter(|p| p["type"].as_str() == Some("Split"))
+                                        .filter_map(|p| p["pattern"]["Regex"].as_str())
+                                        .collect();
+                                    return DetectedPretokenizer {
+                                        pretok_type: PretokType::None,
+                                        fallback_pattern: Some(all_splits.join("|")),
+                                    };
                                 }
 
                                 // Patterns with [\p{L}\p{M}]+ include combining marks
@@ -648,6 +676,28 @@ fn detect_pretokenizer_type(data: &serde_json::Value) -> DetectedPretokenizer {
     DetectedPretokenizer { pretok_type: PretokType::None, fallback_pattern: None }
 }
 
+/// Map a HF `BertNormalizer` to [`Normalizer::BertCased`] / [`Normalizer::BertUncased`].
+///
+/// Those variants hard-code `clean_text = true`, `handle_chinese_chars = true`
+/// and `strip_accents = lowercase` (HF's `strip_accents: null` default). Any
+/// other combination (e.g. `lowercase: true, strip_accents: false`) has no
+/// tokie equivalent, so it is rejected rather than silently tokenized with the
+/// wrong flags. Missing fields take HF's defaults, except `lowercase`, which
+/// keeps tokie's historical `false` default.
+fn bert_normalizer(n: &serde_json::Value) -> Result<Normalizer, JsonLoadError> {
+    let clean_text = n["clean_text"].as_bool().unwrap_or(true);
+    let handle_chinese_chars = n["handle_chinese_chars"].as_bool().unwrap_or(true);
+    let lowercase = n["lowercase"].as_bool().unwrap_or(false);
+    let strip_accents = n["strip_accents"].as_bool().unwrap_or(lowercase);
+    if !clean_text || !handle_chinese_chars || strip_accents != lowercase {
+        return Err(JsonLoadError::InvalidFormat(
+            "unsupported BertNormalizer flags: tokie requires clean_text = true, \
+             handle_chinese_chars = true and strip_accents = null or equal to lowercase",
+        ));
+    }
+    Ok(if lowercase { Normalizer::BertUncased } else { Normalizer::BertCased })
+}
+
 /// Detect the normalizer from HuggingFace JSON.
 ///
 /// Auto-detects based on normalizer and pre_tokenizer configuration:
@@ -655,11 +705,17 @@ fn detect_pretokenizer_type(data: &serde_json::Value) -> DetectedPretokenizer {
 /// - Precompiled + WhitespaceSplit + Metaspace → SentencePiece (T5, XLM-RoBERTa)
 /// - BertNormalizer with lowercase=true → BertUncased
 /// - BertNormalizer with lowercase=false → BertCased
+///   (other BertNormalizer flag combinations are rejected, see [`bert_normalizer`])
+/// - Lowercase alone → Lowercase (SentencePieceLowercase with WhitespaceSplit + Metaspace)
 /// - NFC → Nfc
 /// - Sequence containing NFC → Nfc
 /// - Metaspace pre_tokenizer only → Metaspace (Llama, Mistral)
 /// - None or null → None
-fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
+///
+/// Known (pre-existing) approximation: CLIP / SAM3's `Sequence[NFC, Replace(\s+ → " "), Lowercase]` is detected as `Nfc`
+/// via the NFC scan below, so neither the lowercase nor the whitespace
+/// collapse is applied.
+fn detect_normalizer(data: &serde_json::Value) -> Result<Normalizer, JsonLoadError> {
     let normalizer = &data["normalizer"];
     let has_metaspace = is_metaspace_pretokenizer(data);
     let has_whitespace_split = is_whitespace_split_pretokenizer(data);
@@ -667,9 +723,9 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
     // Handle null/missing normalizer - check for Metaspace pre_tokenizer
     if normalizer.is_null() {
         if has_metaspace {
-            return metaspace_normalizer_from_pretok(data);
+            return Ok(metaspace_normalizer_from_pretok(data));
         }
-        return Normalizer::None;
+        return Ok(Normalizer::None);
     }
 
     // Check normalizer type
@@ -681,21 +737,15 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
                 if has_metaspace {
                     // Prefer the model's exact charsmap blob; fall back to the
                     // category-rule approximation if it's missing or malformed.
-                    return parse_precompiled_charsmap(normalizer, has_whitespace_split)
-                        .unwrap_or(Normalizer::SentencePiece);
+                    return Ok(parse_precompiled_charsmap(normalizer, has_whitespace_split)
+                        .unwrap_or(Normalizer::SentencePiece));
                 }
             }
             "BertNormalizer" => {
-                // BertNormalizer with lowercase option
-                let lowercase = normalizer["lowercase"].as_bool().unwrap_or(false);
-                if lowercase {
-                    return Normalizer::BertUncased;
-                } else {
-                    return Normalizer::BertCased;
-                }
+                return bert_normalizer(normalizer);
             }
             "NFC" => {
-                return Normalizer::Nfc;
+                return Ok(Normalizer::Nfc);
             }
             "Sequence" => {
                 // Check sequence normalizers for specific patterns
@@ -704,7 +754,7 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
                     // 32× Replace(punct → " punct "), Replace(\s+→" "), Strip]
                     // + Metaspace pre-tokenizer.
                     if let Some(n) = detect_punct_pad_chain(normalizers, has_metaspace) {
-                        return n;
+                        return Ok(n);
                     }
 
                     let has_lowercase = normalizers.iter().any(|n| {
@@ -728,17 +778,17 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
 
                     // ALBERT pattern: Sequence with Lowercase + Precompiled + WhitespaceSplit + Metaspace
                     if has_precompiled && has_lowercase && has_metaspace && has_whitespace_split {
-                        return Normalizer::SentencePieceLowercase;
+                        return Ok(Normalizer::SentencePieceLowercase);
                     }
 
                     // General SentencePiece: Sequence with Precompiled + Metaspace
                     // (with or without WhitespaceSplit — bge-m3 omits it)
                     if has_precompiled && has_metaspace {
-                        return normalizers
+                        return Ok(normalizers
                             .iter()
                             .find(|n| n["type"].as_str() == Some("Precompiled"))
                             .and_then(|n| parse_precompiled_charsmap(n, has_whitespace_split))
-                            .unwrap_or(Normalizer::SentencePiece);
+                            .unwrap_or(Normalizer::SentencePiece));
                     }
 
                     // Mixtral pattern: Prepend "▁" + Replace " " → "▁".
@@ -746,22 +796,17 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
                     // and prepends unconditionally (TinyLlama, Phi-3,
                     // voyage-2 family) — unlike the Metaspace pre-tokenizer.
                     if has_prepend_metaspace && has_replace_space_metaspace {
-                        return Normalizer::Metaspace(MetaspacePrepend::Unconditional);
+                        return Ok(Normalizer::Metaspace(MetaspacePrepend::Unconditional));
                     }
 
                     // Check for NFC or BertNormalizer in sequence
                     for n in normalizers {
                         if let Some(n_type) = n["type"].as_str() {
                             if n_type == "NFC" {
-                                return Normalizer::Nfc;
+                                return Ok(Normalizer::Nfc);
                             }
                             if n_type == "BertNormalizer" {
-                                let lowercase = n["lowercase"].as_bool().unwrap_or(false);
-                                if lowercase {
-                                    return Normalizer::BertUncased;
-                                } else {
-                                    return Normalizer::BertCased;
-                                }
+                                return bert_normalizer(n);
                             }
                         }
                     }
@@ -770,9 +815,10 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
             "Lowercase" => {
                 // Simple lowercase normalizer - check if also has Metaspace
                 if has_metaspace && has_whitespace_split {
-                    return Normalizer::SentencePieceLowercase;
+                    return Ok(Normalizer::SentencePieceLowercase);
                 }
-                return Normalizer::BertUncased;
+                // HF `Lowercase` only lowercases: no clean_text / CJK padding.
+                return Ok(Normalizer::Lowercase);
             }
             "Replace" => {
                 // Replace normalizer - check if it converts space to metaspace (Gemma style)
@@ -780,7 +826,7 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
                 let pattern = normalizer["pattern"]["String"].as_str();
                 let content = normalizer["content"].as_str();
                 if pattern == Some(" ") && content == Some("▁") {
-                    return Normalizer::MetaspaceReplace;
+                    return Ok(Normalizer::MetaspaceReplace);
                 }
             }
             _ => {}
@@ -789,10 +835,10 @@ fn detect_normalizer(data: &serde_json::Value) -> Normalizer {
 
     // Even if normalizer exists, check for Metaspace pre_tokenizer
     if has_metaspace {
-        return metaspace_normalizer_from_pretok(data);
+        return Ok(metaspace_normalizer_from_pretok(data));
     }
 
-    Normalizer::None
+    Ok(Normalizer::None)
 }
 
 /// Detect the potion-multilingual punctuation-padding normalizer chain:
@@ -1469,17 +1515,86 @@ mod tests {
 
     #[test]
     fn test_detect_qwen35_single_stage_single_digits() {
-        // Qwen3.5-style: one Split with [\p{L}\p{M}]+ and single \p{N} — must stay Qwen35
+        // Qwen3.5 (real tokenizer.json pattern): one Split with [\p{L}\p{M}]+ and
+        // single \p{N} — must stay Qwen35
         let data = serde_json::json!({
             "pre_tokenizer": {
                 "type": "Sequence",
                 "pretokenizers": [
-                    {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false},
+                    {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false},
                     {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}
                 ]
             }
         });
         assert_eq!(detect_pretokenizer_type(&data).pretok_type, PretokType::Qwen35);
+    }
+
+    #[test]
+    fn test_detect_tekken_vs_o200k() {
+        // Nemotron / Mistral-Nemo: case-aware letters, no contractions, single digits.
+        let tekken = "[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\r\n/]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+        let o200k = "[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\r\n/]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+        for (pat, want) in [(tekken, PretokType::Tekken), (o200k, PretokType::O200k)] {
+            let data = serde_json::json!({
+                "pre_tokenizer": {
+                    "type": "Sequence",
+                    "pretokenizers": [
+                        {"type": "Split", "pattern": {"Regex": pat}, "behavior": "Isolated", "invert": false},
+                        {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}
+                    ]
+                }
+            });
+            assert_eq!(detect_pretokenizer_type(&data).pretok_type, want);
+        }
+    }
+
+    #[test]
+    fn test_detect_normalizer_lowercase_and_bert_flags() {
+        let detect = |n: serde_json::Value| detect_normalizer(&serde_json::json!({ "normalizer": n }));
+        // Plain Lowercase is lowercase-only (no BERT cleaning / CJK padding).
+        assert_eq!(detect(serde_json::json!({"type": "Lowercase"})).unwrap(), Normalizer::Lowercase);
+
+        let bert = |clean: bool, cjk: bool, strip: serde_json::Value, lower: bool| {
+            detect(serde_json::json!({
+                "type": "BertNormalizer", "clean_text": clean, "handle_chinese_chars": cjk,
+                "strip_accents": strip, "lowercase": lower
+            }))
+        };
+        use serde_json::Value::{Bool, Null};
+        assert_eq!(bert(true, true, Null, true).unwrap(), Normalizer::BertUncased);
+        assert_eq!(bert(true, true, Bool(true), true).unwrap(), Normalizer::BertUncased);
+        assert_eq!(bert(true, true, Null, false).unwrap(), Normalizer::BertCased);
+        assert_eq!(bert(true, true, Bool(false), false).unwrap(), Normalizer::BertCased);
+        // No tokie equivalent: rejected instead of silently approximated.
+        assert!(bert(true, true, Bool(false), true).is_err());
+        assert!(bert(true, true, Bool(true), false).is_err());
+        assert!(bert(false, true, Null, true).is_err());
+        assert!(bert(true, false, Null, false).is_err());
+        let seq = detect(serde_json::json!({"type": "Sequence", "normalizers": [
+            {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": false,
+             "strip_accents": null, "lowercase": true}
+        ]}));
+        assert!(seq.is_err());
+    }
+
+    #[test]
+    fn test_detect_case_aware_with_separate_digit_stage_is_not_tekken() {
+        // Tekken-like letters without contractions, but digits chunked by an
+        // earlier Split stage: neither Tekken nor o200k, so run the raw regex.
+        let letters = "[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\r\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\r\n/]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+        let data = serde_json::json!({
+            "pre_tokenizer": {
+                "type": "Sequence",
+                "pretokenizers": [
+                    {"type": "Split", "pattern": {"Regex": "\\p{N}{1,3}"}, "behavior": "Isolated", "invert": false},
+                    {"type": "Split", "pattern": {"Regex": letters}, "behavior": "Isolated", "invert": false},
+                    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}
+                ]
+            }
+        });
+        let detected = detect_pretokenizer_type(&data);
+        assert_eq!(detected.pretok_type, PretokType::None);
+        assert_eq!(detected.fallback_pattern.as_deref(), Some(format!("\\p{{N}}{{1,3}}|{letters}").as_str()));
     }
 
     #[test]

@@ -23,7 +23,7 @@ smallvec = "1.13"
 hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"], optional = true }
 memchr = "2.7"
 chunk = "0.9"
-pretokie = { version = "0.1.3", features = ["regex"] }
+pretokie = { path = "../pretokie", version = "0.2.0", features = ["regex"] }
 icu_normalizer = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -136,4 +136,60 @@ required-features = ["build"]
 
 [[example]]
 name = "regenerate_precompiled_v12"
+required-features = ["hf"]
+
+[[example]]
+name = "x1_miss"
+required-features = ["hf"]
+
+[[example]]
+name = "hf_diff"
+required-features = ["build"]
+
+[[example]]
+name = "bench_files"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_files"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_glue_costs"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_hotpath"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_piece_costs"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_spawn_cost"
+required-features = ["hf"]
+
+[[example]]
+name = "rank_merge_bench"
+required-features = ["hf"]
+
+[[example]]
+name = "rank_merge_diff"
+required-features = ["hf"]
+
+[[example]]
+name = "w3_simple"
+required-features = ["hf"]
+
+[[example]]
+name = "perf_encode"
+required-features = ["hf"]
+
+[[example]]
+name = "w4_split_audit"
+required-features = ["hf"]
+
+[[example]]
+name = "w4_unit_bench"
 required-features = ["hf"]

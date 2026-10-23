@@ -1,0 +1,64 @@
+name: Pretokenizer Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-pretokie:
+    name: Test pretokenizers against the HF oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Same data and cache keys as tokenizer-accuracy.yml: the data-file
+      # goldens read benches/data/{enwik8,owt_sample.txt}.
+      - name: Cache enwik8 test data
+        uses: actions/cache@v4
+        with:
+          path: benches/data/enwik8
+          key: enwik8-100mb
+
+      - name: Download enwik8 test data
+        run: |
+          mkdir -p benches/data
+          if [ ! -f benches/data/enwik8 ]; then
+            curl -L "https://mattmahoney.net/dc/enwik8.zip" -o /tmp/enwik8.zip
+            unzip -o /tmp/enwik8.zip -d benches/data/
+          fi
+
+      - name: Cache OWT test data
+        uses: actions/cache@v4
+        with:
+          path: benches/data/owt_sample.txt
+          key: owt-sample-50mb
+
+      - name: Download OWT test data
+        run: |
+          mkdir -p benches/data
+          if [ ! -f benches/data/owt_sample.txt ]; then
+            curl -sL "https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz" \
+              | gunzip -c 2>/dev/null | head -c 50000000 > benches/data/owt_sample.txt || true
+          fi
+          test "$(stat -c%s benches/data/owt_sample.txt)" -eq 50000000
+
+      # Lib tests (incl. the every-code-point class-table check and Mask vs
+      # Core differentials) and the Oniguruma oracle goldens on every ISA the
+      # runner supports. The oracle builds bundled Oniguruma with `cc`.
+      - name: Run pretokie tests
+        env:
+          PRETOKIE_REQUIRE_DATA: "1"
+        run: cargo test --release -p pretokie --features oracle --lib --tests
+
+      - name: Run tokie lib tests
+        run: cargo test -p tokie --lib

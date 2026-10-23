@@ -309,6 +309,79 @@ fn split_on_added(
     splits
 }
 
+/// The distinct first bytes of an added-token matcher's patterns. A match
+/// can only start at one of them, so a text containing none of them has no
+/// match: the DAAC scan (one automaton step per byte, no prefilter) and the
+/// split vectors are skipped. Most vocabularies need one or two bytes
+/// (`<` for `<|endoftext|>`/Llama-3 reserved tokens, `[` for BERT), which
+/// `memchr` checks at SIMD speed.
+struct FirstBytes {
+    set: [bool; 256],
+    few: [u8; 3],
+    n: usize,
+    /// Second bytes of the patterns, and whether every pattern has one.
+    /// With a single shared first byte (`<` of `<|...|>`, `[` of BERT's
+    /// `[CLS]`) the scan checks the byte after each occurrence too, so
+    /// code with plain `<` / `[` still skips the matcher.
+    second: [bool; 256],
+    all_two: bool,
+}
+
+impl Default for FirstBytes {
+    fn default() -> Self {
+        Self { set: [false; 256], few: [0; 3], n: 0, second: [false; 256], all_two: true }
+    }
+}
+
+impl FirstBytes {
+    fn add(&mut self, pattern: &[u8]) {
+        let b = pattern[0];
+        if !self.set[b as usize] {
+            self.set[b as usize] = true;
+            if self.n < 3 {
+                self.few[self.n] = b;
+            }
+            self.n += 1;
+        }
+        match pattern.get(1) {
+            Some(&b1) => self.second[b1 as usize] = true,
+            None => self.all_two = false,
+        }
+    }
+
+    /// Whether any pattern could start somewhere in `hay`.
+    #[inline]
+    fn may_occur(&self, hay: &[u8]) -> bool {
+        match self.n {
+            0 => false,
+            1 if self.all_two => {
+                // A match starts with the first byte followed by one of the
+                // patterns' second bytes.
+                let mut from = 0;
+                while let Some(i) = memchr::memchr(self.few[0], &hay[from..]) {
+                    let j = from + i;
+                    if hay.get(j + 1).is_some_and(|&b| self.second[b as usize]) {
+                        return true;
+                    }
+                    from = j + 1;
+                }
+                false
+            }
+            1 => memchr::memchr(self.few[0], hay).is_some(),
+            2 => memchr::memchr2(self.few[0], self.few[1], hay).is_some(),
+            3 => memchr::memchr3(self.few[0], self.few[1], self.few[2], hay).is_some(),
+            _ => hay.iter().any(|&b| self.set[b as usize]),
+        }
+    }
+}
+
+/// Shortest text that Backtracking/Simple encode through the
+/// pretokenizer's block drain and [`PretokenCache::encode_block`] (keys,
+/// then a paired probe with fixed-width emit) instead of one closure call
+/// per piece. Shorter ones (added-token segments, mostly) take the
+/// per-piece walk, whose setup is cheaper.
+const BLOCK_MIN_LEN: usize = 64;
+
 /// Approximation of the regex `\w` class HF uses for `single_word`
 /// boundaries: alphanumerics plus underscore.
 fn is_word_char(c: char) -> bool {
@@ -357,6 +430,10 @@ pub struct Tokenizer {
     /// normalized segment like HF's `split_normalized_trie`. Patterns are the
     /// normalizer-transformed token contents; values index `added_tokens_raw`.
     norm_added_matcher: Option<DoubleArrayAhoCorasick>,
+    /// First bytes of the `raw_added_matcher` / `norm_added_matcher`
+    /// patterns (scan prefilter).
+    raw_added_first: FirstBytes,
+    norm_added_first: FirstBytes,
     /// Special token metadata: maps token string -> token ID.
     /// Populated from the `added_tokens` array in tokenizer.json where `special: true`.
     special_tokens: Vec<(String, TokenId)>,
@@ -393,6 +470,8 @@ impl Tokenizer {
             reverse_vocab: OnceLock::new(),
             raw_added_matcher: None,
             norm_added_matcher: None,
+            raw_added_first: FirstBytes::default(),
+            norm_added_first: FirstBytes::default(),
             special_tokens: Vec::new(),
             added_tokens_raw: Vec::new(),
             added_tokens_serialized: false,
@@ -460,6 +539,7 @@ impl Tokenizer {
         let mut raw_trie = Trie::new();
         let mut norm_trie = Trie::new();
         let (mut raw_count, mut norm_count) = (0usize, 0usize);
+        let (mut raw_first, mut norm_first) = (FirstBytes::default(), FirstBytes::default());
         for (idx, tok) in tokens.iter().enumerate() {
             if tok.bytes.is_empty() {
                 continue;
@@ -479,19 +559,24 @@ impl Tokenizer {
                         let pattern = self.normalizer.normalize(s);
                         if !pattern.is_empty() {
                             norm_trie.add(pattern.as_ref().as_bytes(), idx as u32);
+                            norm_first.add(pattern.as_ref().as_bytes());
                             norm_count += 1;
                         }
                     }
                     Err(_) => {
                         raw_trie.add(&tok.bytes, idx as u32);
+                        raw_first.add(&tok.bytes);
                         raw_count += 1;
                     }
                 }
             } else {
                 raw_trie.add(&tok.bytes, idx as u32);
+                raw_first.add(&tok.bytes);
                 raw_count += 1;
             }
         }
+        self.raw_added_first = raw_first;
+        self.norm_added_first = norm_first;
         self.raw_added_matcher = (raw_count > 0).then(|| {
             raw_trie.build(MatchKind::LeftmostLongest);
             raw_trie.compile()
@@ -847,7 +932,7 @@ impl Tokenizer {
     /// parallel path for large documents.
     fn encode_raw_ctx(&self, text: &str, cache: Option<&mut WorkerCaches>) -> Vec<TokenId> {
         let allow_parallel = cache.is_none();
-        if cache.is_none() && self.encoder.as_backtracking().is_some() && self.pretokenizer.is_some() {
+        if cache.is_none() && (self.encoder.as_backtracking().is_some() || self.encoder.as_simple().is_some() || self.encoder.as_wordpiece().is_some()) && self.pretokenizer.is_some() {
             let mut lease = crate::pool::CacheLease::checkout(self.cache_generation);
             return self.encode_raw_dispatch(text, Some(lease.caches()), allow_parallel);
         }
@@ -877,89 +962,126 @@ impl Tokenizer {
         mut cache: Option<&mut WorkerCaches>,
         allow_parallel: bool,
     ) -> Vec<TokenId> {
-        let mut result = Vec::new();
-
-        let raw_splits = match &self.raw_added_matcher {
-            Some(matcher) => split_on_added(text, matcher, &self.added_tokens_raw),
-            None => vec![(None, 0..text.len())],
-        };
-
-        for (spec_idx, range) in raw_splits {
-            if let Some(idx) = spec_idx {
-                result.push(self.added_tokens_raw[idx].id);
-                continue;
-            }
-            let segment = &text[range.clone()];
-            if segment.is_empty() {
-                continue;
-            }
-            // Only the segment at byte 0 of the original input counts as
-            // "first" (HF Metaspace prepend_scheme=first checks the
-            // original offset).
-            let first_segment = range.start == 0;
-
-            match &self.norm_added_matcher {
-                None => {
-                    result.extend(self.encode_segment(segment, first_segment, cache.as_deref_mut(), allow_parallel));
+        let mut out = Vec::with_capacity(text.len() / 3);
+        match &self.raw_added_matcher {
+            Some(matcher) if self.raw_added_first.may_occur(text.as_bytes()) => {
+                for (spec_idx, range) in split_on_added(text, matcher, &self.added_tokens_raw) {
+                    match spec_idx {
+                        Some(idx) => out.push(self.added_tokens_raw[idx].id),
+                        None => self.encode_raw_segment_into(text, range, cache.as_deref_mut(), allow_parallel, &mut out),
+                    }
                 }
-                Some(matcher) => {
-                    let normalized = self.normalizer.normalize_segment(segment, first_segment);
-                    for (nidx, nrange) in
-                        split_on_added(normalized.as_ref(), matcher, &self.added_tokens_raw)
-                    {
-                        if let Some(idx) = nidx {
-                            result.push(self.added_tokens_raw[idx].id);
-                            continue;
-                        }
-                        let piece = &normalized[nrange];
-                        if !piece.is_empty() {
-                            result.extend(self.encode_prenormalized(piece, cache.as_deref_mut(), allow_parallel));
-                        }
+            }
+            // No raw added token can start anywhere in `text` (or there are
+            // none): it is a single segment, as `split_on_added` would return.
+            _ => self.encode_raw_segment_into(text, 0..text.len(), cache, allow_parallel, &mut out),
+        }
+        out
+    }
+
+    /// Encode the non-added-token segment `text[range]` of a raw split into
+    /// `out`: normalize it with segment-position awareness, then split it on
+    /// the normalized added-token patterns.
+    fn encode_raw_segment_into(
+        &self,
+        text: &str,
+        range: std::ops::Range<usize>,
+        mut cache: Option<&mut WorkerCaches>,
+        allow_parallel: bool,
+        out: &mut Vec<TokenId>,
+    ) {
+        let segment = &text[range.clone()];
+        if segment.is_empty() {
+            return;
+        }
+        // Only the segment at byte 0 of the original input counts as
+        // "first" (HF Metaspace prepend_scheme=first checks the
+        // original offset).
+        let first_segment = range.start == 0;
+
+        match &self.norm_added_matcher {
+            None => self.encode_segment_into(segment, first_segment, cache, allow_parallel, out),
+            Some(matcher) => {
+                let normalized = self.normalizer.normalize_segment(segment, first_segment);
+                let normalized = normalized.as_ref();
+                if !self.norm_added_first.may_occur(normalized.as_bytes()) {
+                    if !normalized.is_empty() {
+                        self.encode_prenormalized_into(normalized, cache, allow_parallel, out);
+                    }
+                    return;
+                }
+                for (nidx, nrange) in split_on_added(normalized, matcher, &self.added_tokens_raw) {
+                    if let Some(idx) = nidx {
+                        out.push(self.added_tokens_raw[idx].id);
+                        continue;
+                    }
+                    let piece = &normalized[nrange];
+                    if !piece.is_empty() {
+                        self.encode_prenormalized_into(piece, cache.as_deref_mut(), allow_parallel, out);
                     }
                 }
             }
         }
-
-        result
     }
 
-    /// Encode one raw segment of an added-token split, normalizing it with
-    /// segment-position awareness.
-    fn encode_segment(
+    /// Encode one raw segment of an added-token split into `out`,
+    /// normalizing it with segment-position awareness.
+    fn encode_segment_into(
         &self,
         segment: &str,
         first_segment: bool,
         cache: Option<&mut WorkerCaches>,
         allow_parallel: bool,
-    ) -> Vec<TokenId> {
+        out: &mut Vec<TokenId>,
+    ) {
         if self.pretokenizer.is_none() {
             let normalized = self.normalizer.normalize_segment(segment, first_segment);
-            let mut out = Vec::with_capacity(normalized.as_ref().len() / 3);
-            self.encoder
-                .encode_into(normalized.as_ref().as_bytes(), cache, &mut out);
-            return out;
+            self.encoder.encode_into(normalized.as_ref().as_bytes(), cache, out);
+            return;
         }
         // Models with a pretokenizer never use position-aware metaspace
         // prepending, so the standard path (with its parallel branch for
         // large segments) is equivalent.
-        self.encode_raw_inner(segment, cache, allow_parallel)
+        self.encode_raw_inner_into(segment, cache, allow_parallel, out)
     }
 
-    /// Encode an already-normalized piece (stage 2 of the added-token split).
-    fn encode_prenormalized(&self, piece: &str, cache: Option<&mut WorkerCaches>, allow_parallel: bool) -> Vec<TokenId> {
+    /// Encode an already-normalized piece (stage 2 of the added-token split)
+    /// into `out`.
+    fn encode_prenormalized_into(
+        &self,
+        piece: &str,
+        cache: Option<&mut WorkerCaches>,
+        allow_parallel: bool,
+        out: &mut Vec<TokenId>,
+    ) {
         if self.pretokenizer.is_none() {
-            let mut out = Vec::with_capacity(piece.len() / 3);
-            self.encoder.encode_into(piece.as_bytes(), cache, &mut out);
-            return out;
+            self.encoder.encode_into(piece.as_bytes(), cache, out);
+            return;
         }
         // Pretokenizer models pair with idempotent normalizers (None, NFC,
         // Bert clean-text), so re-normalizing in the standard path is a
         // no-op and keeps the parallel branch for large pieces.
-        self.encode_raw_inner(piece, cache, allow_parallel)
+        self.encode_raw_inner_into(piece, cache, allow_parallel, out)
     }
 
     /// Inner encoding without added token splitting.
     fn encode_raw_inner(&self, text: &str, cache: Option<&mut WorkerCaches>, allow_parallel: bool) -> Vec<TokenId> {
+        if self.pretokenizer.is_some() && allow_parallel && text.len() >= Self::PARALLEL_CHUNK_THRESHOLD {
+            return self.encode_parallel(text);
+        }
+        let mut out = Vec::with_capacity(text.len() / 3);
+        self.encode_raw_inner_into(text, cache, allow_parallel, &mut out);
+        out
+    }
+
+    /// [`Self::encode_raw_inner`] appending into `out`.
+    fn encode_raw_inner_into(
+        &self,
+        text: &str,
+        cache: Option<&mut WorkerCaches>,
+        allow_parallel: bool,
+        out: &mut Vec<TokenId>,
+    ) {
         // For models without pretokenizer (SentencePiece, Unigram), normalize the full
         // text first and pass directly to the encoder. The encoder handles its own
         // chunking at safe boundaries (metaspace). We must NOT use encode_parallel here
@@ -968,17 +1090,15 @@ impl Tokenizer {
         // - Metaspace sequence merging (Voyage-code-2, Voyage-law-2)
         if self.pretokenizer.is_none() {
             let normalized = self.normalizer.normalize(text);
-            let mut out = Vec::with_capacity(normalized.as_ref().len() / 3);
-            self.encoder
-                .encode_into(normalized.as_ref().as_bytes(), cache, &mut out);
-            return out;
+            self.encoder.encode_into(normalized.as_ref().as_bytes(), cache, out);
+            return;
         }
 
         if allow_parallel && text.len() >= Self::PARALLEL_CHUNK_THRESHOLD {
-            self.encode_parallel(text)
+            out.extend(self.encode_parallel(text));
         } else {
             let normalized = self.normalizer.normalize(text);
-            self.encode_sequential(normalized.as_ref(), cache)
+            self.encode_sequential_into(normalized.as_ref(), cache, out);
         }
     }
 
@@ -1103,13 +1223,46 @@ impl Tokenizer {
                 // the Backtracking fused path.
                 Some(c) => {
                     let pc = &mut c.pretok;
-                    pretok.for_each_piece(text, |p| {
-                        bt.encode_piece_into(db, p.as_bytes(), Some(&mut *pc), out)
-                    })
+                    if pc.wants_seed() {
+                        pc.seed(bt.cache_seeds());
+                    }
+                    // Block drain: keys and probes for a block of pieces run
+                    // in their own loops instead of inside the walker.
+                    let blocked = text.len() >= BLOCK_MIN_LEN && pretok.for_each_block(text, &mut |start, ends| {
+                        pc.encode_block(db, start, ends, out, |c, p, o| bt.encode_piece_into(db, p, Some(c), o))
+                    });
+                    if !blocked {
+                        pretok.for_each_piece(text, |p| {
+                            bt.encode_piece_into(db, p.as_bytes(), Some(&mut *pc), out)
+                        })
+                    }
                 }
                 None => pretok.for_each_piece(text, |p| {
                     bt.encode_piece_into(db, p.as_bytes(), None, out)
                 }),
+            }
+        } else if let Some(wp) = self.encoder.as_wordpiece() {
+            let mut pc = cache.map(|c| &mut c.pretok);
+            pretok.for_each_piece(text, |p| {
+                wp.encode_piece_into(db, p.as_bytes(), pc.as_deref_mut(), out)
+            })
+        } else if let Some(se) = self.encoder.as_simple() {
+            let mut pc = cache.map(|c| &mut c.pretok);
+            if let Some(c) = pc.as_deref_mut() {
+                if c.wants_seed() {
+                    c.seed(se.cache_seeds());
+                }
+            }
+            let blocked = match pc.as_deref_mut() {
+                Some(c) if text.len() >= BLOCK_MIN_LEN => pretok.for_each_block(text, &mut |start, ends| {
+                    c.encode_block(db, start, ends, out, |c, p, o| se.encode_piece_into(db, p, Some(c), o))
+                }),
+                _ => false,
+            };
+            if !blocked {
+                pretok.for_each_piece(text, |p| {
+                    se.encode_piece_into(db, p.as_bytes(), pc.as_deref_mut(), out)
+                })
             }
         } else {
             for piece in pretok.split(text) {
@@ -2352,5 +2505,38 @@ mod tests {
         let enc = tokenizer.encode_with_offsets("abcde", false);
         assert!(enc.ids.len() <= 2);
         assert_eq!(enc.ids.len(), enc.offsets.len());
+    }
+
+    /// The added-token prefilter never rules out a text in which some
+    /// pattern occurs.
+    #[test]
+    fn first_bytes_prefilter_is_conservative() {
+        let sets: &[&[&[u8]]] = &[
+            &[b"<|endoftext|>"],
+            &[b"<|im_start|>", b"<|im_end|>", b"<s>"],
+            &[b"[CLS]", b"[SEP]", b"[PAD]", b"[MASK]", b"[UNK]"],
+            &[b"a", b"bc"],
+            &[b"<", b"<|x"],
+            &[b"xy", b"zw", b"q", b"rs"],
+        ];
+        let alphabet = b"<|[]CSPMUabcxyzqrsw ";
+        let mut state = 0x9E3779B97F4A7C15u64;
+        for pats in sets {
+            let mut fb = FirstBytes::default();
+            for p in *pats {
+                fb.add(p);
+            }
+            for _ in 0..20_000 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let len = (state >> 58) as usize;
+                let hay: Vec<u8> = (0..len)
+                    .map(|k| alphabet[((state >> (k % 50)) as usize ^ k * 7) % alphabet.len()])
+                    .collect();
+                let occurs = pats.iter().any(|p| hay.windows(p.len()).any(|w| w == *p));
+                if occurs {
+                    assert!(fb.may_occur(&hay), "{pats:?} occur in {:?}", String::from_utf8_lossy(&hay));
+                }
+            }
+        }
     }
 }

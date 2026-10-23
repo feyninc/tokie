@@ -6,12 +6,15 @@
 //! # File Format
 //!
 //! ```text
-//! Header (88 bytes):
+//! Header (100 bytes in v14; 96 in v13, 88 before):
 //!   - magic: "TOKI" (4 bytes)
-//!   - version: u32 (4 bytes) - currently v12
-//!   - encoder_type: u32 (4 bytes) - 0=Backtracking, 1=Simple, 2=WordPiece
-//!   - pretokenizer_type: u32 (4 bytes) - 0=None, 1=GPT2, 2=CL100K, 3=O200K, 4=BERT, 5=Voyage
-//!   - normalizer_type: u32 (4 bytes) - 0=None, 1=BertUncased, 2=BertCased, 3=Nfc
+//!   - version: u32 (4 bytes) - currently v14 (v10..=v14 load)
+//!   - encoder_type: u32 (4 bytes) - 0=Backtracking, 1=Simple, 2=WordPiece,
+//!     3=SentencePiece, 4=Unigram
+//!   - pretokenizer_type: u32 (4 bytes) - 0=None, 1=GPT2, 2=CL100K, 3=O200K, 4=BERT, 5=Voyage,
+//!     6=DeepSeek, 7=SmolLM, 8=Qwen3.5, 9=Tekken
+//!   - normalizer_type: u32 (4 bytes) - 0=None, 1=BertUncased, 2=BertCased, 3=Nfc,
+//!     4..=12 Metaspace/SentencePiece variants, 13=Lowercase (see `Normalizer::to_u32`)
 //!   - post_processor_type: u32 (4 bytes) - 0=None, 1=Bert, 2=Prefix, 3=Template
 //!   - vocab_size: u32 (4 bytes)
 //!   - num_merges: u32 (4 bytes)
@@ -23,8 +26,11 @@
 //!   - prefix_data_offset: u32, prefix_data_checksum: u32
 //!   - pp_data_offset: u32, pp_data_checksum: u32
 //!   - charsmap_data_offset: u32, charsmap_data_checksum: u32 (v12+; padding before)
+//!   - added_tokens_offset: u32, added_tokens_checksum: u32 (v13+)
+//!   - flags: u32 (v14+) - bit0 = ignore_merges (Simple encoder); other bits 0.
+//!     Files before v14 load Simple encoders with ignore_merges = true.
 //!
-//! Sections:
+//! Sections (offsets are absolute, starting right after the header):
 //!   - TOKEN_DATA: Decoder's flat buffer (offsets + data)
 //!   - MERGE_DATA: split_table as raw bytes
 //!   - DAAC_DATA: Pre-built DoubleArrayAhoCorasick state (empty for Simple encoder)
@@ -32,6 +38,7 @@
 //!   - PP_DATA: Post-processor parameters (empty for None)
 //!   - CHARSMAP_DATA: Raw SentencePiece precompiled_charsmap blob (v12+, empty
 //!     unless normalizer is SentencePiecePrecompiled)
+//!   - ADDED_TOKENS: added/special tokens (v13+, present even when empty)
 //! ```
 
 use core::mem::size_of;
@@ -51,11 +58,16 @@ use foldhash::HashMap as FoldHashMap;
 const MAGIC: &[u8; 4] = b"TOKI";
 /// Current .tkz format version. Public so cache layers can key artifacts by it.
 /// v12 added CHARSMAP_DATA; v13 adds ADDED_TOKENS (files are self-contained —
-/// no tokenizer.json fetch needed for added/special tokens).
-pub(crate) const VERSION: u32 = 13;
+/// no tokenizer.json fetch needed for added/special tokens); v14 adds a flags
+/// word (bit0 = Simple encoder `ignore_merges`).
+pub(crate) const VERSION: u32 = 14;
 const HEADER_SIZE: usize = 88;
 /// v13 grows the header by one (offset, checksum) pair for ADDED_TOKENS.
 const HEADER_SIZE_V13: usize = 96;
+/// v14 grows the header by one u32 flags word.
+const HEADER_SIZE_V14: usize = 100;
+/// v14 header flag: Simple encoder uses HF `ignore_merges`.
+const FLAG_IGNORE_MERGES: u32 = 1;
 
 impl PretokType {
     fn from_u32(v: u32) -> Option<Self> {
@@ -69,6 +81,7 @@ impl PretokType {
             6 => Some(Self::DeepSeek),
             7 => Some(Self::SmolLM),
             8 => Some(Self::Qwen35),
+            9 => Some(Self::Tekken),
             _ => None,
         }
     }
@@ -90,6 +103,7 @@ impl Normalizer {
             7 => Some(Self::MetaspaceReplace),
             10 => Some(Self::Metaspace(MetaspacePrepend::IfNotSpaceLed)),
             11 => Some(Self::Metaspace(MetaspacePrepend::FirstSegment)),
+            13 => Some(Self::Lowercase),
             _ => None,
         }
     }
@@ -110,6 +124,7 @@ impl Normalizer {
             Self::Metaspace(MetaspacePrepend::IfNotSpaceLed) => 10,
             Self::Metaspace(MetaspacePrepend::FirstSegment) => 11,
             Self::SentencePiecePunctPad { .. } => 12,
+            Self::Lowercase => 13,
         }
     }
 }
@@ -347,7 +362,7 @@ impl Tokenizer {
         let charsmap_checksum = crc32(charsmap_data);
 
         // Compute offsets (after header)
-        let token_offset = HEADER_SIZE_V13 as u32;
+        let token_offset = HEADER_SIZE_V14 as u32;
         let merge_offset = token_offset + token_data.len() as u32;
         let daac_offset = merge_offset + merge_data.len() as u32;
         let prefix_offset = daac_offset + daac_data.len() as u32;
@@ -399,6 +414,12 @@ impl Tokenizer {
         // v13: 7th section pair extends the header to 96 bytes
         writer.write_all(&added_offset.to_le_bytes())?;
         writer.write_all(&added_checksum.to_le_bytes())?;
+        // v14: flags word extends the header to 100 bytes
+        let flags = match encoder {
+            Encoder::Simple(enc) if enc.ignore_merges() => FLAG_IGNORE_MERGES,
+            _ => 0,
+        };
+        writer.write_all(&flags.to_le_bytes())?;
 
         // Write sections
         writer.write_all(&token_data)?;
@@ -508,6 +529,16 @@ impl Tokenizer {
         } else {
             (data.len(), 0)
         };
+        // v14+: flags word in bytes 96..100. Older Simple files predate the
+        // flag and were built with every token short-circuiting.
+        let flags = if version >= 14 {
+            if data.len() < HEADER_SIZE_V14 {
+                return Err(SerdeError::InvalidData("truncated v14 header"));
+            }
+            u32::from_le_bytes(data[96..100].try_into().unwrap())
+        } else {
+            FLAG_IGNORE_MERGES
+        };
 
         // Extract and verify sections
         let token_data = &data[token_offset..merge_offset];
@@ -596,7 +627,7 @@ impl Tokenizer {
                 let next_prefix_match = deserialize_prefix_match(prefix_data)?;
 
                 // Rebuild pair_lookup from split_table
-                let pair_lookup = rebuild_pair_lookup(&split_table, num_base_tokens);
+                let pair_lookup = rebuild_pair_lookup(&split_table, num_base_tokens, &token_bytes);
 
                 // Extract token lengths from decoder offsets
                 let token_lengths: Vec<u8> = (0..vocab_size)
@@ -621,13 +652,17 @@ impl Tokenizer {
             EncoderType::Simple => {
                 // OPTIMIZED: Build lookups directly from decoder (single copy)
                 // Simple encoder doesn't use token_lengths, so we ignore it
-                let (byte_lut, token_cache, _, _) = build_token_lookups(&decoder_offsets, &decoder_data, vocab_size);
+                // Simple's whole-piece early exit covers tokens of any length;
+                // from_parts prunes it to merge-reachable tokens unless
+                // ignore_merges.
+                let (byte_lut, token_cache, _, _) = build_token_lookups(&decoder_offsets, &decoder_data, vocab_size, usize::MAX);
                 let merges = deserialize_merges(merge_data)?;
 
                 let enc = BytePairEncoder::from_parts(
                     &merges,
                     byte_lut,
                     token_cache,
+                    flags & FLAG_IGNORE_MERGES != 0,
                     vocab_size,
                     num_base_tokens,
                 );
@@ -659,7 +694,7 @@ impl Tokenizer {
             }
             EncoderType::SentencePiece => {
                 // OPTIMIZED: Build lookups directly from decoder (single copy)
-                let (mut byte_lut, mut token_cache, token_lengths, byte_tokens) = build_token_lookups(&decoder_offsets, &decoder_data, vocab_size);
+                let (mut byte_lut, mut token_cache, token_lengths, byte_tokens) = build_token_lookups(&decoder_offsets, &decoder_data, vocab_size, MAX_CACHED_TOKEN_LEN);
                 let merges = deserialize_merges(merge_data)?;
 
                 // Fix byte_lut/token_cache for byte-fallback collisions.
@@ -681,6 +716,10 @@ impl Tokenizer {
                     token_lengths,
                     vocab_size,
                     num_base_tokens,
+                    |id| {
+                        let i = id as usize;
+                        &decoder_data[decoder_offsets[i] as usize..decoder_offsets[i + 1] as usize]
+                    },
                 );
                 Encoder::SentencePiece(enc)
             }
@@ -869,6 +908,7 @@ fn build_token_lookups(
     decoder_offsets: &[u32],
     decoder_data: &[u8],
     vocab_size: usize,
+    max_cached_len: usize,
 ) -> ([TokenId; 256], FoldHashMap<Vec<u8>, TokenId>, Vec<u16>, [Vec<TokenId>; 256]) {
     let mut byte_lut = [u32::MAX; 256];
     let mut byte_tokens: [Vec<TokenId>; 256] = std::array::from_fn(|_| Vec::new());
@@ -877,7 +917,7 @@ fn build_token_lookups(
     let short_count: usize = (0..vocab_size)
         .filter(|&i| {
             let len = (decoder_offsets[i + 1] - decoder_offsets[i]) as usize;
-            len <= MAX_CACHED_TOKEN_LEN
+            len <= max_cached_len
         })
         .count();
 
@@ -903,7 +943,7 @@ fn build_token_lookups(
             }
             // First-wins for token_cache
             token_cache.entry(bytes.to_vec()).or_insert(i as TokenId);
-        } else if len <= MAX_CACHED_TOKEN_LEN {
+        } else if len <= max_cached_len {
             token_cache.insert(bytes.to_vec(), i as TokenId);
         }
     }
@@ -1190,16 +1230,26 @@ fn deserialize_merges(data: &[u8]) -> Result<Vec<(TokenId, TokenId, TokenId)>, S
 fn rebuild_pair_lookup(
     splits: &[Split],
     num_base_tokens: usize,
+    token_bytes: &[Vec<u8>],
 ) -> FoldHashMap<u64, TokenId> {
     let mut lookup = FoldHashMap::default();
 
     for (id, split) in splits.iter().enumerate().skip(num_base_tokens) {
-        // Split::base entries (added/special tokens, e.g. gpt2's <|endoftext|>)
-        // point at themselves and are not merges; from_json never puts them in
-        // pair_lookup, and a degenerate (id,id)->id entry would make the rank
-        // table's monotonicity check reject the whole vocab.
-        if split.left == id as TokenId && split.right == id as TokenId {
-            continue;
+        // Split::base entries (added/special tokens) are not merges; from_json
+        // never puts them in pair_lookup, and a degenerate entry would make the
+        // rank table's monotonicity check reject the whole vocab on every .tkz
+        // load. A base split points at the token's *id*, which differs from its
+        // table position when the vocab has id holes (cl100k's <|endoftext|> sits
+        // at position 100256 with id 100257), so `left == id` alone misses them:
+        // keep only splits whose parts really concatenate to this token.
+        if split.left == split.right {
+            let is_merge = match (token_bytes.get(id), token_bytes.get(split.left as usize)) {
+                (Some(t), Some(part)) => t.len() == 2 * part.len() && t[..part.len()] == part[..] && t[part.len()..] == part[..],
+                _ => false,
+            };
+            if !is_merge {
+                continue;
+            }
         }
         lookup.insert(pack_pair(split.left, split.right), id as TokenId);
     }
@@ -1393,6 +1443,8 @@ mod tests {
             PretokType::Gpt2,
             PretokType::Cl100k,
             PretokType::O200k,
+            PretokType::Qwen35,
+            PretokType::Tekken,
         ] {
             assert_eq!(PretokType::from_u32(typ as u32), Some(typ));
         }
@@ -1420,6 +1472,58 @@ mod tests {
         let (encoder, token_bytes) = BytePairEncoder::from_merges(&merges, &base_tokens);
         let decoder = Decoder::new(token_bytes);
         Tokenizer::new(Encoder::Simple(encoder), decoder, PretokType::Gpt2, Normalizer::None, PostProcessor::None)
+    }
+
+    /// Simple tokenizer whose vocab token "abc" (258) the merges never build
+    /// ("ab" pre-empts "a"+"bc"): plain BPE gives [ab, c].
+    fn make_unreachable_simple_tokenizer(ignore_merges: bool) -> Tokenizer {
+        let mut vocab: Vec<(u32, Vec<u8>)> = (0..256u32).map(|b| (b, vec![b as u8])).collect();
+        vocab.push((256, b"ab".to_vec()));
+        vocab.push((257, b"bc".to_vec()));
+        vocab.push((258, b"abc".to_vec()));
+        let merges = [(b'a' as u32, b'b' as u32), (b'b' as u32, b'c' as u32), (b'a' as u32, 257)];
+        let (encoder, token_bytes) = BytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256, ignore_merges);
+        let decoder = Decoder::new(token_bytes);
+        Tokenizer::new(Encoder::Simple(encoder), decoder, PretokType::None, Normalizer::None, PostProcessor::None)
+    }
+
+    fn simple_ignore_merges(tok: &Tokenizer) -> bool {
+        match tok.encoder() {
+            Encoder::Simple(enc) => enc.ignore_merges(),
+            _ => panic!("expected Simple encoder"),
+        }
+    }
+
+    #[test]
+    fn test_ignore_merges_flag_roundtrip() {
+        for (ignore, want) in [(false, vec![256, b'c' as u32]), (true, vec![258])] {
+            let tok = make_unreachable_simple_tokenizer(ignore);
+            assert_eq!(tok.encode("abc", false).ids, want);
+            let mut buf = Vec::new();
+            tok.save(&mut buf).unwrap();
+            assert_eq!(u32::from_le_bytes(buf[96..100].try_into().unwrap()), ignore as u32);
+            let loaded = Tokenizer::load(&mut buf.as_slice()).unwrap();
+            assert_eq!(simple_ignore_merges(&loaded), ignore);
+            assert_eq!(loaded.encode("abc", false).ids, want);
+            assert_eq!(loaded.encode("ab", false).ids, vec![256]);
+        }
+    }
+
+    #[test]
+    fn test_v13_simple_file_loads_with_ignore_merges() {
+        // Rewrite a v14 file as v13: drop the flags word, shift offsets back.
+        let tok = make_unreachable_simple_tokenizer(false);
+        let mut buf = Vec::new();
+        tok.save(&mut buf).unwrap();
+        buf[4..8].copy_from_slice(&13u32.to_le_bytes());
+        for at in (40..HEADER_SIZE_V13).step_by(8) {
+            let off = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+            buf[at..at + 4].copy_from_slice(&(off - 4).to_le_bytes());
+        }
+        buf.drain(HEADER_SIZE_V13..HEADER_SIZE_V14);
+        let loaded = Tokenizer::load(&mut buf.as_slice()).unwrap();
+        assert!(simple_ignore_merges(&loaded), "pre-v14 Simple files keep ignore_merges");
+        assert_eq!(loaded.encode("abc", false).ids, vec![258]);
     }
 
     #[test]
@@ -1468,6 +1572,35 @@ mod tests {
             tokenizer.encode("abcab", false).ids,
             loaded.encode("abcab", false).ids
         );
+    }
+
+    #[test]
+    fn test_rank_table_survives_roundtrip_with_id_holes() {
+        // cl100k/o200k layout: special tokens have ids past a gap, so they sit
+        // at a table position below their id and their Split::base(id) is not
+        // self-referential by position. The rebuild must still skip them.
+        let mut vocab: Vec<(u32, Vec<u8>)> = (0u32..256).map(|b| (b, vec![b as u8])).collect();
+        vocab.push((256, b"ab".to_vec()));
+        vocab.push((257, b"abc".to_vec()));
+        vocab.push((259, b"<|endoftext|>".to_vec())); // id 258 is a hole
+        let merges: Vec<(TokenId, TokenId)> = vec![(b'a' as u32, b'b' as u32), (256, b'c' as u32)];
+        let (encoder, token_bytes) =
+            crate::encoder::BacktrackingBytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256);
+        assert!(encoder.has_rank_merge(), "precondition: fresh build has rank table");
+
+        let tokenizer = Tokenizer::new(
+            Encoder::Backtracking(encoder),
+            Decoder::new(token_bytes),
+            PretokType::Gpt2,
+            Normalizer::None,
+            PostProcessor::None,
+        );
+        let mut buf = Vec::new();
+        tokenizer.save(&mut buf).expect("save failed");
+        let loaded = Tokenizer::load(&mut std::io::Cursor::new(&buf)).expect("load failed");
+        let enc = loaded.encoder().as_backtracking().expect("backtracking encoder");
+        assert!(enc.has_rank_merge(), "rank table must survive .tkz roundtrip with id holes");
+        assert_eq!(tokenizer.encode("abcab aa", false).ids, loaded.encode("abcab aa", false).ids);
     }
 
     #[test]

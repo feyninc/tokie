@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the Unicode M-category (Mn/Mc/Me) range table in crates/pretokie/src/util.rs.
+"""Generate the Unicode M-category (Mn/Mc/Me) range table in crates/pretokie/src/mask/util.rs.
 
 Usage: python3 scripts/gen_unicode_marks.py
 Rewrites the MARK_RANGES table in place between the GENERATED markers.
@@ -12,7 +12,7 @@ import sys
 import unicodedata
 from pathlib import Path
 
-UTIL_RS = Path(__file__).resolve().parent.parent / "crates/pretokie/src/util.rs"
+UTIL_RS = Path(__file__).resolve().parent.parent / "crates/pretokie/src/mask/util.rs"
 
 
 def mark_ranges():

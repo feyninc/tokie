@@ -10,8 +10,32 @@ keywords = ["tokenizer", "pretokenizer", "bpe", "nlp", "transformers"]
 categories = ["text-processing"]
 readme = "README.md"
 
+[features]
+# `mask::Regex`, the fallback for split patterns no mask scheme covers.
+regex = ["regex-automata"]
+# Dev-only oracle: a faithful re-implementation of HuggingFace tokenizers'
+# pretokenization (Oniguruma via `onig`, Ruby syntax, no options — see
+# docs/ORACLE.md). Used by tests/golden.rs and examples/dump.rs; never
+# enabled by published builds.
+oracle = ["dep:onig"]
+
 [dependencies]
+regex-automata = { version = "0.4", optional = true }
 unicode-general-category = "1.0"
+onig = { version = "6.5.1", default-features = false, optional = true }
 
 [dev-dependencies]
 fancy-regex = "0.18"
+foldhash = "0.1"
+
+[[test]]
+name = "golden"
+required-features = ["oracle"]
+
+[[example]]
+name = "dump"
+required-features = ["oracle"]
+
+[[example]]
+name = "verify_vs_hf"
+required-features = ["regex"]

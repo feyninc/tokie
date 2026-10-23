@@ -22,12 +22,12 @@ fn main() {
     };
 
     // Pretokenize only
-    let pretok = pretokie::Gpt2::new("");
+    let pretok = pretokie::mask::Gpt2::new("");
     drop(pretok);
     let t0 = Instant::now();
     let mut pieces = 0usize;
     for d in &docs {
-        pieces += pretokie::Gpt2::new(d).count();
+        pieces += pretokie::mask::Gpt2::new(d).count();
     }
     let el = t0.elapsed().as_secs_f64();
     println!("pretokenize only : {:7.1} MB/s  ({} pieces)", nbytes as f64 / 1e6 / el, pieces);

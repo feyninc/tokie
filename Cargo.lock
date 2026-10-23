@@ -1434,19 +1434,12 @@ dependencies = [
 
 [[package]]
 name = "pretokie"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a57fe333385b85c2ddf83ee5c921845aa6c24a3783c70bf8182a26cb8f9af55"
-dependencies = [
- "regex-automata",
- "unicode-general-category",
-]
-
-[[package]]
-name = "pretokie"
 version = "0.2.0"
 dependencies = [
  "fancy-regex 0.18.0",
+ "foldhash",
+ "onig",
+ "regex-automata",
  "unicode-general-category",
 ]
 
@@ -2051,7 +2044,7 @@ dependencies = [
  "icu_normalizer 1.5.0",
  "libc",
  "memchr",
- "pretokie 0.1.3",
+ "pretokie",
  "serde",
  "serde_json",
  "smallvec",

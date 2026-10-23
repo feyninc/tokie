@@ -126,6 +126,16 @@ assert_eq!(err.to_string(), r"no pretokenizer for pattern: \p{L}+");
 
 The only runtime dependency is `unicode-general-category`, used for BERT punctuation.
 
+## Mask pretokenizers
+
+`pretokie::mask` holds the mask-based pretokenizers tokie runs today. Each scheme is a `Mask` over a config (`Gpt2`, `Cl100k`, `O200k`, `Voyage`, `SmolLM`, `DeepSeek`, `Qwen`, `Tekken`), and `Bert` and the `regex` fallback live there too. They take piece callbacks (`for_each_piece`) and block callbacks (`for_each_block`). They stay until tokie moves onto the cuts above. The scanner is written up in [docs/MASK.md](docs/MASK.md). The Oniguruma oracle that checks it against Hugging Face is in [docs/ORACLE.md](docs/ORACLE.md).
+
+```rust
+use pretokie::mask::Gpt2;
+
+let pieces: Vec<&str> = Gpt2::new("Hello world! It's a test.").collect();
+```
+
 ## Benchmarks
 
 One OpenWebText sample, 200,041,585 bytes. Release build, fat LTO, median of five passes after one warmup, on a machine with AVX-512 and VBMI2. pretokie fills spans in batches of 256. An empty cell means that library has no cut for the row. The full notes are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).

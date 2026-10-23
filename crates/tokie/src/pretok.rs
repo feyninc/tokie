@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-pub use pretokie::Regex as RegexPretok;
+pub use pretokie::mask::Regex as RegexPretok;
 
 /// Type of pretokenizer for serialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +30,7 @@ pub enum PretokType {
     DeepSeek = 6,
     SmolLM = 7,
     Qwen35 = 8,
+    Tekken = 9,
 }
 
 impl PretokType {
@@ -60,20 +61,22 @@ pub enum Pretokenizer {
     SmolLM,
     DeepSeek,
     Qwen,
-    Regex(Arc<pretokie::Regex>),
+    Tekken,
+    Regex(Arc<pretokie::mask::Regex>),
 }
 
 /// Iterator returned by [`Pretokenizer::split`].
 pub enum PretokenizerIter<'a> {
-    Gpt2(pretokie::Gpt2<'a>),
-    Cl100k(pretokie::Cl100k<'a>),
-    Bert(pretokie::Bert<'a>),
-    O200k(pretokie::O200k<'a>),
-    Voyage(pretokie::Voyage<'a>),
-    SmolLM(pretokie::SmolLM<'a>),
-    DeepSeek(pretokie::DeepSeek<'a>),
-    Qwen(pretokie::Qwen<'a>),
-    Regex(pretokie::regex::RegexIter<'a>),
+    Gpt2(pretokie::mask::Gpt2<'a>),
+    Cl100k(pretokie::mask::Cl100k<'a>),
+    Bert(pretokie::mask::Bert<'a>),
+    O200k(pretokie::mask::O200k<'a>),
+    Voyage(pretokie::mask::Voyage<'a>),
+    SmolLM(pretokie::mask::SmolLM<'a>),
+    DeepSeek(pretokie::mask::DeepSeek<'a>),
+    Qwen(pretokie::mask::Qwen<'a>),
+    Tekken(pretokie::mask::Tekken<'a>),
+    Regex(pretokie::mask::regex::RegexIter<'a>),
 }
 
 impl<'a> Iterator for PretokenizerIter<'a> {
@@ -90,6 +93,7 @@ impl<'a> Iterator for PretokenizerIter<'a> {
             PretokenizerIter::SmolLM(it) => it.next(),
             PretokenizerIter::DeepSeek(it) => it.next(),
             PretokenizerIter::Qwen(it) => it.next(),
+            PretokenizerIter::Tekken(it) => it.next(),
             PretokenizerIter::Regex(it) => it.next(),
         }
     }
@@ -108,11 +112,12 @@ impl Pretokenizer {
             PretokType::SmolLM => Pretokenizer::SmolLM,
             PretokType::DeepSeek => Pretokenizer::DeepSeek,
             PretokType::Qwen35 => Pretokenizer::Qwen,
+            PretokType::Tekken => Pretokenizer::Tekken,
         }
     }
 
-    /// Create a regex-based pretokenizer from a compiled `pretokie::Regex`.
-    pub fn from_regex(regex: pretokie::Regex) -> Self {
+    /// Create a regex-based pretokenizer from a compiled `pretokie::mask::Regex`.
+    pub fn from_regex(regex: pretokie::mask::Regex) -> Self {
         Pretokenizer::Regex(Arc::new(regex))
     }
 
@@ -125,6 +130,7 @@ impl Pretokenizer {
     pub fn smollm() -> Self { Pretokenizer::SmolLM }
     pub fn deepseek() -> Self { Pretokenizer::DeepSeek }
     pub fn qwen() -> Self { Pretokenizer::Qwen }
+    pub fn tekken() -> Self { Pretokenizer::Tekken }
 
     /// Visit every piece of `text`, dispatching on the pretokenizer type
     /// once per call instead of once per piece: each arm runs a
@@ -136,30 +142,53 @@ impl Pretokenizer {
         match self {
             // Mask-scanner configs drain trusted boundary runs in a tight
             // loop (bulk-emit), not one piece per Iterator::next.
-            Pretokenizer::Gpt2 => pretokie::Gpt2::new(text).for_each_piece(f),
-            Pretokenizer::Cl100k => pretokie::Cl100k::new(text).for_each_piece(f),
-            Pretokenizer::O200k => pretokie::O200k::new(text).for_each_piece(f),
-            Pretokenizer::Voyage => pretokie::Voyage::new(text).for_each_piece(f),
-            Pretokenizer::SmolLM => pretokie::SmolLM::new(text).for_each_piece(f),
-            Pretokenizer::DeepSeek => pretokie::DeepSeek::new(text).for_each_piece(f),
-            Pretokenizer::Qwen => pretokie::Qwen::new(text).for_each_piece(f),
-            Pretokenizer::Bert => for p in pretokie::Bert::new(text) { f(p) },
+            Pretokenizer::Gpt2 => pretokie::mask::Gpt2::new(text).for_each_piece(f),
+            Pretokenizer::Cl100k => pretokie::mask::Cl100k::new(text).for_each_piece(f),
+            Pretokenizer::O200k => pretokie::mask::O200k::new(text).for_each_piece(f),
+            Pretokenizer::Voyage => pretokie::mask::Voyage::new(text).for_each_piece(f),
+            Pretokenizer::SmolLM => pretokie::mask::SmolLM::new(text).for_each_piece(f),
+            Pretokenizer::DeepSeek => pretokie::mask::DeepSeek::new(text).for_each_piece(f),
+            Pretokenizer::Qwen => pretokie::mask::Qwen::new(text).for_each_piece(f),
+            Pretokenizer::Tekken => pretokie::mask::Tekken::new(text).for_each_piece(f),
+            Pretokenizer::Bert => for p in pretokie::mask::Bert::new(text) { f(p) },
             Pretokenizer::Regex(r) => for p in r.split(text) { f(p) },
         }
+    }
+
+    /// [`Self::for_each_piece`] in blocks of contiguous pieces (see
+    /// `pretokie::mask::Mask::for_each_block`): `f(start, ends)` where piece `i`
+    /// ends at `start + ends[i]`. Returns `false` without calling `f` for
+    /// pretokenizers that have no mask scanner (Bert, Regex), so callers
+    /// fall back to the per-piece path.
+    #[inline]
+    pub fn for_each_block(&self, text: &str, f: &mut dyn FnMut(usize, &[u32])) -> bool {
+        match self {
+            Pretokenizer::Gpt2 => pretokie::mask::Gpt2::new(text).for_each_block(f),
+            Pretokenizer::Cl100k => pretokie::mask::Cl100k::new(text).for_each_block(f),
+            Pretokenizer::O200k => pretokie::mask::O200k::new(text).for_each_block(f),
+            Pretokenizer::Voyage => pretokie::mask::Voyage::new(text).for_each_block(f),
+            Pretokenizer::SmolLM => pretokie::mask::SmolLM::new(text).for_each_block(f),
+            Pretokenizer::DeepSeek => pretokie::mask::DeepSeek::new(text).for_each_block(f),
+            Pretokenizer::Qwen => pretokie::mask::Qwen::new(text).for_each_block(f),
+            Pretokenizer::Tekken => pretokie::mask::Tekken::new(text).for_each_block(f),
+            Pretokenizer::Bert | Pretokenizer::Regex(_) => return false,
+        }
+        true
     }
 
     /// Split text into pre-tokens using the fastest available implementation.
     #[inline]
     pub fn split<'a>(&'a self, text: &'a str) -> PretokenizerIter<'a> {
         match self {
-            Pretokenizer::Gpt2 => PretokenizerIter::Gpt2(pretokie::Gpt2::new(text)),
-            Pretokenizer::Cl100k => PretokenizerIter::Cl100k(pretokie::Cl100k::new(text)),
-            Pretokenizer::Bert => PretokenizerIter::Bert(pretokie::Bert::new(text)),
-            Pretokenizer::O200k => PretokenizerIter::O200k(pretokie::O200k::new(text)),
-            Pretokenizer::Voyage => PretokenizerIter::Voyage(pretokie::Voyage::new(text)),
-            Pretokenizer::SmolLM => PretokenizerIter::SmolLM(pretokie::SmolLM::new(text)),
-            Pretokenizer::DeepSeek => PretokenizerIter::DeepSeek(pretokie::DeepSeek::new(text)),
-            Pretokenizer::Qwen => PretokenizerIter::Qwen(pretokie::Qwen::new(text)),
+            Pretokenizer::Gpt2 => PretokenizerIter::Gpt2(pretokie::mask::Gpt2::new(text)),
+            Pretokenizer::Cl100k => PretokenizerIter::Cl100k(pretokie::mask::Cl100k::new(text)),
+            Pretokenizer::Bert => PretokenizerIter::Bert(pretokie::mask::Bert::new(text)),
+            Pretokenizer::O200k => PretokenizerIter::O200k(pretokie::mask::O200k::new(text)),
+            Pretokenizer::Voyage => PretokenizerIter::Voyage(pretokie::mask::Voyage::new(text)),
+            Pretokenizer::SmolLM => PretokenizerIter::SmolLM(pretokie::mask::SmolLM::new(text)),
+            Pretokenizer::DeepSeek => PretokenizerIter::DeepSeek(pretokie::mask::DeepSeek::new(text)),
+            Pretokenizer::Qwen => PretokenizerIter::Qwen(pretokie::mask::Qwen::new(text)),
+            Pretokenizer::Tekken => PretokenizerIter::Tekken(pretokie::mask::Tekken::new(text)),
             Pretokenizer::Regex(r) => PretokenizerIter::Regex(r.split(text)),
         }
     }

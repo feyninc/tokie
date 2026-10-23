@@ -330,7 +330,7 @@ For the full compatibility and performance matrix across every model family, see
 
 When I started building [Chonkie](https://github.com/chonkie-inc/chonkie), the biggest bottleneck wasn't chunking — it was tokenization. We were spending more time counting tokens than actually chunking text.
 
-tokie uses hand-written parsers for each pretokenization pattern — GPT-2, cl100k, o200k, BERT — that understand the exact character classes needed without the overhead of a general-purpose regex engine. Since 0.1.0 these run as a SIMD mask scanner: 64-byte blocks are classified into character-class bitmasks and piece boundaries fall out of bitwise algebra, pushing pretokenization past 1 GB/s per core — over 20x faster than running the reference regexes.
+tokie uses hand-written parsers for each pretokenization pattern — GPT-2, cl100k, o200k, Qwen, Tekken, DeepSeek, BERT — that understand the exact character classes needed without the overhead of a general-purpose regex engine. Since 0.1.0 these run as a SIMD mask scanner: 64-byte blocks are classified into character-class bitmasks and piece boundaries fall out of bitwise algebra, pushing pretokenization past 1 GB/s per core — over 20x faster than running the reference regexes.
 
 The second problem was that no single library could load everything. I actually tried to solve this before with [AutoTikTokenizer](https://github.com/bhavnick/autotiktokenizer), believing tiktoken's BPE engine could handle all of HuggingFace. I was wrong — you need fundamentally different algorithms for each encoder type: backtracking BPE for tiktoken-style models, heap-based BPE for models with non-topological merge orders, radix-heap BPE for SentencePiece, plus WordPiece and Unigram each with their own tricks.
 
