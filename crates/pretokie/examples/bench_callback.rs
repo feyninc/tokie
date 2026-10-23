@@ -6,8 +6,8 @@
 //!
 //! Usage: cargo run -p pretokie --example bench_callback --release
 
-use pretokie::Gpt2;
-use pretokie::util::{decode_utf8, is_ascii_letter, is_digit};
+use pretokie::mask::Gpt2;
+use pretokie::mask::util::{decode_utf8, is_ascii_letter, is_digit};
 use std::time::Instant;
 
 #[cfg(target_arch = "aarch64")]

@@ -1626,7 +1626,7 @@ impl PretokenCache {
     }
 
     /// Encode one block of contiguous pieces from a pretokenizer block
-    /// drain (`pretokie::Mask::for_each_block`): piece `i` of `doc` spans
+    /// drain (`pretokie::mask::Mask::for_each_block`): piece `i` of `doc` spans
     /// `start0 + ends[i-1] .. start0 + ends[i]` (the first starts at
     /// `start0`). Keys and home slots of the whole block are built first,
     /// branch-light, in their own loop; then every piece is probed and

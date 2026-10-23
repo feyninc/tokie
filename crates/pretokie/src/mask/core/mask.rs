@@ -17,8 +17,8 @@
 
 use std::marker::PhantomData;
 
-use crate::core::config::*;
-use crate::core::iter::Core;
+use crate::mask::core::config::*;
+use crate::mask::core::iter::Core;
 
 /// End of the piece starting at `pos` per the scalar ground truth.
 #[inline(always)]
@@ -414,7 +414,8 @@ unsafe fn avx2_ascii_masks(
     use std::arch::x86_64::*;
     debug_assert!(scan + 64 <= bytes.len());
     let mut m = AsciiMasks::default();
-    let p = bytes.as_ptr().add(scan);
+    // SAFETY: the caller guarantees `scan + 64 <= bytes.len()`.
+    let p = unsafe { bytes.as_ptr().add(scan) };
     // Macros rather than closures: a closure is its own function and does
     // not reliably inherit this `#[target_feature]`, which would turn each
     // intrinsic into an out-of-line call.
@@ -430,7 +431,8 @@ unsafe fn avx2_ascii_masks(
         }};
     }
     for i in 0..2 {
-        let v = _mm256_loadu_si256(p.add(32 * i) as *const __m256i);
+        // SAFETY: both 32-byte halves lie inside the 64-byte window at `p`.
+        let v = unsafe { _mm256_loadu_si256(p.add(32 * i) as *const __m256i) };
         let sh = 32 * i as u32;
         macro_rules! mv {
             ($x:expr) => {
@@ -548,7 +550,7 @@ fn is_ascii_ws_byte(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | 0x0B | 0x0C | b'\n' | b'\r')
 }
 
-use crate::util::is_cjk_char;
+use crate::mask::util::is_cjk_char;
 
 // =======================================================================
 // Unicode in-mask classification
@@ -576,9 +578,9 @@ enum UClass {
 
 #[inline(always)]
 fn uclass<C: PretokConfig>(ch: char) -> UClass {
-    use crate::util::cls;
+    use crate::mask::util::cls;
     // One table read answers every predicate below.
-    let k = crate::util::class_of(ch);
+    let k = crate::mask::util::class_of(ch);
     let letter = match C::LETTER_MODE {
         LetterMode::Plain => k & (cls::ALPHA | cls::MARK) == cls::ALPHA,
         LetterMode::PlainWithMarks | LetterMode::CamelCase => k & (cls::ALPHA | cls::MARK) != 0,
@@ -641,7 +643,7 @@ fn classify_uni<C: PretokConfig>(bytes: &[u8], scan: usize, m: u64) -> UniMasks 
         let i = m.trailing_zeros() as usize;
         let b = bytes[scan + i];
         debug_assert!(b & 0xC0 != 0x80, "unclaimed continuation byte at bit {i}");
-        let (ch, clen) = crate::util::decode_utf8(&bytes[scan + i..]);
+        let (ch, clen) = crate::mask::util::decode_utf8(&bytes[scan + i..]);
         let lead = 1u64 << i;
         let chm = if clen >= 64 - i {
             u64::MAX << i
@@ -728,7 +730,7 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
             while bytes[j] & 0xC0 == 0x80 {
                 j -= 1;
             }
-            let (ch, clen) = crate::util::decode_utf8(&bytes[j..]);
+            let (ch, clen) = crate::mask::util::decode_utf8(&bytes[j..]);
             let end = j + clen;
             let claim_bits = if end > scan {
                 (1u64 << (end - scan)) - 1
@@ -762,8 +764,8 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
                             edge_kill = letter_bit; // text-start punct absorbs
                         } else if bytes[j - 1] < 0x80 {
                             let b2 = bytes[j - 1];
-                            let o2 = !crate::util::is_ascii_letter(b2)
-                                && !crate::util::is_digit(b2)
+                            let o2 = !crate::mask::util::is_ascii_letter(b2)
+                                && !crate::mask::util::is_digit(b2)
                                 && !is_ascii_ws_byte(b2);
                             let sp2 = b2 == b' '; // a tab never prefixes punct
                             if !o2 && !sp2 {
@@ -781,15 +783,15 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
                 }
             }
         } else {
-            let letter = crate::util::is_ascii_letter(b);
-            let digit = crate::util::is_digit(b);
+            let letter = crate::mask::util::is_ascii_letter(b);
+            let digit = crate::mask::util::is_digit(b);
             let wsb = is_ascii_ws_byte(b);
             pl = u64::from(letter);
             pd = u64::from(digit);
-            psp = u64::from(b == b' ' || crate::util::is_tab_like(b));
+            psp = u64::from(b == b' ' || crate::mask::util::is_tab_like(b));
             pws = u64::from(wsb);
             po = u64::from(!letter && !digit && !wsb);
-            plo = u64::from(crate::util::is_lower(b));
+            plo = u64::from(crate::mask::util::is_lower(b));
             pn = u64::from(b == b'\n' || b == b'\r');
         }
     }
@@ -927,14 +929,14 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
         } else if bytes[scan + 64] < 0x80 {
             let nb64 = bytes[scan + 64];
             !is_ascii_ws_byte(nb64)
-                && !(C::WS_EXCEPTION != WsException::None && crate::util::is_digit(nb64))
+                && !(C::WS_EXCEPTION != WsException::None && crate::mask::util::is_digit(nb64))
         } else {
-            let (ch, _) = crate::util::decode_utf8(&bytes[scan + 64..]);
+            let (ch, _) = crate::mask::util::decode_utf8(&bytes[scan + 64..]);
             !ch.is_whitespace()
                 && match C::WS_EXCEPTION {
                     WsException::None => true,
-                    WsException::Digits => !crate::util::is_numeric(ch),
-                    WsException::Cjk => !is_cjk_char(ch) && !crate::util::is_numeric(ch),
+                    WsException::Digits => !crate::mask::util::is_numeric(ch),
+                    WsException::Cjk => !is_cjk_char(ch) && !crate::mask::util::is_numeric(ch),
                 }
         };
         split = (split & !(1 << 63)) | ((u64::from(keep) << 63) & split_base);
@@ -964,7 +966,7 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
     let (ps, pt) = if scan == 0 {
         (0u64, 0u64)
     } else {
-        (u64::from(bytes[scan - 1] == b' '), u64::from(crate::util::is_tab_like(bytes[scan - 1])))
+        (u64::from(bytes[scan - 1] == b' '), u64::from(crate::mask::util::is_tab_like(bytes[scan - 1])))
     };
     let pfx_bits = run_start | split;
     let after_sp_classes =
@@ -1124,7 +1126,7 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
                 // x 'y). SpaceOnly configs (GPT-2 ` ?[^\s\p{L}\p{N}]+`) keep
                 // the apostrophe a punct piece of its own ("d'Arce" → d ' Arce).
                 let nb1 = bytes[scan + i + 1];
-                if crate::util::is_ascii_letter(nb1)
+                if crate::mask::util::is_ascii_letter(nb1)
                     || (nb1 >= 0x80 && (uni.l_lead >> (i + 1)) & 1 == 1)
                 {
                     boundary &= !(1u64 << (i + 1));
@@ -1157,7 +1159,7 @@ fn batch_masks<C: PretokConfig, K: Classify>(bytes: &[u8], scan: usize) -> (u64,
 #[doc(hidden)]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub mod bench_internal {
-    use crate::core::config::*;
+    use crate::mask::core::config::*;
 
     /// Stage (a): NEON classification + movemasks only, folded to a u64
     /// so the calls cannot be dead-code-eliminated.
@@ -1579,7 +1581,7 @@ impl<'a, C: PretokConfig> Iterator for Mask<'a, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configs::*;
+    use crate::mask::configs::*;
 
     /// Every backend runnable on this CPU (the scalar walker included).
     fn isas() -> impl Iterator<Item = MaskIsa> {

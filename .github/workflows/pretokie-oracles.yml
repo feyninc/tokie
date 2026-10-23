@@ -1,0 +1,30 @@
+name: Pretokie oracles
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  oracles:
+    name: Test pretokie oracles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The cut oracles live in crates/pretokie/tests. tests/golden.rs needs
+      # the `oracle` feature and runs in pretokie-tests.yml.
+      - name: Run pretokie oracles
+        run: cargo test -p pretokie --tests

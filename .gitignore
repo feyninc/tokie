@@ -36,6 +36,7 @@ models/
 CLAUDE.md
 work.log
 __pycache__
+/notes/
 
 # Generated benchmark output
 benchmark_results.json

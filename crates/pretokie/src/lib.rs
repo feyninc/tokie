@@ -1,65 +1,16 @@
-//! Fast pretokenizers for BPE tokenizers.
-//!
-//! Each pretokenizer is a zero-allocation, single-pass iterator over text pieces.
-//!
-//! # Example
-//!
-//! ```
-//! use pretokie::Gpt2;
-//!
-//! let pieces: Vec<&str> = Gpt2::new("Hello world").collect();
-//! assert_eq!(pieces, vec!["Hello", " world"]);
-//! ```
-//!
-//! # SIMD backend (`PRETOKIE_ISA`)
-//!
-//! [`Mask`]-based pretokenizers classify 64-byte batches with SIMD: NEON on
-//! aarch64, SSE2 on x86_64 (AVX2 is supported but opt-in). The
-//! `PRETOKIE_ISA` environment variable overrides the backend:
-//! `scalar` (no SIMD), `base` / `sse2` / `neon` (baseline, the default), or
-//! `avx2` (x86_64, runtime-detected). It is read once per process, on the
-//! first `Mask` construction, and cached; unsupported or unknown values fall
-//! back to the default. It is meant for benchmarking and differential
-//! testing — output is byte-identical across backends.
+//! Pretokenizers for tokie.
 
-mod core;
-mod configs;
 mod impls;
-pub mod util;
-mod unicode_class;
+mod span;
+mod walk;
 
-/// Dev-only HuggingFace oracle (requires the `oracle` feature). See
-/// `docs/pretokie-v2/00-oracle-engine.md`; never part of published builds'
-/// default features. Hidden from docs: semver-exempt test infrastructure.
-#[doc(hidden)]
-#[cfg(feature = "oracle")]
-pub mod oracle;
+pub use impls::{
+    refuse, Bert, Cl100k, DeepSeek, Gpt2, Kimi, Nemotron, O200k, Olmo, Qwen, SmolLM, T5,
+    UnsupportedPattern, Voyage,
+};
+pub use span::Span;
 
-pub use core::iter::Core;
-pub use core::mask::Mask;
-#[doc(hidden)]
-pub use core::mask::MaskIsa;
-
-/// Bench-only stage hooks for the mask pipeline (hidden, semver-exempt).
-#[doc(hidden)]
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub use core::mask::bench_internal;
-pub use configs::{Gpt2Config, Cl100kConfig, O200kConfig, VoyageConfig, SmolLMConfig, DeepSeekConfig, QwenConfig, TekkenConfig};
-
-pub type Gpt2<'a> = Mask<'a, Gpt2Config>;
-pub type Cl100k<'a> = Mask<'a, Cl100kConfig>;
-pub type O200k<'a> = Mask<'a, O200kConfig>;
-pub type Voyage<'a> = Mask<'a, VoyageConfig>;
-pub type SmolLM<'a> = Mask<'a, SmolLMConfig>;
-pub type DeepSeek<'a> = Mask<'a, DeepSeekConfig>;
-pub type Qwen<'a> = Mask<'a, QwenConfig>;
-pub type Tekken<'a> = Mask<'a, TekkenConfig>;
-
-pub use impls::bert::Bert;
-#[cfg(feature = "regex")]
-pub mod regex {
-    //! Regex-based pretokenizer (requires `regex` feature).
-    pub use crate::impls::regex::{Regex, RegexIter};
-}
-#[cfg(feature = "regex")]
-pub use impls::regex::Regex;
+/// The mask-based pretokenizers tokie runs today: [`mask::Mask`] over a
+/// per-scheme config, with piece and block callbacks, plus [`mask::Bert`]
+/// and the `regex` fallback. They stay until tokie moves onto the cuts above.
+pub mod mask;

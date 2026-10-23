@@ -45,14 +45,14 @@ fn best_ns<F: FnMut() -> u64>(mut f: F) -> (f64, u64) {
 macro_rules! dispatch_mask {
     ($ty:expr, $f:expr) => {
         match $ty {
-            PretokType::Gpt2 => $f(|d| pretokie::Gpt2::new(d)),
-            PretokType::Cl100k => $f(|d| pretokie::Cl100k::new(d)),
-            PretokType::O200k => $f(|d| pretokie::O200k::new(d)),
-            PretokType::Voyage => $f(|d| pretokie::Voyage::new(d)),
-            PretokType::SmolLM => $f(|d| pretokie::SmolLM::new(d)),
-            PretokType::DeepSeek => $f(|d| pretokie::DeepSeek::new(d)),
-            PretokType::Qwen35 => $f(|d| pretokie::Qwen::new(d)),
-            PretokType::Tekken => $f(|d| pretokie::Tekken::new(d)),
+            PretokType::Gpt2 => $f(|d| pretokie::mask::Gpt2::new(d)),
+            PretokType::Cl100k => $f(|d| pretokie::mask::Cl100k::new(d)),
+            PretokType::O200k => $f(|d| pretokie::mask::O200k::new(d)),
+            PretokType::Voyage => $f(|d| pretokie::mask::Voyage::new(d)),
+            PretokType::SmolLM => $f(|d| pretokie::mask::SmolLM::new(d)),
+            PretokType::DeepSeek => $f(|d| pretokie::mask::DeepSeek::new(d)),
+            PretokType::Qwen35 => $f(|d| pretokie::mask::Qwen::new(d)),
+            PretokType::Tekken => $f(|d| pretokie::mask::Tekken::new(d)),
             other => panic!("no mask scanner for {:?}", other),
         }
     };

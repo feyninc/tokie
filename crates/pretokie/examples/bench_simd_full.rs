@@ -7,8 +7,8 @@
 //!
 //! Usage: cargo run -p pretokie --example bench_simd_full --release
 
-use pretokie::Gpt2;
-use pretokie::util::is_ascii_letter;
+use pretokie::mask::Gpt2;
+use pretokie::mask::util::is_ascii_letter;
 use std::time::Instant;
 
 #[cfg(target_arch = "aarch64")]

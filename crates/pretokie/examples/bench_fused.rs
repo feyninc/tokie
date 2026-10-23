@@ -7,8 +7,8 @@
 //!
 //! Usage: cargo run -p pretokie --example bench_fused --release
 
-use pretokie::Gpt2;
-use pretokie::util::{decode_utf8, is_ascii_letter, is_digit};
+use pretokie::mask::Gpt2;
+use pretokie::mask::util::{decode_utf8, is_ascii_letter, is_digit};
 use foldhash::HashMap as FoldHashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;

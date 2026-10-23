@@ -9,7 +9,7 @@
 //!   cargo run -p pretokie --features oracle --example dump -- \
 //!     --scheme r50k --impl oracle --file benches/data/enwik8 [--chunk-bytes N] [--out PATH]
 
-use pretokie::oracle::{self, Scheme};
+use pretokie::mask::oracle::{self, Scheme};
 use std::io::{BufWriter, Write};
 
 const DEFAULT_CHUNK: usize = 1 << 20;
@@ -23,16 +23,16 @@ fn scheme_by_name(name: &str) -> &'static Scheme {
 
 fn pretokie_pretokens(scheme: &Scheme, text: &str) -> Vec<Vec<u8>> {
     match scheme.name {
-        "r50k" => pretokie::Gpt2::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "cl100k" => pretokie::Cl100k::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "o200k" => pretokie::O200k::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        // Qwen2's pattern is Voyage's; `pretokie::Qwen` is Qwen3.5.
-        "qwen2" | "voyage" => pretokie::Voyage::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "tekken" => pretokie::Tekken::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "qwen35" => pretokie::Qwen::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "deepseek" => pretokie::DeepSeek::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "smollm" => pretokie::SmolLM::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
-        "bert" => pretokie::Bert::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "r50k" => pretokie::mask::Gpt2::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "cl100k" => pretokie::mask::Cl100k::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "o200k" => pretokie::mask::O200k::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        // Qwen2's pattern is Voyage's; `pretokie::mask::Qwen` is Qwen3.5.
+        "qwen2" | "voyage" => pretokie::mask::Voyage::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "tekken" => pretokie::mask::Tekken::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "qwen35" => pretokie::mask::Qwen::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "deepseek" => pretokie::mask::DeepSeek::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "smollm" => pretokie::mask::SmolLM::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "bert" => pretokie::mask::Bert::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
         // Falcon-style models have no hand-written pretokie scheme.
         "falcon" => Vec::new(),
         other => panic!("no pretokie implementation for scheme {other:?}"),

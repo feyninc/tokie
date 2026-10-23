@@ -1,6 +1,6 @@
 //! Golden tests: pretokie vs the HuggingFace oracle (feature `oracle`).
 //!
-//! Three layers, per `docs/pretokie-v2/00-oracle-engine.md`:
+//! Three layers, per `docs/ORACLE.md`:
 //! 1. `onig_semantics` — pin Oniguruma's definitions empirically (the
 //!    `\s` question and friends) so every downstream assumption is grounded.
 //! 2. Edge-case goldens — adversarial strings per scheme vs the oracle.
@@ -16,10 +16,10 @@
 //!
 //! Every scheme matches the oracle on all layers; nothing is `#[ignore]`d.
 //! The divergence classes fixed to get here are listed in
-//! `docs/pretokie-v2/00-oracle-engine.md` §4b.
+//! `docs/ORACLE.md` §4b.
 
-use pretokie::oracle::{self, Scheme};
-use pretokie::MaskIsa;
+use pretokie::mask::oracle::{self, Scheme};
+use pretokie::mask::MaskIsa;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ fn isas() -> Vec<MaskIsa> {
 
 /// pretokie implementation for an oracle scheme name, under `isa`. Qwen2's
 /// pattern is byte-identical to Voyage's, and tokie serves it with `Voyage`
-/// (`hf.rs` detection); `pretokie::Qwen` is the Qwen3.5 variant
+/// (`hf.rs` detection); `pretokie::mask::Qwen` is the Qwen3.5 variant
 /// (`[\p{L}\p{M}]+` letter runs), tested as `qwen35`. Falcon-style models
 /// are served by tokie's regex fallback, so pretokie has no falcon scheme;
 /// the oracle's `FALCON` is only cross-checked against HF
@@ -231,7 +231,7 @@ fn isas() -> Vec<MaskIsa> {
 fn run_pretokie(scheme: &str, text: &str, isa: MaskIsa) -> Vec<Vec<u8>> {
     macro_rules! mask {
         ($ty:ident) => {
-            pretokie::$ty::with_isa(text, isa).map(|p| p.as_bytes().to_vec()).collect()
+            pretokie::mask::$ty::with_isa(text, isa).map(|p| p.as_bytes().to_vec()).collect()
         };
     }
     match scheme {
@@ -243,7 +243,7 @@ fn run_pretokie(scheme: &str, text: &str, isa: MaskIsa) -> Vec<Vec<u8>> {
         "qwen35" => mask!(Qwen),
         "deepseek" => mask!(DeepSeek),
         "smollm" => mask!(SmolLM),
-        "bert" => pretokie::Bert::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
+        "bert" => pretokie::mask::Bert::new(text).map(str::as_bytes).map(<[u8]>::to_vec).collect(),
         other => panic!("unknown scheme {other}"),
     }
 }

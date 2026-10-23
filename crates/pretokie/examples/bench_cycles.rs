@@ -5,8 +5,8 @@
 //!
 //! Usage: cargo run -p pretokie --example bench_cycles --release
 
-use pretokie::Gpt2;
-use pretokie::util::{is_ascii_letter, is_digit};
+use pretokie::mask::Gpt2;
+use pretokie::mask::util::{is_ascii_letter, is_digit};
 use std::time::Instant;
 
 #[cfg(target_arch = "aarch64")]

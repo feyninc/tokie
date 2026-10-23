@@ -6,7 +6,7 @@
 //!
 //! Usage: cargo run -p pretokie --example bench_extract --release
 
-use pretokie::Gpt2;
+use pretokie::mask::Gpt2;
 use std::time::Instant;
 
 #[cfg(target_arch = "aarch64")]

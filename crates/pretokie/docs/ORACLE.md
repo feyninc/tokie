@@ -290,7 +290,7 @@ pretokenization. Out of oracle scope except as a "no-op" case.
 
 Implemented as an **opt-in `oracle` feature of pretokie** (no new crate):
 
-- `crates/pretokie/src/oracle.rs` — the engine: verbatim patterns,
+- `crates/pretokie/src/mask/oracle.rs` — the engine: verbatim patterns,
   find_matches/behaviors/Invert/Sequence, char-class stages, and the
   ByteLevel remap as a mid-sequence transform (post-remap stages operate
   on remapped text — Falcon's Digits splits `¹` (byte 0xB9) out
@@ -367,5 +367,5 @@ normalizers, as pretokie's per-char split did before).
 
 ## 5. Canonical strings file
 
-The verbatim patterns live in `crates/pretokie/src/oracle.rs` (§4) — each
+The verbatim patterns live in `crates/pretokie/src/mask/oracle.rs` (§4) — each
 with its pipeline shape (stage list + behavior).

@@ -187,7 +187,7 @@ pub(crate) mod cls {
 /// every code point by `class_table_matches_reference`.
 #[inline(always)]
 pub(crate) fn class_of(c: char) -> u8 {
-    use crate::unicode_class::{BLOCKS, INDEX, SHIFT};
+    use crate::mask::unicode_class::{BLOCKS, INDEX, SHIFT};
     let cp = c as u32;
     let block = INDEX[(cp >> SHIFT) as usize] as usize;
     let at = (block << SHIFT) | (cp & ((1 << SHIFT) - 1)) as usize;
@@ -490,7 +490,7 @@ mod class_table_tests {
             std::fs::write(path, render_table(&want)).unwrap();
             panic!("regenerated {path}; rebuild and rerun without PRETOKIE_REGEN_CLASS_TABLE");
         }
-        use crate::unicode_class::{BLOCKS, INDEX, SHIFT};
+        use crate::mask::unicode_class::{BLOCKS, INDEX, SHIFT};
         assert_eq!(INDEX.len(), 0x110000 >> SHIFT);
         assert!(INDEX.iter().all(|&b| ((b as usize) << SHIFT) < BLOCKS.len()));
         for (cp, &w) in want.iter().enumerate() {

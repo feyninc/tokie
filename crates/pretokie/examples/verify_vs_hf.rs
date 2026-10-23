@@ -5,8 +5,8 @@
 //! on 1MB of enwik8. This validates that the hand-coded optimizations
 //! produce identical output to the reference regex patterns.
 
-use pretokie::{Bert, Cl100k, Gpt2, O200k, SmolLM};
-use pretokie::Regex;
+use pretokie::mask::{Bert, Cl100k, Gpt2, O200k, SmolLM};
+use pretokie::mask::Regex;
 use std::path::Path;
 use unicode_general_category::GeneralCategory;
 

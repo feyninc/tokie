@@ -2,7 +2,7 @@
 //!
 //! Usage: cargo run -p pretokie --example bench_specialized --release
 
-use pretokie::{Gpt2, Cl100k, O200k, Voyage, SmolLM, DeepSeek, Qwen, Bert};
+use pretokie::mask::{Gpt2, Cl100k, O200k, Voyage, SmolLM, DeepSeek, Qwen, Bert};
 use std::time::Instant;
 
 macro_rules! bench {

@@ -1,6 +1,6 @@
 //! Zero-sized config types for each BPE pretokenizer.
 
-use crate::core::config::*;
+use crate::mask::core::config::*;
 
 pub struct Gpt2Config;
 impl PretokConfig for Gpt2Config {

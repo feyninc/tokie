@@ -2,7 +2,7 @@
 //! pretokenization, compiled with the exact engine HF uses (Oniguruma via
 //! `onig` 6.5.1, `Regex::new` = UTF-8 + `ONIG_OPTION_NONE` + Ruby syntax).
 //!
-//! Spec source: `docs/pretokie-v2/00-oracle-engine.md`. The engine mirrors
+//! Spec source: `docs/ORACLE.md`. The engine mirrors
 //! `tokenizers/src/utils/onig.rs` (`find_matches` gap/match splitting),
 //! `SplitDelimiterBehavior` (`Isolated`/`Removed`/`Contiguous`), `Invert`,
 //! `Sequence` composition, and the char-class stages (`Digits`,

@@ -9,9 +9,9 @@
 //!
 //! Run: cargo run -p pretokie --release --example profile_stages
 
-use pretokie::bench_internal as bi;
-use pretokie::{Core, Gpt2};
-use pretokie::Gpt2Config;
+use pretokie::mask::bench_internal as bi;
+use pretokie::mask::{Core, Gpt2};
+use pretokie::mask::Gpt2Config;
 use std::time::Instant;
 
 type C = Gpt2Config;

@@ -511,7 +511,7 @@ fn apply_regex_fallback(tok: &mut Tokenizer, detected: &DetectedPretokenizer) {
                 .map(|(p, l)| (p.as_str(), *l))
                 .collect();
 
-            if let Ok(regex) = pretokie::Regex::new(&pat_refs) {
+            if let Ok(regex) = pretokie::mask::Regex::new(&pat_refs) {
                 tok.set_pretokenizer(Some(Pretokenizer::from_regex(regex)));
             }
         }

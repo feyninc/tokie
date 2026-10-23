@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use pretokie::*;
+use pretokie::mask::*;
 
 fn best_of_3(mut f: impl FnMut() -> usize) -> (f64, usize) {
     let mut best = f64::MAX;

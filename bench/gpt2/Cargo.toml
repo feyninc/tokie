@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "gpt2-pretok-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+pretokie = { path = "../../crates/pretokie" }
+gigatoken = { path = "../../../gigatoken" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

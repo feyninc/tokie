@@ -5,7 +5,7 @@
 //!
 //! Usage: cargo run -p pretokie --example bench_branchless --release
 
-use pretokie::Gpt2;
+use pretokie::mask::Gpt2;
 use std::time::Instant;
 
 // ===========================================================================

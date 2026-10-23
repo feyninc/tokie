@@ -3,8 +3,8 @@
 //!
 //! Run: cargo run -p pretokie --release --example piece_diff
 
-use pretokie::{Core, Gpt2, DeepSeek};
-use pretokie::{Gpt2Config, DeepSeekConfig};
+use pretokie::mask::{Core, Gpt2, DeepSeek};
+use pretokie::mask::{Gpt2Config, DeepSeekConfig};
 
 fn read_owt() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

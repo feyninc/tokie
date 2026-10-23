@@ -7,8 +7,8 @@
 
 use std::marker::PhantomData;
 
-use crate::core::config::*;
-use crate::util::{class_of, cls, is_cjk_char, ascii_letter_run, decode_utf8, is_ascii_letter, is_digit, is_lower, is_punct_or_symbol, is_tab_like, is_upper, is_unicode_letter, is_unicode_mark};
+use crate::mask::core::config::*;
+use crate::mask::util::{class_of, cls, is_cjk_char, ascii_letter_run, decode_utf8, is_ascii_letter, is_digit, is_lower, is_punct_or_symbol, is_tab_like, is_upper, is_unicode_letter, is_unicode_mark};
 
 pub struct Core<'a, C: PretokConfig> {
     bytes: &'a [u8],
@@ -92,7 +92,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
             (0, 1)
         } else {
             let (ch, cl) = decode_utf8(&self.bytes[pos..]);
-            (crate::util::camel_class(ch), cl)
+            (crate::mask::util::camel_class(ch), cl)
         }
     }
 
@@ -111,7 +111,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
     /// `pos` by the caller's letter check (no second `is_alpha`).
     #[inline(always)]
     fn scan_camel_letter(&mut self, ch: char) {
-        self.scan_camel_known(crate::util::camel_class_of_letter(ch), ch.len_utf8());
+        self.scan_camel_known(crate::mask::util::camel_class_of_letter(ch), ch.len_utf8());
     }
 
     /// [`Self::scan_camel`] given the class `c0` and byte length `cl0` of
@@ -195,7 +195,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
                         self.pos += 1;
                     } else if b >= 0x80 {
                         let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
-                        if crate::util::is_numeric(ch) { self.pos += cl; } else { break; }
+                        if crate::mask::util::is_numeric(ch) { self.pos += cl; } else { break; }
                     } else {
                         break;
                     }
@@ -211,7 +211,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
                         count += 1;
                     } else if b >= 0x80 {
                         let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
-                        if crate::util::is_numeric(ch) { self.pos += cl; count += 1; } else { break; }
+                        if crate::mask::util::is_numeric(ch) { self.pos += cl; count += 1; } else { break; }
                     } else {
                         break;
                     }
@@ -345,7 +345,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
                 // SmolLM: don't back up before numerics (\p{N} incl. ½, ¹)
                 let next = self.at(self.pos);
                 let is_num = is_digit(next)
-                    || (next >= 0x80 && crate::util::is_numeric(decode_utf8(&self.bytes[self.pos..]).0));
+                    || (next >= 0x80 && crate::mask::util::is_numeric(decode_utf8(&self.bytes[self.pos..]).0));
                 if !is_num {
                     self.pos = prev_pos;
                 }
@@ -388,7 +388,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
                 let split_off = is_digit(next)
                     || (next >= 0x80
                         && (Self::is_cjk_start(&self.bytes[self.pos..])
-                            || crate::util::is_numeric(decode_utf8(&self.bytes[self.pos..]).0)));
+                            || crate::mask::util::is_numeric(decode_utf8(&self.bytes[self.pos..]).0)));
                 if !split_off {
                     self.pos = prev_pos;
                 }
@@ -418,7 +418,7 @@ impl<'a, C: PretokConfig> Core<'a, C> {
     /// prefixes (the run holds no ASCII or whitespace). `first` is consumed.
     #[inline(always)]
     fn scan_cjk(&mut self, first: char) {
-        let letter = |c: char| crate::util::is_alpha(c) || is_unicode_mark(c);
+        let letter = |c: char| crate::mask::util::is_alpha(c) || is_unicode_mark(c);
         let want = letter(first);
         while self.pos < self.len && self.at(self.pos) >= 0xE0 {
             let (ch, cl) = decode_utf8(&self.bytes[self.pos..]);
@@ -534,9 +534,9 @@ impl<'a, C: PretokConfig> Core<'a, C> {
         }
         let (ch, cl) = decode_utf8(&self.bytes[pos..]);
         let gap = !is_cjk_char(ch)
-            && !crate::util::is_alpha(ch)
+            && !crate::mask::util::is_alpha(ch)
             && !is_unicode_mark(ch)
-            && !crate::util::is_numeric(ch)
+            && !crate::mask::util::is_numeric(ch)
             && !ch.is_whitespace()
             && !is_punct_or_symbol(ch);
         if gap { cl } else { 0 }
@@ -664,12 +664,12 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                                 return Some(piece);
                             }
                         }
-                    } else if crate::util::is_numeric(ch) && C::SPACE_PREFIXES_DIGITS {
+                    } else if crate::mask::util::is_numeric(ch) && C::SPACE_PREFIXES_DIGITS {
                         // GPT-2 ` ?\p{N}+`: space attaches to a numeric run (incl. ¹, ❶)
                         let (_, cl) = decode_utf8(&self.bytes[self.pos + 1..]);
                         self.pos += 1 + cl;
                         self.scan_digits();
-                    } else if ch.is_whitespace() || crate::util::is_numeric(ch) || Self::isolated_cjk(ch) {
+                    } else if ch.is_whitespace() || crate::mask::util::is_numeric(ch) || Self::isolated_cjk(ch) {
                         self.scan_whitespace();
                     } else {
                         self.pos += 1;
@@ -733,7 +733,7 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
                 self.scan_camel_letter(ch);
                 let clen = self.check_contraction();
                 if clen > 0 { self.pos += clen; }
-            } else if crate::util::is_numeric(ch) {
+            } else if crate::mask::util::is_numeric(ch) {
                 self.pos += cl;
                 self.scan_digits();
             } else if ch.is_whitespace() {
@@ -873,7 +873,7 @@ impl<'a, C: PretokConfig> Iterator for Core<'a, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configs::*;
+    use crate::mask::configs::*;
 
     type Gpt2<'a> = Core<'a, Gpt2Config>;
     type Cl100k<'a> = Core<'a, Cl100kConfig>;

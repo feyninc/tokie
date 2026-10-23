@@ -1,145 +1,345 @@
-//! BERT pretokenizer — single-pass, zero allocation.
+//! BERT split rules.
 //!
-//! Matches HuggingFace's `BertPreTokenizer`:
-//! - Whitespace (`char::is_whitespace`) is a delimiter only (stripped, never part of a piece)
-//! - Each punctuation character (ASCII punct or Unicode P) is a separate piece:
-//!   "..." → [".", ".", "."]
-//! - Everything else stays together in words: "18th" → ["18th"], "€100" → ["€100"]
-//! - Control characters (other than whitespace) are not delimiters: they stay
-//!   inside the surrounding word, as in HF
-//! - CJK ideographs are NOT split here: HF isolates them in `BertNormalizer`
-//!   (`handle_chinese_chars`) before pretokenization, and so does tokie's normalizer
-//! - No contractions, no space prefix
-//!
-//! **Changed in 0.2.0:** earlier versions isolated each CJK ideograph as its
-//! own piece. To get the old behaviour, pad CJK chars with spaces before
-//! calling [`Bert`] (or use tokie's BERT normalizer, which does it for you).
+//! Whitespace is dropped. Each punctuation character is its own piece.
+//! Every other character, including letters, digits, marks, symbols, and
+//! CJK, stays in the run. Punctuation is the ASCII punctuation ranges plus
+//! any character whose Unicode category starts with `P`. This is the cut
+//! Hugging Face `BertPreTokenizer` runs.
 
-use crate::util::decode_utf8;
+use crate::walk::classify::{masks_for, Masks};
+use crate::walk::{Scheme, Walk, Window};
+use crate::Span;
 use unicode_general_category::{get_general_category, GeneralCategory};
 
-/// Fast ASCII punctuation check (same ranges as HuggingFace's `_is_punctuation`).
-#[inline(always)]
-fn is_ascii_punct(b: u8) -> bool {
-    matches!(b, 33..=47 | 58..=64 | 91..=96 | 123..=126)
+/// BERT pretokenizer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Bert;
+
+/// Pulls pieces in batches. Create one with [`Bert::walk`].
+pub struct BertWalk<'a> {
+    inner: Walk<'a, Bert>,
 }
 
-/// ASCII `char::is_whitespace` (includes VT and FF).
-#[inline(always)]
-fn is_ascii_ws(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
-}
-
-/// Check if a Unicode character is punctuation.
-///
-/// Matches HuggingFace's `_is_punctuation`: ASCII punct ranges + Unicode P* categories.
-#[inline]
-fn is_unicode_punct(c: char) -> bool {
-    let cp = c as u32;
-    if cp < 0x80 {
-        return is_ascii_punct(cp as u8);
+impl Bert {
+    /// Number of pieces in `text`.
+    pub fn count(text: &str) -> usize {
+        Self::count_upto(text, usize::MAX)
     }
+
+    /// Number of pieces, stopping once the count passes `limit`.
+    ///
+    /// Returns `limit + 1` when the text has more pieces than `limit`.
+    pub fn count_upto(text: &str, limit: usize) -> usize {
+        Walk::<Bert>::new(text).count_upto(limit)
+    }
+
+    /// Write every piece of `text` that fits in `out`. Returns how many were written.
+    pub fn fill(text: &str, out: &mut [Span]) -> usize {
+        Self::walk(text).fill(out)
+    }
+
+    /// Cursor for pulling pieces in batches.
+    pub fn walk(text: &str) -> BertWalk<'_> {
+        BertWalk {
+            inner: Walk::new(text),
+        }
+    }
+}
+
+impl BertWalk<'_> {
+    /// Write the next pieces into `out`. Returns how many were written.
+    /// A short count means the text is finished.
+    pub fn fill(&mut self, out: &mut [Span]) -> usize {
+        self.inner.fill(out)
+    }
+}
+
+impl Scheme for Bert {
+    #[inline]
+    fn advance(bytes: &[u8], pos: usize) -> usize {
+        advance(bytes, pos)
+    }
+
+    #[inline(always)]
+    fn align(bytes: &[u8], pos: usize) -> usize {
+        align(bytes, pos)
+    }
+
+    #[inline(always)]
+    fn try_window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
+        window::<ISA>(bytes, pos)
+    }
+}
+
+fn is_ascii_ws(b: u8) -> bool {
+    b == b' ' || b.wrapping_sub(9) < 5
+}
+
+fn is_ascii_punct(b: u8) -> bool {
+    b.is_ascii_punctuation()
+}
+
+fn is_unicode_punct(ch: char) -> bool {
     matches!(
-        get_general_category(c),
+        get_general_category(ch),
         GeneralCategory::ConnectorPunctuation
             | GeneralCategory::DashPunctuation
-            | GeneralCategory::ClosePunctuation
-            | GeneralCategory::FinalPunctuation
-            | GeneralCategory::InitialPunctuation
-            | GeneralCategory::OtherPunctuation
             | GeneralCategory::OpenPunctuation
+            | GeneralCategory::ClosePunctuation
+            | GeneralCategory::InitialPunctuation
+            | GeneralCategory::FinalPunctuation
+            | GeneralCategory::OtherPunctuation
     )
 }
 
-/// HF `BertPreTokenizer`: splits on whitespace (dropped) and isolates each
-/// punctuation char. Does **not** isolate CJK ideographs (since 0.2.0) —
-/// pre-pad them yourself, or normalize with tokie's BERT normalizer
-/// (`handle_chinese_chars`), as HF does.
-pub struct Bert<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    len: usize,
-}
-
-impl<'a> Bert<'a> {
-    pub fn new(text: &'a str) -> Self {
-        let bytes = text.as_bytes();
-        Self { bytes, pos: 0, len: bytes.len() }
-    }
-
-    /// Skip whitespace (delimiter in BERT).
-    #[inline(always)]
-    fn skip_whitespace(&mut self) {
-        while self.pos < self.len {
-            let b = unsafe { *self.bytes.get_unchecked(self.pos) };
-            if is_ascii_ws(b) {
-                self.pos += 1;
-            } else if b < 0x80 {
-                return;
-            } else {
-                let (c, cl) = decode_utf8(unsafe { self.bytes.get_unchecked(self.pos..) });
-                if c.is_whitespace() { self.pos += cl; } else { return; }
-            }
-        }
-    }
-
-    /// Scan word characters: anything that is neither whitespace nor punctuation.
-    #[inline(always)]
-    fn scan_word(&mut self) {
-        while self.pos < self.len {
-            let b = unsafe { *self.bytes.get_unchecked(self.pos) };
-            if b.is_ascii_alphanumeric() {
-                self.pos += 1;
-            } else if b < 0x80 {
-                if is_ascii_ws(b) || is_ascii_punct(b) {
-                    return;
-                }
-                self.pos += 1; // ASCII control: part of the word, as in HF
-            } else {
-                let (c, cl) = decode_utf8(unsafe { self.bytes.get_unchecked(self.pos..) });
-                if c.is_whitespace() || is_unicode_punct(c) {
-                    return;
-                }
-                // Letter, number, mark, symbol, CJK, … → continues word
-                self.pos += cl;
-            }
-        }
-    }
-}
-
-impl<'a> Iterator for Bert<'a> {
-    type Item = &'a str;
-
-    #[inline]
-    fn next(&mut self) -> Option<&'a str> {
-        // Skip whitespace
-        self.skip_whitespace();
-        if self.pos >= self.len { return None; }
-
-        let start = self.pos;
-        let b = unsafe { *self.bytes.get_unchecked(self.pos) };
-
+/// Next piece start, skipping whitespace.
+fn align(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() {
+        let b = bytes[pos];
         if b < 0x80 {
-            if is_ascii_punct(b) {
-                // Single punctuation character
-                self.pos += 1;
-            } else {
-                // Any other ASCII char (letter, digit, control) — scan word
-                self.pos += 1;
-                self.scan_word();
+            if is_ascii_ws(b) {
+                pos += 1;
+                continue;
             }
-        } else {
-            let (c, cl) = decode_utf8(unsafe { self.bytes.get_unchecked(self.pos..) });
-            if is_unicode_punct(c) {
-                // Single Unicode punctuation character
-                self.pos += cl;
-            } else {
-                // Non-ASCII letter, number, mark, or other → start word
-                self.pos += cl;
-                self.scan_word();
+            return pos;
+        }
+        let (ch, n) = decode(bytes, pos);
+        if !ch.is_whitespace() {
+            return pos;
+        }
+        pos += n;
+    }
+    pos
+}
+
+fn advance(bytes: &[u8], pos: usize) -> usize {
+    let b0 = bytes[pos];
+    if b0 < 0x80 {
+        if is_ascii_punct(b0) {
+            return pos + 1;
+        }
+        return scan_word(bytes, pos + 1);
+    }
+    let (ch, n) = decode(bytes, pos);
+    if is_unicode_punct(ch) {
+        return pos + n;
+    }
+    scan_word(bytes, pos + n)
+}
+
+fn scan_word(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() {
+        let b = bytes[pos];
+        if b < 0x80 {
+            if is_ascii_ws(b) || is_ascii_punct(b) {
+                return pos;
+            }
+            pos += 1;
+            continue;
+        }
+        let (ch, n) = decode(bytes, pos);
+        if ch.is_whitespace() || is_unicode_punct(ch) {
+            return pos;
+        }
+        pos += n;
+    }
+    pos
+}
+
+fn decode(bytes: &[u8], i: usize) -> (char, usize) {
+    let b0 = bytes[i];
+    let width = if b0 < 0xE0 {
+        2
+    } else if b0 < 0xF0 {
+        3
+    } else {
+        4
+    };
+    let end = (i + width).min(bytes.len());
+    let rest = std::str::from_utf8(&bytes[i..end]).expect("piece boundary is a char boundary");
+    let ch = rest.chars().next().expect("i is inside bytes");
+    (ch, ch.len_utf8())
+}
+
+/// The byte at `at` continues a word. End of text, whitespace, and
+/// punctuation do not.
+fn continues_word(bytes: &[u8], at: usize) -> bool {
+    if at >= bytes.len() {
+        return false;
+    }
+    let b = bytes[at];
+    if b < 0x80 {
+        return !is_ascii_ws(b) && !is_ascii_punct(b);
+    }
+    let (ch, _) = decode(bytes, at);
+    !ch.is_whitespace() && !is_unicode_punct(ch)
+}
+
+#[inline(always)]
+fn window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
+    if pos + 64 > bytes.len() {
+        return None;
+    }
+    let masks = masks_for::<ISA>(bytes, pos);
+    let punct = punct_mask::<ISA>(bytes, pos);
+    let stop = if masks.non_ascii == 0 {
+        64
+    } else {
+        masks.non_ascii.trailing_zeros()
+    };
+    if stop == 0 {
+        return None;
+    }
+    bits(bytes, pos, masks, punct, stop)
+}
+
+#[inline(always)]
+fn bits(bytes: &[u8], pos: usize, masks: Masks, punct: u64, stop: u32) -> Option<Window> {
+    let keep = if stop >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << stop) - 1
+    };
+    let punct = punct & keep;
+    let ws = (masks.space | masks.newline | masks.other_ws) & keep;
+    let word = keep & !ws & !punct;
+    let touches = stop > 0 && word & (1u64 << (stop - 1)) != 0;
+    let continues = touches && continues_word(bytes, pos + stop as usize);
+
+    let mut starts = (word & !(word << 1)) | punct;
+    let mut stops = ((word & !(word >> 1)) << 1) | (punct << 1);
+    if continues && stop < 64 {
+        stops &= !(1u64 << stop);
+    }
+    if stop < 64 && !continues {
+        starts |= 1u64 << stop;
+    }
+    let finishes = stop >= 64 && !continues;
+    if starts & 1 == 0 {
+        return None;
+    }
+    let complete = if finishes {
+        starts.count_ones()
+    } else {
+        starts.count_ones().saturating_sub(1)
+    };
+    if complete == 0 {
+        return None;
+    }
+    Some(Window {
+        starts,
+        stops: Some(stops),
+        finishes,
+    })
+}
+
+#[inline(always)]
+fn punct_mask<const ISA: u8>(bytes: &[u8], pos: usize) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::walk::{ISA_AVX2, ISA_AVX512};
+        if ISA == ISA_AVX512 {
+            // SAFETY: the AVX-512 kernel is the only caller of this isa.
+            return unsafe { punct_avx512(bytes, pos) };
+        }
+        if ISA == ISA_AVX2 {
+            // SAFETY: the AVX2 kernel is the only caller of this isa.
+            return unsafe { punct_avx2(bytes, pos) };
+        }
+    }
+    let _ = ISA;
+    punct_scalar(bytes, pos)
+}
+
+fn punct_scalar(bytes: &[u8], pos: usize) -> u64 {
+    let mut punct = 0u64;
+    for i in 0..64 {
+        if is_ascii_punct(bytes[pos + i]) {
+            punct |= 1u64 << i;
+        }
+    }
+    punct
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
+unsafe fn punct_avx512(bytes: &[u8], pos: usize) -> u64 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm512_loadu_si512(bytes.as_ptr().add(pos) as *const _);
+        let range = |lo: u8, hi: u8| {
+            _mm512_cmple_epu8_mask(
+                _mm512_sub_epi8(v, _mm512_set1_epi8(lo as i8)),
+                _mm512_set1_epi8((hi - lo) as i8),
+            )
+        };
+        range(0x21, 0x2F) | range(0x3A, 0x40) | range(0x5B, 0x60) | range(0x7B, 0x7E)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn punct_avx2(bytes: &[u8], pos: usize) -> u64 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let pack = |m0: __m256i, m1: __m256i| -> u64 {
+            (_mm256_movemask_epi8(m0) as u32 as u64) | ((_mm256_movemask_epi8(m1) as u32 as u64) << 32)
+        };
+        let le = |v: __m256i, lim: __m256i| -> __m256i { _mm256_cmpeq_epi8(_mm256_min_epu8(v, lim), v) };
+        let p = bytes.as_ptr().add(pos);
+        let v0 = _mm256_loadu_si256(p as *const _);
+        let v1 = _mm256_loadu_si256(p.add(32) as *const _);
+        let range = |lo: u8, hi: u8| {
+            let lim = _mm256_set1_epi8((hi - lo) as i8);
+            let a = le(_mm256_sub_epi8(v0, _mm256_set1_epi8(lo as i8)), lim);
+            let b = le(_mm256_sub_epi8(v1, _mm256_set1_epi8(lo as i8)), lim);
+            pack(a, b)
+        };
+        range(0x21, 0x2F) | range(0x3A, 0x40) | range(0x5B, 0x60) | range(0x7B, 0x7E)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pieces(text: &str) -> Vec<String> {
+        let mut walk = Bert::walk(text);
+        let mut buf = [Span { start: 0, end: 0 }; 1];
+        let mut out = Vec::new();
+        loop {
+            let n = walk.fill(&mut buf);
+            if n == 0 {
+                break;
+            }
+            for span in &buf[..n] {
+                out.push(text[span.start as usize..span.end as usize].to_string());
             }
         }
+        out
+    }
 
-        Some(unsafe { std::str::from_utf8_unchecked(&self.bytes[start..self.pos]) })
+    #[test]
+    fn whitespace_drops_and_punctuation_is_alone() {
+        assert_eq!(pieces(""), [] as [&str; 0]);
+        assert_eq!(pieces("   "), [] as [&str; 0]);
+        assert_eq!(pieces("Hello, world!"), ["Hello", ",", "world", "!"]);
+        assert_eq!(pieces("don't"), ["don", "'", "t"]);
+        assert_eq!(pieces("18th"), ["18th"]);
+        assert_eq!(pieces("..."), [".", ".", "."]);
+        assert_eq!(pieces("a\0b"), ["a\0b"]);
+        assert_eq!(pieces("€5"), ["€5"]);
+        assert_eq!(pieces("$5"), ["$", "5"]);
+    }
+
+    #[test]
+    fn rules_hold_inside_a_long_window() {
+        let text = format!("Hello, world! don't 18th {}", "word ".repeat(20));
+        let got = pieces(&text);
+        assert_eq!(&got[..7], ["Hello", ",", "world", "!", "don", "'", "t"]);
+        assert!(got.iter().any(|p| p == "18th"), "{got:?}");
+        assert_eq!(got.last().map(String::as_str), Some("word"));
     }
 }

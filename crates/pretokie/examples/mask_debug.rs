@@ -2,7 +2,7 @@
 //! mismatch. Debug aid for the mask-scanner differential tests.
 //! Run: cargo run -p pretokie --example mask_debug -- <file> <config>
 
-use pretokie::{Core, Mask};
+use pretokie::mask::{Core, Mask};
 
 
 fn main() {
@@ -46,13 +46,13 @@ fn main() {
         }};
     }
     match cfg {
-        "gpt2" => run!(pretokie::Gpt2Config),
-        "cl100k" => run!(pretokie::Cl100kConfig),
-        "o200k" => run!(pretokie::O200kConfig),
-        "voyage" => run!(pretokie::VoyageConfig),
-        "smollm" => run!(pretokie::SmolLMConfig),
-        "deepseek" => run!(pretokie::DeepSeekConfig),
-        "qwen" => run!(pretokie::QwenConfig),
+        "gpt2" => run!(pretokie::mask::Gpt2Config),
+        "cl100k" => run!(pretokie::mask::Cl100kConfig),
+        "o200k" => run!(pretokie::mask::O200kConfig),
+        "voyage" => run!(pretokie::mask::VoyageConfig),
+        "smollm" => run!(pretokie::mask::SmolLMConfig),
+        "deepseek" => run!(pretokie::mask::DeepSeekConfig),
+        "qwen" => run!(pretokie::mask::QwenConfig),
         _ => panic!("unknown config"),
     }
 }

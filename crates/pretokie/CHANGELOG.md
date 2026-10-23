@@ -4,17 +4,22 @@
 
 ### Breaking changes
 
+- **The mask pretokenizers moved to `pretokie::mask`.** The crate root now
+  holds the zero-sized cuts (`Gpt2::count`, `Gpt2::walk`, `Span`, ...).
+  `Mask`, the `*Config` types, the `Gpt2`..`Tekken` aliases, `Bert`, `Regex`,
+  and `util` are unchanged under `pretokie::mask`.
+  *Migration:* replace `pretokie::` with `pretokie::mask::`.
 - **`Bert` no longer isolates CJK ideographs.** It now matches HuggingFace's
   `BertPreTokenizer` exactly; HF isolates CJK in `BertNormalizer`
   (`handle_chinese_chars`), and tokie's BERT normalizers now do the same.
   Non-whitespace control characters also stay inside words instead of
   splitting them, and VT/FF are whitespace.
-  *Migration:* if you call `pretokie::Bert` directly on un-normalized text,
+  *Migration:* if you call `pretokie::mask::Bert` directly on un-normalized text,
   pad CJK chars with spaces first (or use tokie's BERT normalizer).
-- **`util::is_unicode_letter`** now returns `false` for letter numbers
+- **`mask::util::is_unicode_letter`** now returns `false` for letter numbers
   (Nl: `Ⅲ`, `ⅰ`, `〇`, which are `\p{N}`) and Other_Alphabetic symbols
   (circled `Ⓐ`..`ⓩ`, U+1F130..U+1F189, which are `\p{So}`).
-- **`util::is_punct_or_symbol`** now returns `true` for those
+- **`mask::util::is_punct_or_symbol`** now returns `true` for those
   Other_Alphabetic symbols.
 
 ### Added

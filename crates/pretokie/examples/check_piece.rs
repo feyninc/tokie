@@ -1,4 +1,4 @@
-use pretokie::Gpt2;
+use pretokie::mask::Gpt2;
 fn main() {
     let tests = &[
         " />\n", ". \n", "]] s", "]]s", " \n", "\n ", "  ", " a", " 1",
