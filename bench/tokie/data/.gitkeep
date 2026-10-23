@@ -1,0 +1,4 @@
+//! `tokenizer.json` files for the rows in `src/rows.rs`.
+//!
+//! A file dropped here is encoded by tokenizers v1 in `tests/oracles.rs`.
+//! The test fails until tokie emits the same ids.

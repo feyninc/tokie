@@ -49,6 +49,14 @@ impl SmolLMWalk<'_> {
     pub fn fill(&mut self, out: &mut [Span]) -> usize {
         self.inner.fill(out)
     }
+
+    /// Write the next piece boundaries into `out`.
+    ///
+    /// `out[0]` is the absolute start. Each later entry is the next piece's
+    /// exclusive end. `out` must hold `limit + 80` slots.
+    pub fn bounds(&mut self, out: &mut [u32], limit: usize) -> usize {
+        self.inner.bounds(out, limit)
+    }
 }
 
 impl Scheme for SmolLM {
@@ -66,6 +74,18 @@ impl Scheme for SmolLM {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounds_match_fill() {
+        let samples = ["", "Hello world", "123 456", "café naïve 東京", "a12b"];
+        let long = "Hello world! It's a test.\n\tDon't  stop.\n".repeat(40);
+        for text in samples {
+            crate::walk::bounds_match_fill::<SmolLM>(text);
+        }
+        crate::walk::bounds_match_fill::<SmolLM>(&long);
+        crate::walk::bounds_match_fill::<SmolLM>(&"word ".repeat(300));
+    }
+
 
     fn pieces(text: &str) -> Vec<&str> {
         let mut buf = [Span { start: 0, end: 0 }; 16];

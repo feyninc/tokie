@@ -12,10 +12,10 @@
 [![docs.rs](https://img.shields.io/docsrs/tokie)](https://docs.rs/tokie)
 [![GitHub Stars](https://img.shields.io/github/stars/chonkie-inc/tokie)](https://github.com/chonkie-inc/tokie)
 
-*25-150x faster than HuggingFace, 100% accurate drop-in replacement*
+*25 to 150 times faster than Hugging Face tokenizers, with the same token ids*
 
 [Install](#install) •
-[Quick Start](#quick-start) •
+[Quick start](#quick-start) •
 [Examples](#examples) •
 [Benchmarks](#benchmarks) •
 [Why tokie?](#why-tokie)
@@ -25,7 +25,7 @@
 > [!CAUTION]
 > tokie is in its alpha stage and might produce mis-aligned output. Please report any issues you encounter.
 
-**tokie** is a Rust tokenizer library (with Python bindings) that can load any tokenizer on HuggingFace and tokenize 25-150x faster. It supports every major algorithm — BPE, WordPiece, SentencePiece, and Unigram — and is 100% token-accurate, every time.
+tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face `tokenizer.json` and encodes 25 to 150 times faster than Hugging Face tokenizers. It implements BPE, WordPiece, SentencePiece, and Unigram. The token ids match Hugging Face tokenizers.
 
 ![benchmark](assets/benchmark.png)
 
@@ -44,19 +44,19 @@ pip install tokie
 tokie = { version = "0.0.8", features = ["hf"] }
 ```
 
-Coming from HuggingFace `tokenizers`? See the [migration guide](docs/MIGRATION.md).
+Coming from Hugging Face `tokenizers`? See the [migration guide](docs/MIGRATION.md).
 
-## Quick Start
+## Quick start
 
 ### Python
 
 ```python
 import tokie
 
-# Load any HuggingFace tokenizer
+# Load a Hugging Face tokenizer
 tokenizer = tokie.Tokenizer.from_pretrained("bert-base-uncased")
 
-# Encode — returns Encoding with ids, attention_mask, type_ids, tokens
+# Encode. Returns an Encoding with ids, attention_mask, type_ids, and tokens.
 encoding = tokenizer("Hello, world!")  # or tokenizer.encode("Hello, world!")
 print(encoding.ids)             # [101, 7592, 1010, 2088, 999, 102]
 print(encoding.tokens)          # ['[CLS]', 'hello', ',', 'world', '!', '[SEP]']
@@ -87,9 +87,9 @@ let text = tokenizer.decode(&encoding.ids).unwrap();
 
 ## Examples
 
-### Padding & Truncation
+### Padding and truncation
 
-For ML inference, you need fixed-length inputs. tokie supports padding and truncation just like HuggingFace:
+Model input is a fixed length. tokie pads and truncates the same way Hugging Face tokenizers does:
 
 ```python
 tokenizer = tokie.Tokenizer.from_pretrained("bert-base-uncased")
@@ -108,9 +108,9 @@ assert all(len(r) == 128 for r in results)
 print(results[0].attention_mask)  # [1, 1, 1, 1, 0, 0, 0, ...]
 ```
 
-### Cross-Encoder Pair Encoding
+### Cross-encoder pair encoding
 
-For rerankers and cross-encoders that need sentence pairs with token type IDs:
+Rerankers and cross-encoders take a sentence pair and token type ids:
 
 ```python
 pair = tokenizer("How are you?", "I am fine.")  # or tokenizer.encode_pair(...)
@@ -120,9 +120,9 @@ pair.type_ids          # [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1]
 pair.special_tokens_mask  # [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
 ```
 
-### Byte Offsets
+### Byte offsets
 
-Track where each token maps back to in the original text:
+Each token records the byte range it came from:
 
 ```python
 enc = tokenizer.encode_with_offsets("Hello world")
@@ -130,7 +130,7 @@ for token_id, (start, end) in zip(enc.ids, enc.offsets):
     print(f"  token {token_id}: bytes [{start}:{end}]")
 ```
 
-### Vocabulary Access
+### Vocabulary access
 
 ```python
 tokenizer.vocab_size          # 30522
@@ -139,64 +139,64 @@ tokenizer.token_to_id("[SEP]")  # 102
 vocab = tokenizer.get_vocab()   # {"[CLS]": 101, "[SEP]": 102, ...}
 ```
 
-### Save and Load `.tkz` Files
+### Save and load `.tkz` files
 
-tokie's binary format is ~10x smaller than `tokenizer.json` and loads in ~5ms:
+The `.tkz` file is about 10 times smaller than `tokenizer.json` and loads in about 5 ms:
 
 ```python
 tokenizer.save("model.tkz")
 tokenizer = tokie.Tokenizer.from_file("model.tkz")
 ```
 
-`from_pretrained()` automatically tries `.tkz` first, falling back to `tokenizer.json`.
+`from_pretrained()` tries `.tkz` first, then `tokenizer.json`.
 
-### Bulk File Encoding
+### Bulk file encoding
 
-For tokenizing large corpora, `encode_files` reads the files in Rust, splits on a separator, and encodes every document across all cores — the text never crosses the Python string boundary. It returns a flat `uint32` array of token ids plus a `uint64` array of per-document offsets (zero-copy numpy):
+`encode_files` reads the files in Rust, splits on a separator, and encodes every document on all cores. The text stays in Rust. It returns a flat `uint32` array of token ids and a `uint64` array of per-document offsets. NumPy reads both arrays without a copy:
 
 ```python
 ids, offsets = tokenizer.encode_files(["corpus.txt"], separator=b"<|endoftext|>")
-# ids: np.ndarray[uint32]  — all tokens, concatenated
-# offsets: np.ndarray[uint64] — length ndocs+1; doc i is ids[offsets[i]:offsets[i+1]]
+# ids: np.ndarray[uint32], every token, concatenated
+# offsets: np.ndarray[uint64], length ndocs+1. Doc i is ids[offsets[i]:offsets[i+1]].
 
 n_tokens = tokenizer.count_tokens_files(["corpus.txt"], separator=b"<|endoftext|>")
 ```
 
-Output is identical to concatenating `encode_batch_flat` over the same documents; invalid UTF-8 is handled losslessly rather than raising.
+The ids match `encode_batch_flat` on the same documents. Invalid UTF-8 is kept as bytes and does not raise.
 
 ## Benchmarks
 
-All benchmarks run on an Apple M3 with tokie 0.1.3. tokie produces **identical output** to HuggingFace tokenizers — every token matches, every time.
+All benchmarks run on an Apple M3 with tokie 0.1.3. The ids match Hugging Face tokenizers.
 
-### BPE Encoding (GPT-2, Llama, Qwen, ModernBERT)
+### BPE encoding (GPT-2, Llama, Qwen, ModernBERT)
 
-For tiktoken-style BPE models, tokie uses a backtracking encoder built on an Aho-Corasick automaton. Instead of iteratively merging byte pairs, it does a greedy longest-match in O(n) time, with backtracking only when adjacent tokens form invalid pairs. Pretokenization runs as a SIMD mask scanner from [pretokie](https://crates.io/crates/pretokie) (64-byte blocks classified into piece-boundary bitmasks, >1 GB/s per core), repeated pretokens resolve through a compact per-worker cache instead of re-running BPE, and work-stealing parallel chunking keeps every core busy. Together this gives **39-154x faster** single-string encoding than HuggingFace.
+For tiktoken-style BPE, tokie uses a backtracking encoder on an Aho-Corasick automaton. It takes a greedy longest match in O(n), and it backtracks only when two adjacent tokens are not a valid pair. It does not merge one byte pair at a time. Pretokenization is the SIMD mask scanner in [pretokie](https://crates.io/crates/pretokie). That scanner classifies 64-byte blocks into piece-boundary bitmasks and runs above 1 GB/s per core. A repeated piece hits a per-worker cache instead of running BPE again. Work stealing splits the text so every core has a chunk. On one string this is 39 to 154 times faster than Hugging Face tokenizers.
 
 ![BPE encoding speed](assets/benchmark_bpe.png)
 
 ### WordPiece (BERT, MiniLM, BGE, GTE)
 
-WordPiece tokenizers use a different algorithm — greedy longest-match prefix search over a vocabulary trie. tokie uses a pre-built Double-Array trie for O(n) lookup with excellent cache locality, combined with a specialized BERT pretokenizer. The result is **25-71x faster** than HuggingFace on BERT, with identical output.
+WordPiece searches a vocabulary trie for the longest prefix. tokie stores that trie as a Double-Array trie and looks it up in O(n), with a BERT pretokenizer. On BERT this is 25 to 71 times faster than Hugging Face tokenizers, and the ids match.
 
 ![WordPiece encoding speed](assets/benchmark_wordpiece.png)
 
-### SentencePiece BPE & Unigram (Gemma, XLM-R, T5)
+### SentencePiece BPE and Unigram (Gemma, XLM-R, T5)
 
-SentencePiece-style models use a different merge algorithm with non-topological rank orders. tokie uses a radix heap with O(1) amortized operations that exploits BPE's monotonic rank property. tokie is **2-3x faster** than HuggingFace on Gemma 3.
+SentencePiece BPE merges in an order that is not topological. tokie uses a radix heap. Insert and pop are O(1) amortized because a later BPE rank is never smaller. On Gemma 3 this is 2 to 3 times faster than Hugging Face tokenizers.
 
-Unigram models (T5, XLM-RoBERTa, ALBERT, and other SentencePiece-Unigram vocabularies) run their Viterbi segmentation per metaspace-delimited word unit and memoize the Zipf-frequent units, making single-string encoding **~4x** and batch encoding **~3x** faster than the whole-string Viterbi baseline, with identical output. Vocabularies containing multi-word (interior-metaspace) tokens automatically fall back to exact whole-string Viterbi.
+Unigram models such as T5, XLM-RoBERTa, and ALBERT run Viterbi on each metaspace-delimited word and store the frequent units. Encoding one string is about 4 times faster than whole-string Viterbi. Batch encoding is about 3 times faster. The ids match. A vocabulary with a metaspace inside a token uses whole-string Viterbi.
 
 ![SentencePiece BPE speed](assets/benchmark_sentencepiece.png)
 
 ![Unigram encoding speed](assets/benchmark_unigram.png)
 
-### Python Benchmarks
+### Python benchmarks
 
 All results on Apple M3, single-string encode, median of 10 runs.
 
-#### tokie vs HuggingFace tokenizers
+#### tokie vs Hugging Face tokenizers
 
-| Model | Text Size | tokie | HF tokenizers | vs HF |
+| Model | Text size | tokie | Hugging Face | Speedup |
 |-------|-----------|-------|---------------|-------|
 | BERT | 45 KB | 0.38 ms | 9.6 ms | **25x** |
 | BERT | 900 KB | 3.60 ms | 257 ms | **71x** |
@@ -213,20 +213,20 @@ All results on Apple M3, single-string encode, median of 10 runs.
 
 #### tokie vs tiktoken (OpenAI models)
 
-| Model | Text Size | tokie | tiktoken | Speedup |
+| Model | Text size | tokie | tiktoken | Speedup |
 |-------|-----------|-------|----------|---------|
 | cl100k (GPT-4) | 45 KB | 0.13 ms | 2.12 ms | **17x** |
 | cl100k (GPT-4) | 900 KB | 1.28 ms | 42.3 ms | **33x** |
 | o200k (GPT-4o) | 45 KB | 0.16 ms | 3.57 ms | **22x** |
 | o200k (GPT-4o) | 900 KB | 1.66 ms | 70.7 ms | **42x** |
 
-100% token-accurate across all models. Batch encoding is 17-36x faster than HF, and `encode_batch_flat` returns a contiguous numpy array for zero-copy bulk pipelines.
+The ids match on every model in these tables. Batch encoding is 17 to 36 times faster than Hugging Face tokenizers. `encode_batch_flat` returns one contiguous NumPy array.
 
-### Tokenizer Loading
+### Tokenizer loading
 
-Loading a tokenizer from `tokenizer.json` requires JSON parsing, vocabulary construction, and — for BPE models — building the Aho-Corasick automaton from scratch. tiktoken similarly has to parse its BPE data and compile regex patterns on every load. tokie's `.tkz` binary format stores all of this pre-built — the Double-Array Aho-Corasick (DAAC) automaton state, the normalized vocabulary, the encoder configuration, and (since v13) the added/special tokens — so loading is a near-zero-cost deserialization. `from_pretrained` also resolves the hub disk cache offline-first and keeps a compiled `.tkz` beside the snapshot, so warm loads skip the network entirely: **13x–44x faster** than HuggingFace (2.8 ms for BERT, 6.2 ms for GPT-2).
+Loading `tokenizer.json` parses the JSON, builds the vocabulary, and, for BPE, builds the Aho-Corasick automaton. tiktoken parses its BPE data and compiles its regexes on every load. A `.tkz` file stores the Double-Array Aho-Corasick state, the normalized vocabulary, the encoder configuration, and, since v13, the added and special tokens. Loading that file is deserialization. `from_pretrained` reads the hub disk cache before the network and writes the compiled `.tkz` next to the snapshot, so a warm load does not use the network. A warm load is 13 to 44 times faster than Hugging Face tokenizers. BERT takes 2.8 ms. GPT-2 takes 6.2 ms.
 
-| Model | tokie | HF tokenizers | Speedup |
+| Model | tokie | Hugging Face | Speedup |
 |-------|-------|---------------|---------|
 | BERT | 2.8 ms | 123 ms | **44x** |
 | GPT-2 | 6.2 ms | 151 ms | **24x** |
@@ -236,113 +236,111 @@ Loading a tokenizer from `tokenizer.json` requires JSON parsing, vocabulary cons
 
 ![Tokenizer loading time](assets/benchmark_loading.png)
 
-## Verified Tokenizers
+## Verified tokenizers
 
-Every tokenizer below is tested against the original HuggingFace tokenizer on 1MB of [enwik8](https://mattmahoney.net/dc/textdata.html) (~300K tokens) in [CI](../../actions/workflows/tokenizer-accuracy.yml). **Pass** = every token matches.
+Every tokenizer below is tested against the Hugging Face tokenizer on 1 MB of [enwik8](https://mattmahoney.net/dc/textdata.html), about 300,000 tokens, in [CI](../../actions/workflows/tokenizer-accuracy.yml). Pass means every token matches.
 
-For the full compatibility and performance matrix across every model family, see [docs/TOKENIZERS.md](docs/TOKENIZERS.md).
+The full matrix is in [docs/TOKENIZERS.md](docs/TOKENIZERS.md).
 
 <details>
-<summary><b>View full accuracy table (74 models)</b></summary>
+<summary>Full accuracy table, 74 models</summary>
 
 | Model | Type | Status |
 |-------|------|--------|
-| [GPT-2](https://huggingface.co/tokiers/gpt2) | BPE | ✅ Pass |
-| [cl100k](https://huggingface.co/tokiers/cl100k) | BPE | ✅ Pass (vs tiktoken-rs) |
-| [o200k](https://huggingface.co/tokiers/o200k) | BPE | ✅ Pass (vs tiktoken-rs) |
-| [RoBERTa](https://huggingface.co/tokiers/roberta-base) | BPE | ✅ Pass |
-| [Phi-2](https://huggingface.co/tokiers/phi-2) | BPE | ✅ Pass |
-| [Phi-3 Mini](https://huggingface.co/tokiers/Phi-3-mini-4k-instruct) | BPE | ✅ Pass |
-| [ModernBERT](https://huggingface.co/tokiers/ModernBERT-base) | BPE | ✅ Pass |
-| [CodeLlama 7B](https://huggingface.co/tokiers/CodeLlama-7b-hf) | BPE | ✅ Pass |
-| [DeepSeek-V3](https://huggingface.co/tokiers/DeepSeek-V3) | BPE | ✅ Pass |
-| [DeepSeek-R1](https://huggingface.co/tokiers/DeepSeek-R1) | BPE | ✅ Pass |
-| [Gemma 2 2B](https://huggingface.co/tokiers/gemma-2-2b) | SentencePiece BPE | ✅ Pass |
-| [Gemma 3 4B](https://huggingface.co/tokiers/gemma-3-4b-it) | SentencePiece BPE | ✅ Pass |
-| [Llama 3.2 1B](https://huggingface.co/tokiers/Llama-3.2-1B) | BPE | ✅ Pass |
-| [Llama 4 Scout](https://huggingface.co/tokiers/Llama-4-Scout-17B-16E) | BPE | ✅ Pass |
-| [Mistral 7B](https://huggingface.co/tokiers/Mistral-7B-v0.1) | BPE | ✅ Pass |
-| [Mistral Nemo](https://huggingface.co/tokiers/Mistral-Nemo-Base-2407) | BPE | ✅ Pass |
-| [Mixtral 8x7B](https://huggingface.co/tokiers/Mixtral-8x7B-v0.1) | BPE | ✅ Pass |
-| [NV-Embed-v2](https://huggingface.co/tokiers/NV-Embed-v2) | SentencePiece BPE | ✅ Pass |
-| [Qwen2 7B](https://huggingface.co/tokiers/Qwen2-7B) | BPE | ✅ Pass |
-| [Qwen3 Embed 0.6B](https://huggingface.co/tokiers/Qwen3-Embedding-0.6B) | BPE | ✅ Pass |
-| [Qwen3 Embed 4B](https://huggingface.co/tokiers/Qwen3-Embedding-4B) | BPE | ✅ Pass |
-| [Qwen3 Embed 8B](https://huggingface.co/tokiers/Qwen3-Embedding-8B) | BPE | ✅ Pass |
-| [Qwen3 0.6B](https://huggingface.co/tokiers/Qwen3-0.6B) | BPE | ✅ Pass |
-| [Qwen3 8B](https://huggingface.co/tokiers/Qwen3-8B) | BPE | ✅ Pass |
-| [Qwen3 Coder 30B](https://huggingface.co/tokiers/Qwen3-Coder-30B-A3B-Instruct) | BPE | ✅ Pass |
-| [Qwen3.5 0.8B](https://huggingface.co/tokiers/Qwen3.5-0.8B) | BPE | ✅ Pass |
-| [Qwen3.5 4B](https://huggingface.co/tokiers/Qwen3.5-4B) | BPE | ✅ Pass |
-| [SmolLM2 135M](https://huggingface.co/tokiers/SmolLM2-135M) | BPE | ✅ Pass |
-| [StableLM 2 1.6B](https://huggingface.co/tokiers/stablelm-2-1_6b) | BPE | ✅ Pass |
-| [Nomic Embed v1](https://huggingface.co/tokiers/nomic-embed-text-v1) | WordPiece | ✅ Pass |
-| [BERT base](https://huggingface.co/tokiers/bert-base-uncased) | WordPiece | ✅ Pass |
-| [all-MiniLM-L6-v2](https://huggingface.co/tokiers/all-MiniLM-L6-v2) | WordPiece | ✅ Pass |
-| [all-MiniLM-L12-v2](https://huggingface.co/tokiers/all-MiniLM-L12-v2) | WordPiece | ✅ Pass |
-| [all-mpnet-base-v2](https://huggingface.co/tokiers/all-mpnet-base-v2) | WordPiece | ✅ Pass |
-| [BGE base en v1.5](https://huggingface.co/tokiers/bge-base-en-v1.5) | WordPiece | ✅ Pass |
-| [BGE large en v1.5](https://huggingface.co/tokiers/bge-large-en-v1.5) | WordPiece | ✅ Pass |
-| [BGE small en v1.5](https://huggingface.co/tokiers/bge-small-en-v1.5) | WordPiece | ✅ Pass |
-| [BGE en ICL](https://huggingface.co/tokiers/bge-en-icl) | BPE | ✅ Pass |
-| [BGE M3](https://huggingface.co/tokiers/bge-m3) | SentencePiece BPE | ✅ Pass |
-| [E5 base v2](https://huggingface.co/tokiers/e5-base-v2) | WordPiece | ✅ Pass |
-| [E5 large v2](https://huggingface.co/tokiers/e5-large-v2) | WordPiece | ✅ Pass |
-| [E5 small v2](https://huggingface.co/tokiers/e5-small-v2) | WordPiece | ✅ Pass |
-| [GTE base](https://huggingface.co/tokiers/gte-base) | WordPiece | ✅ Pass |
-| [GTE large](https://huggingface.co/tokiers/gte-large) | WordPiece | ✅ Pass |
-| [GTE small](https://huggingface.co/tokiers/gte-small) | WordPiece | ✅ Pass |
-| [GTE Qwen2 7B](https://huggingface.co/tokiers/gte-Qwen2-7B-instruct) | BPE | ✅ Pass |
-| [MS MARCO MiniLM L-4](https://huggingface.co/tokiers/ms-marco-MiniLM-L-4-v2) | WordPiece | ✅ Pass |
-| [MS MARCO MiniLM L-6](https://huggingface.co/tokiers/ms-marco-MiniLM-L-6-v2) | WordPiece | ✅ Pass |
-| [mxbai embed large v1](https://huggingface.co/tokiers/mxbai-embed-large-v1) | WordPiece | ✅ Pass |
-| [mxbai embed 2d large v1](https://huggingface.co/tokiers/mxbai-embed-2d-large-v1) | WordPiece | ✅ Pass |
-| [mxbai embed xsmall v1](https://huggingface.co/tokiers/mxbai-embed-xsmall-v1) | WordPiece | ✅ Pass |
-| [deepset mxbai embed de large](https://huggingface.co/tokiers/deepset-mxbai-embed-de-large-v1) | Unigram | ✅ Pass |
-| [Jina v2 base en](https://huggingface.co/tokiers/jina-embeddings-v2-base-en) | BPE | ✅ Pass |
-| [Jina v2 base code](https://huggingface.co/tokiers/jina-embeddings-v2-base-code) | BPE | ✅ Pass |
-| [Jina v3](https://huggingface.co/tokiers/jina-embeddings-v3) | Unigram | ✅ Pass |
-| [Jina v4](https://huggingface.co/tokiers/jina-embeddings-v4) | BPE | ✅ Pass |
-| [Cohere embed english v3](https://huggingface.co/tokiers/Cohere-embed-english-v3.0) | BPE | ✅ Pass |
-| [Cohere embed english light v3](https://huggingface.co/tokiers/Cohere-embed-english-light-v3.0) | BPE | ✅ Pass |
-| [Cohere embed multilingual v3](https://huggingface.co/tokiers/Cohere-embed-multilingual-v3.0) | Unigram | ✅ Pass |
-| [Cohere embed multilingual light v3](https://huggingface.co/tokiers/Cohere-embed-multilingual-light-v3.0) | Unigram | ✅ Pass |
-| [Voyage 3](https://huggingface.co/tokiers/voyage-3) | BPE | ✅ Pass |
-| [Voyage 3 large](https://huggingface.co/tokiers/voyage-3-large) | BPE | ✅ Pass |
-| [Voyage 3 lite](https://huggingface.co/tokiers/voyage-3-lite) | BPE | ✅ Pass |
-| [Voyage 3.5](https://huggingface.co/tokiers/voyage-3.5) | BPE | ✅ Pass |
-| [Voyage 3.5 lite](https://huggingface.co/tokiers/voyage-3.5-lite) | BPE | ✅ Pass |
-| [Voyage Code 2](https://huggingface.co/tokiers/voyage-code-2) | BPE | ✅ Pass |
-| [Voyage Code 3](https://huggingface.co/tokiers/voyage-code-3) | BPE | ✅ Pass |
-| [Voyage Finance 2](https://huggingface.co/tokiers/voyage-finance-2) | BPE | ✅ Pass |
-| [Voyage Law 2](https://huggingface.co/tokiers/voyage-law-2) | BPE | ✅ Pass |
-| [Voyage Multilingual 2](https://huggingface.co/tokiers/voyage-multilingual-2) | BPE | ✅ Pass |
-| [Voyage Multimodal 3](https://huggingface.co/tokiers/voyage-multimodal-3) | BPE | ✅ Pass |
-| [Snowflake Arctic Embed v2](https://huggingface.co/tokiers/snowflake-arctic-embed-l-v2.0) | SentencePiece BPE | ✅ Pass |
-| [T5 base](https://huggingface.co/tokiers/t5-base) | Unigram | ✅ Pass |
-| [XLM-RoBERTa](https://huggingface.co/tokiers/xlm-roberta-base) | SentencePiece BPE | ✅ Pass |
+| [GPT-2](https://huggingface.co/tokiers/gpt2) | BPE | Pass |
+| [cl100k](https://huggingface.co/tokiers/cl100k) | BPE | Pass, compared with tiktoken-rs |
+| [o200k](https://huggingface.co/tokiers/o200k) | BPE | Pass, compared with tiktoken-rs |
+| [RoBERTa](https://huggingface.co/tokiers/roberta-base) | BPE | Pass |
+| [Phi-2](https://huggingface.co/tokiers/phi-2) | BPE | Pass |
+| [Phi-3 Mini](https://huggingface.co/tokiers/Phi-3-mini-4k-instruct) | BPE | Pass |
+| [ModernBERT](https://huggingface.co/tokiers/ModernBERT-base) | BPE | Pass |
+| [CodeLlama 7B](https://huggingface.co/tokiers/CodeLlama-7b-hf) | BPE | Pass |
+| [DeepSeek-V3](https://huggingface.co/tokiers/DeepSeek-V3) | BPE | Pass |
+| [DeepSeek-R1](https://huggingface.co/tokiers/DeepSeek-R1) | BPE | Pass |
+| [Gemma 2 2B](https://huggingface.co/tokiers/gemma-2-2b) | SentencePiece BPE | Pass |
+| [Gemma 3 4B](https://huggingface.co/tokiers/gemma-3-4b-it) | SentencePiece BPE | Pass |
+| [Llama 3.2 1B](https://huggingface.co/tokiers/Llama-3.2-1B) | BPE | Pass |
+| [Llama 4 Scout](https://huggingface.co/tokiers/Llama-4-Scout-17B-16E) | BPE | Pass |
+| [Mistral 7B](https://huggingface.co/tokiers/Mistral-7B-v0.1) | BPE | Pass |
+| [Mistral Nemo](https://huggingface.co/tokiers/Mistral-Nemo-Base-2407) | BPE | Pass |
+| [Mixtral 8x7B](https://huggingface.co/tokiers/Mixtral-8x7B-v0.1) | BPE | Pass |
+| [NV-Embed-v2](https://huggingface.co/tokiers/NV-Embed-v2) | SentencePiece BPE | Pass |
+| [Qwen2 7B](https://huggingface.co/tokiers/Qwen2-7B) | BPE | Pass |
+| [Qwen3 Embed 0.6B](https://huggingface.co/tokiers/Qwen3-Embedding-0.6B) | BPE | Pass |
+| [Qwen3 Embed 4B](https://huggingface.co/tokiers/Qwen3-Embedding-4B) | BPE | Pass |
+| [Qwen3 Embed 8B](https://huggingface.co/tokiers/Qwen3-Embedding-8B) | BPE | Pass |
+| [Qwen3 0.6B](https://huggingface.co/tokiers/Qwen3-0.6B) | BPE | Pass |
+| [Qwen3 8B](https://huggingface.co/tokiers/Qwen3-8B) | BPE | Pass |
+| [Qwen3 Coder 30B](https://huggingface.co/tokiers/Qwen3-Coder-30B-A3B-Instruct) | BPE | Pass |
+| [Qwen3.5 0.8B](https://huggingface.co/tokiers/Qwen3.5-0.8B) | BPE | Pass |
+| [Qwen3.5 4B](https://huggingface.co/tokiers/Qwen3.5-4B) | BPE | Pass |
+| [SmolLM2 135M](https://huggingface.co/tokiers/SmolLM2-135M) | BPE | Pass |
+| [StableLM 2 1.6B](https://huggingface.co/tokiers/stablelm-2-1_6b) | BPE | Pass |
+| [Nomic Embed v1](https://huggingface.co/tokiers/nomic-embed-text-v1) | WordPiece | Pass |
+| [BERT base](https://huggingface.co/tokiers/bert-base-uncased) | WordPiece | Pass |
+| [all-MiniLM-L6-v2](https://huggingface.co/tokiers/all-MiniLM-L6-v2) | WordPiece | Pass |
+| [all-MiniLM-L12-v2](https://huggingface.co/tokiers/all-MiniLM-L12-v2) | WordPiece | Pass |
+| [all-mpnet-base-v2](https://huggingface.co/tokiers/all-mpnet-base-v2) | WordPiece | Pass |
+| [BGE base en v1.5](https://huggingface.co/tokiers/bge-base-en-v1.5) | WordPiece | Pass |
+| [BGE large en v1.5](https://huggingface.co/tokiers/bge-large-en-v1.5) | WordPiece | Pass |
+| [BGE small en v1.5](https://huggingface.co/tokiers/bge-small-en-v1.5) | WordPiece | Pass |
+| [BGE en ICL](https://huggingface.co/tokiers/bge-en-icl) | BPE | Pass |
+| [BGE M3](https://huggingface.co/tokiers/bge-m3) | SentencePiece BPE | Pass |
+| [E5 base v2](https://huggingface.co/tokiers/e5-base-v2) | WordPiece | Pass |
+| [E5 large v2](https://huggingface.co/tokiers/e5-large-v2) | WordPiece | Pass |
+| [E5 small v2](https://huggingface.co/tokiers/e5-small-v2) | WordPiece | Pass |
+| [GTE base](https://huggingface.co/tokiers/gte-base) | WordPiece | Pass |
+| [GTE large](https://huggingface.co/tokiers/gte-large) | WordPiece | Pass |
+| [GTE small](https://huggingface.co/tokiers/gte-small) | WordPiece | Pass |
+| [GTE Qwen2 7B](https://huggingface.co/tokiers/gte-Qwen2-7B-instruct) | BPE | Pass |
+| [MS MARCO MiniLM L-4](https://huggingface.co/tokiers/ms-marco-MiniLM-L-4-v2) | WordPiece | Pass |
+| [MS MARCO MiniLM L-6](https://huggingface.co/tokiers/ms-marco-MiniLM-L-6-v2) | WordPiece | Pass |
+| [mxbai embed large v1](https://huggingface.co/tokiers/mxbai-embed-large-v1) | WordPiece | Pass |
+| [mxbai embed 2d large v1](https://huggingface.co/tokiers/mxbai-embed-2d-large-v1) | WordPiece | Pass |
+| [mxbai embed xsmall v1](https://huggingface.co/tokiers/mxbai-embed-xsmall-v1) | WordPiece | Pass |
+| [deepset mxbai embed de large](https://huggingface.co/tokiers/deepset-mxbai-embed-de-large-v1) | Unigram | Pass |
+| [Jina v2 base en](https://huggingface.co/tokiers/jina-embeddings-v2-base-en) | BPE | Pass |
+| [Jina v2 base code](https://huggingface.co/tokiers/jina-embeddings-v2-base-code) | BPE | Pass |
+| [Jina v3](https://huggingface.co/tokiers/jina-embeddings-v3) | Unigram | Pass |
+| [Jina v4](https://huggingface.co/tokiers/jina-embeddings-v4) | BPE | Pass |
+| [Cohere embed english v3](https://huggingface.co/tokiers/Cohere-embed-english-v3.0) | BPE | Pass |
+| [Cohere embed english light v3](https://huggingface.co/tokiers/Cohere-embed-english-light-v3.0) | BPE | Pass |
+| [Cohere embed multilingual v3](https://huggingface.co/tokiers/Cohere-embed-multilingual-v3.0) | Unigram | Pass |
+| [Cohere embed multilingual light v3](https://huggingface.co/tokiers/Cohere-embed-multilingual-light-v3.0) | Unigram | Pass |
+| [Voyage 3](https://huggingface.co/tokiers/voyage-3) | BPE | Pass |
+| [Voyage 3 large](https://huggingface.co/tokiers/voyage-3-large) | BPE | Pass |
+| [Voyage 3 lite](https://huggingface.co/tokiers/voyage-3-lite) | BPE | Pass |
+| [Voyage 3.5](https://huggingface.co/tokiers/voyage-3.5) | BPE | Pass |
+| [Voyage 3.5 lite](https://huggingface.co/tokiers/voyage-3.5-lite) | BPE | Pass |
+| [Voyage Code 2](https://huggingface.co/tokiers/voyage-code-2) | BPE | Pass |
+| [Voyage Code 3](https://huggingface.co/tokiers/voyage-code-3) | BPE | Pass |
+| [Voyage Finance 2](https://huggingface.co/tokiers/voyage-finance-2) | BPE | Pass |
+| [Voyage Law 2](https://huggingface.co/tokiers/voyage-law-2) | BPE | Pass |
+| [Voyage Multilingual 2](https://huggingface.co/tokiers/voyage-multilingual-2) | BPE | Pass |
+| [Voyage Multimodal 3](https://huggingface.co/tokiers/voyage-multimodal-3) | BPE | Pass |
+| [Snowflake Arctic Embed v2](https://huggingface.co/tokiers/snowflake-arctic-embed-l-v2.0) | SentencePiece BPE | Pass |
+| [T5 base](https://huggingface.co/tokiers/t5-base) | Unigram | Pass |
+| [XLM-RoBERTa](https://huggingface.co/tokiers/xlm-roberta-base) | SentencePiece BPE | Pass |
 
 </details>
 
-**Summary**: 74 pass, 0 fail out of 74 tested. Every tokenizer produces identical output to HuggingFace.
+**74 pass, 0 fail, out of 74 tested.** Every tokenizer's ids match Hugging Face tokenizers.
 
 ## Why tokie?
 
-When I started building [Chonkie](https://github.com/chonkie-inc/chonkie), the biggest bottleneck wasn't chunking — it was tokenization. We were spending more time counting tokens than actually chunking text.
+When I started building [Chonkie](https://github.com/chonkie-inc/chonkie), tokenization took longer than chunking.
 
-tokie uses hand-written parsers for each pretokenization pattern — GPT-2, cl100k, o200k, BERT — that understand the exact character classes needed without the overhead of a general-purpose regex engine. Since 0.1.0 these run as a SIMD mask scanner: 64-byte blocks are classified into character-class bitmasks and piece boundaries fall out of bitwise algebra, pushing pretokenization past 1 GB/s per core — over 20x faster than running the reference regexes.
+Each pretokenization pattern has its own parser: GPT-2, cl100k, o200k, and BERT. The parser uses that pattern's character classes and does not run a general regex engine. Since 0.1.0 those parsers are a SIMD mask scanner. They classify 64-byte blocks into character-class bitmasks and take piece boundaries from the masks. Pretokenization passes 1 GB/s per core, more than 20 times the reference regexes.
 
-The second problem was that no single library could load everything. I actually tried to solve this before with [AutoTikTokenizer](https://github.com/bhavnick/autotiktokenizer), believing tiktoken's BPE engine could handle all of HuggingFace. I was wrong — you need fundamentally different algorithms for each encoder type: backtracking BPE for tiktoken-style models, heap-based BPE for models with non-topological merge orders, radix-heap BPE for SentencePiece, plus WordPiece and Unigram each with their own tricks.
+No single library loaded every Hugging Face tokenizer. I tried [AutoTikTokenizer](https://github.com/bhavnick/autotiktokenizer) and expected tiktoken's BPE to cover them. It does not. Tiktoken-style models need backtracking BPE. A merge order that is not topological needs a heap. SentencePiece needs a radix heap. WordPiece and Unigram each need their own encoder.
 
-The third insight was parallelism. Tokenization is embarrassingly parallel if you split text at the right boundaries. We use [chunk](https://github.com/chonkie-inc/chunk) to SIMD-split text into chunks that respect token boundaries, then encode each chunk on a separate core and concatenate. This gives near-linear scaling — about 5x on 8 cores.
+Tokenization runs in parallel when the split keeps token boundaries. [chunk](https://github.com/chonkie-inc/chunk) splits the text on those boundaries. Each core encodes one chunk, and the ids are concatenated. On 8 cores that is about 5 times faster.
 
-Finally, we built the `.tkz` format to eliminate load-time overhead. A `tokenizer.json` file has to be parsed, validated, and used to reconstruct all the internal data structures (including the Aho-Corasick automaton, which is expensive to build for large vocabularies). The `.tkz` format stores the pre-built DAAC automaton, vocabulary, configuration, and added tokens as a flat binary — loading is just deserialization, no construction required. Combined with offline-first hub resolution and a compiled on-disk cache, warm loads land in single-digit milliseconds: 2.8 ms for BERT, 6.2 ms for GPT-2, versus 120-310 ms for HuggingFace.
-
-The result is **tokie** — one tokenizer to rule them all.
+`.tkz` skips rebuilding those structures at load time. `tokenizer.json` is parsed and validated, and the Aho-Corasick automaton is built. That build is slow for a large vocabulary. `.tkz` stores the automaton, the vocabulary, the configuration, and the added tokens as a flat binary. Loading deserializes that file. With the hub cache and a compiled file on disk, a warm BERT load is 2.8 ms and a warm GPT-2 load is 6.2 ms. Hugging Face tokenizers takes 120 to 310 ms on those two models.
 
 ## Acknowledgements
 
-tokie builds on ideas from [HuggingFace tokenizers](https://github.com/huggingface/tokenizers), [tiktoken](https://github.com/openai/tiktoken), [GitHub's rust-gems](https://github.com/github/rust-gems) (backtracking BPE via Aho-Corasick), [chunk](https://github.com/chonkie-inc/chunk) (SIMD text splitting), and [gigatoken](https://github.com/marcelroed/gigatoken), whose pretoken-caching and mask-scanner pretokenization strategies — and relentless benchmarking — pushed the design of tokie's 0.1.0 hot path.
+tokie uses ideas from [Hugging Face tokenizers](https://github.com/huggingface/tokenizers), [tiktoken](https://github.com/openai/tiktoken), and [GitHub's rust-gems](https://github.com/github/rust-gems) for backtracking BPE via Aho-Corasick. It also uses [chunk](https://github.com/chonkie-inc/chunk) for SIMD text splitting, and [gigatoken](https://github.com/marcelroed/gigatoken). Gigatoken's piece cache, mask-scanner pretokenization, and benchmarks shaped the 0.1.0 hot path.
 
 ## Citation
 
@@ -351,7 +349,7 @@ If you use tokie in your research, please cite it as follows:
 ```bibtex
 @software{tokie2025,
   author = {Minhas, Bhavnick},
-  title = {tokie: Fast, correct tokenizer library for every HuggingFace model},
+  title = {tokie: Fast, correct tokenizer library for every Hugging Face model},
   year = {2025},
   publisher = {GitHub},
   howpublished = {\url{https://github.com/chonkie-inc/tokie}},

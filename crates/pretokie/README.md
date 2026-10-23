@@ -10,9 +10,9 @@
 [![License](https://img.shields.io/crates/l/pretokie)](LICENSE-MIT)
 [![GitHub Stars](https://img.shields.io/github/stars/chonkie-inc/tokie)](https://github.com/chonkie-inc/tokie)
 
-*Fast, zero-allocation pretokenizers for every major tokenizer — up to 3× Hugging Face tokenizers*
+*Fast, zero-allocation pretokenizers for the major tokenizers, up to 3 times Hugging Face tokenizers*
 
-[Quick Start](#quick-start) •
+[Quick start](#quick-start) •
 [Cuts](#cuts) •
 [Unknown patterns](#unknown-patterns) •
 [Benchmarks](#benchmarks)
@@ -23,7 +23,7 @@
 
 Part of the [tokie](https://github.com/chonkie-inc/tokie) tokenizer project. The patterns and the walker are written up in [docs/PATTERNS.md](docs/PATTERNS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-## Quick Start
+## Quick start
 
 ```toml
 [dependencies]

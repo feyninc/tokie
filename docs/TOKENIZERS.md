@@ -1,6 +1,8 @@
 # Supported Tokenizers
 
-This document lists tokenizers and their compatibility with tokie.
+This table is the previous tokie. The rewrite's open work is in [GOAL.md](GOAL.md). The statuses and timings below have not been re-run.
+
+This document lists tokenizers and their compatibility with that tokie.
 
 ## Status Key
 
