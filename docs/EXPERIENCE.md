@@ -78,7 +78,7 @@ let worker = tokenizer.fork();
 
 The pool stays on the tokenizer. The next `batch` reuses those caches.
 
-`fork` returns a tokenizer with the same tables and its own empty cache. The tables sit behind an `Arc`. Each tokenizer owns the cache the hit loop uses. `encode` loads the cut and the cache once per call. Two threads encode by owning one tokenizer each. A `Tokenizer` is `Send`.
+`fork` returns a tokenizer with the same tables and a copy of the loaded piece cache. A JSON open has an empty list, so that copy starts empty. Encode after the fork stays on that tokenizer. The tables sit behind an `Arc`. Each tokenizer owns the cache the hit loop uses. `encode` loads the cut and the cache once per call. Two threads encode by owning one tokenizer each. A `Tokenizer` is `Send`.
 
 `threads` sets the pool size. `1` runs `batch` on the calling thread, for a worker that already has a thread. The default is the machine's available parallelism.
 
@@ -111,13 +111,13 @@ The single-string encode path stays in place.
 - `decode`, `token`, and `id` read the load-time table.
 - `pretrained` downloads, then calls `json`.
 - `batch` calls `encode` on forked tokenizers.
-- `fork` shares the tables and allocates a new cache. The hit loop runs on the cache that tokenizer owns.
+- `fork` shares the tables and copies the loaded piece cache. The hit loop runs on the cache that tokenizer owns.
 
 The piece cache, the pretokie walk, and the merge loop stay as they are. Pretokie and normalie stay their own crates. Importing them is for work on those crates.
 
 ## Later
 
-These names stay free for the calls that come after this API. The open work, including `.tokie`, is listed in [GOAL.md](GOAL.md).
+These names stay free for the calls that come after this API. The open work is listed in [GOAL.md](GOAL.md).
 
 | Name | Job |
 | --- | --- |
@@ -125,6 +125,5 @@ These names stay free for the calls that come after this API. The open work, inc
 | `pad` | Pad a batch to a width |
 | `truncate` | Cut ids to a length |
 | `offsets` | Byte offsets for each id |
-| `save` | Write the `.tokie` file |
 
-The `.tokie` file uses `open` and `save`. The layout is in [FORMAT.md](FORMAT.md). It is not implemented yet.
+`open` reads a `.tokie` file or `tokenizer.json`. `save` writes the `.tokie` file. The layout is in [FORMAT.md](FORMAT.md).

@@ -22,6 +22,30 @@ impl Precompiled {
         })
     }
 
+    /// Trie words, replacement text, and the BMP table filled at parse time.
+    pub fn parts(&self) -> (&[u32], &str, &[(u32, u32)]) {
+        self.map.parts()
+    }
+
+    /// Build from a trie and a BMP table that load already checked.
+    ///
+    /// This fills the ASCII cache from the BMP rows. It does not walk every scalar.
+    pub fn from_parts(
+        trie: Vec<u32>,
+        replacements: String,
+        bmp: Vec<(u32, u32)>,
+    ) -> Result<Self, CharsmapError> {
+        Ok(Self {
+            map: Charsmap::from_parts(trie, replacements, bmp)?,
+        })
+    }
+
+    /// Rebuild from the original blob plus the BMP table stored beside it.
+    pub fn from_stored(blob: &[u8], bmp: Vec<(u32, u32)>) -> Result<Self, CharsmapError> {
+        let (trie, replacements) = Charsmap::split_blob(blob)?;
+        Self::from_parts(trie, replacements, bmp)
+    }
+
     pub fn write(&self, text: &str, at_start: bool, out: &mut String) -> bool {
         <Self as Formula>::drive(self, text, at_start, out)
     }

@@ -165,6 +165,9 @@ struct Tables {
     steps: Vec<Step>,
     raw_added: Needles,
     norm_added: Needles,
+    /// The strings `raw_added` was built from. `save` writes these, not the automaton.
+    raw_rows: Vec<(String, u32)>,
+    norm_rows: Vec<(String, u32)>,
     kind: Kind,
     /// Specials the single-sequence template adds around the encoded ids.
     post: Post,
@@ -222,26 +225,39 @@ pub struct Tokenizer {
     cut: Cut,
     prefix_space: bool,
     mark: bool,
+    /// SHA-256 of the `tokenizer.json` this file was built from. Zeros when that
+    /// source was not a json file.
+    sha: [u8; 32],
+    /// Piece list written by `save`. Encode updates `cache` and leaves this list.
+    piece_seed: Arc<Vec<(Vec<u8>, Vec<u32>)>>,
     tables: Arc<Tables>,
     threads: usize,
     pool: Pool,
 }
 
 impl Tokenizer {
-    /// Read a `tokenizer.json`.
+    /// Read a `.tokie` file or a `tokenizer.json`.
+    ///
+    /// A file that starts with `TOKI` and is not this format is refused.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        let text = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        Self::json(&text)
+        let bytes = fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+        Self::from_bytes(&bytes)
     }
 
     /// Parse a `tokenizer.json`.
     pub fn json(text: &str) -> Result<Self, Error> {
+        let mut tok = Self::parse_json(text)?;
+        tok.sha = crate::file::sha256(text.as_bytes());
+        Ok(tok)
+    }
+
+    fn parse_json(text: &str) -> Result<Self, Error> {
         let value: Value = serde_json::from_str(text).map_err(|err| format!("json: {err}"))?;
         let root = value.as_object().ok_or("tokenizer.json is not an object")?;
         let steps = norms_of(root.get("normalizer"))?;
         let (cut, prefix_space, mark) = cut_of(root.get("pre_tokenizer"))?;
-        let (raw_added, norm_added) = added_of(root.get("added_tokens"))?;
+        let (raw_added, norm_added, raw_rows, norm_rows) = added_of(root.get("added_tokens"))?;
         let post = post_of(root.get("post_processor"))?;
         let model = root.get("model").and_then(|v| v.as_object()).ok_or("missing model")?;
         let kind = kind_of(model)?;
@@ -252,10 +268,14 @@ impl Tokenizer {
             cut,
             prefix_space,
             mark,
+            sha: [0; 32],
+            piece_seed: Arc::new(Vec::new()),
             tables: Arc::new(Tables {
                 steps,
                 raw_added,
                 norm_added,
+                raw_rows,
+                norm_rows,
                 kind,
                 post,
                 vocab,
@@ -263,6 +283,176 @@ impl Tokenizer {
             threads: default_threads(),
             pool: Pool::new(),
         })
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() >= 8 && &bytes[..8] == b"TOKIE\x89\r\n" {
+            return from_image(crate::file::decode(bytes)?);
+        }
+        if bytes.len() >= 4 && &bytes[..4] == b"TOKI" {
+            return Err(Error::new("old .tkz files are not loaded"));
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| "tokenizer file is not utf-8")?;
+        Self::json(text)
+    }
+
+    /// Write this tokenizer as a `.tokie` file.
+    ///
+    /// The piece blob is the list this tokenizer was loaded or preloaded with.
+    /// Ids learned by `encode` stay in the cache and are not written.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        let bytes = crate::file::encode(&self.image())?;
+        let path = path.as_ref();
+        let mut tmp_name = path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        let tmp = Path::new(&tmp_name);
+        fs::write(tmp, &bytes).map_err(|err| format!("write {}: {err}", tmp.display()))?;
+        let file = fs::File::open(tmp).map_err(|err| format!("open {}: {err}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync {}: {err}", tmp.display()))?;
+        fs::rename(tmp, path).map_err(|err| format!("rename {}: {err}", path.display()))?;
+        Ok(())
+    }
+
+    /// Encode `piece` and keep the ids in the piece list `save` writes.
+    #[doc(hidden)]
+    pub fn preload_piece(&mut self, piece: &str) {
+        if piece.is_empty() {
+            return;
+        }
+        self.scratch.piece.clear();
+        if self.encode_piece(piece).is_err() {
+            return;
+        }
+        let encoded = std::mem::take(&mut self.scratch.piece);
+        self.cache.insert(piece.as_bytes(), &encoded);
+        Arc::make_mut(&mut self.piece_seed).push((piece.as_bytes().to_vec(), encoded));
+    }
+
+    fn image(&self) -> crate::file::Image {
+        use crate::file::{CharsmapRec, Image, Model, SlotRec, StepRec};
+        let tables = &self.tables;
+        let model;
+        let mut unk = 0u32;
+        let mut max_chars = 0u32;
+        let mut prefix = String::new();
+        let mut unk_score = 0.0;
+        let mut pairs = Vec::new();
+        let mut byte_ids = None;
+        let mut spm_bytes = None;
+        let mut spm_chars = Vec::new();
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut wp = Vec::new();
+        match &tables.kind {
+            Kind::Bpe {
+                byte_ids: ids,
+                pairs: map,
+            } => {
+                model = Model::Bpe;
+                byte_ids = Some(*ids);
+                pairs = map
+                    .iter()
+                    .map(|(&(left, right), pair)| (left, right, pair.rank, pair.id))
+                    .collect();
+            }
+            Kind::WordPiece {
+                vocab,
+                unk: unk_id,
+                prefix: pre,
+                max_chars: max,
+            } => {
+                model = Model::WordPiece;
+                unk = *unk_id;
+                max_chars = *max as u32;
+                prefix = pre.clone();
+                wp = vocab.iter().map(|(token, id)| (token.clone(), *id)).collect();
+            }
+            Kind::Unigram { lattice } => {
+                model = Model::Unigram;
+                unk = lattice.unk();
+                unk_score = lattice.unk_score();
+                nodes = lattice.nodes().collect();
+                edges = lattice.edges().collect();
+            }
+            Kind::Spm {
+                chars,
+                bytes,
+                pairs: map,
+            } => {
+                model = Model::Spm;
+                spm_bytes = Some(*bytes);
+                spm_chars = chars.iter().map(|(&ch, &id)| (ch as u32, id)).collect();
+                pairs = map
+                    .iter()
+                    .map(|(&(left, right), pair)| (left, right, pair.rank, pair.id))
+                    .collect();
+            }
+        }
+        let mut steps = Vec::new();
+        let mut literals = Vec::new();
+        let mut charsmaps = Vec::new();
+        for step in &tables.steps {
+            match step {
+                Step::Norm(norm) => steps.push(StepRec::Norm(*norm)),
+                Step::Compiled { map, blob } => {
+                    let index = u16::try_from(charsmaps.len()).expect("at most four charsmaps");
+                    let (_, _, bmp) = map.parts();
+                    charsmaps.push(CharsmapRec {
+                        blob: blob.clone(),
+                        bmp: bmp.to_vec(),
+                    });
+                    steps.push(StepRec::Compiled(index));
+                }
+                Step::Literal { from, to } => {
+                    let index = u16::try_from(literals.len()).expect("literal index fits u16");
+                    literals.push((from.clone(), to.clone()));
+                    steps.push(StepRec::Literal(index));
+                }
+            }
+        }
+        let vocab = &tables.vocab;
+        let mut slots = Vec::with_capacity(vocab.lead.len());
+        for i in 0..vocab.lead.len() {
+            slots.push(SlotRec {
+                lead_at: vocab.lead[i].at,
+                lead_len: vocab.lead[i].len,
+                next_at: vocab.next[i].at,
+                next_len: vocab.next[i].len,
+                token: vocab.tokens[i].clone(),
+                special: vocab.special[i],
+            });
+        }
+        Image {
+            sha: self.sha,
+            model,
+            cut: self.cut,
+            prefix_space: self.prefix_space,
+            mark: self.mark,
+            strip_space: vocab.strip_space,
+            unk,
+            max_chars,
+            vocab_len: slots.len() as u32,
+            prefix,
+            unk_score,
+            steps,
+            literals,
+            charsmaps,
+            arena: vocab.arena.clone(),
+            slots,
+            pairs,
+            byte_ids,
+            spm_bytes,
+            spm_chars,
+            nodes,
+            edges,
+            added_raw: tables.raw_rows.clone(),
+            added_norm: tables.norm_rows.clone(),
+            post_prefix: tables.post.prefix.clone(),
+            post_suffix: tables.post.suffix.clone(),
+            wp,
+            pieces: (*self.piece_seed).clone(),
+        }
     }
 
     /// Download `tokenizer.json` for a Hub repo and parse it.
@@ -361,14 +551,19 @@ impl Tokenizer {
         }
     }
 
-    /// A tokenizer with these tables and its own empty cache.
+    /// A tokenizer with these tables and a copy of the loaded piece cache.
+    ///
+    /// Ids learned after load stay on this tokenizer. The copy starts from the
+    /// piece list `save` writes.
     pub fn fork(&self) -> Self {
         Self {
-            cache: Cache::new(),
+            cache: self.cache.duplicate(),
             scratch: Scratch::new(),
             cut: self.cut,
             prefix_space: self.prefix_space,
             mark: self.mark,
+            sha: self.sha,
+            piece_seed: Arc::clone(&self.piece_seed),
             tables: Arc::clone(&self.tables),
             threads: 1,
             pool: Pool::new(),
@@ -481,7 +676,7 @@ impl Tokenizer {
             scratch.a.clear();
             let wrote = match step {
                 Step::Norm(norm) => norm.write(src, true, &mut scratch.a),
-                Step::Compiled(map) => map.write(src, true, &mut scratch.a),
+                Step::Compiled { map, .. } => map.write(src, true, &mut scratch.a),
                 Step::Literal { from, to } => literal_replace(src, from, to, &mut scratch.a),
             };
             if wrote {
@@ -1042,7 +1237,7 @@ fn push_norm(value: &Value, steps: &mut Vec<Step>) -> Result<(), String> {
             let bytes = decode_base64(blob)?;
             let map = normalie::Precompiled::parse(&bytes)
                 .map_err(|err| format!("precompiled charsmap: {err}"))?;
-            steps.push(Step::Compiled(map));
+            steps.push(Step::Compiled { map, blob: bytes });
         }
         "BertNormalizer" => {
             let lowercase = obj.get("lowercase").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1062,7 +1257,7 @@ fn push_norm(value: &Value, steps: &mut Vec<Step>) -> Result<(), String> {
 
 enum Step {
     Norm(Norm),
-    Compiled(normalie::Precompiled),
+    Compiled { map: normalie::Precompiled, blob: Vec<u8> },
     Literal { from: String, to: String },
 }
 
@@ -1276,12 +1471,189 @@ fn post_of(value: Option<&Value>) -> Result<Post, String> {
     Ok(Post { prefix, suffix })
 }
 
-fn added_of(value: Option<&Value>) -> Result<(Needles, Needles), String> {
+fn from_image(image: crate::file::Image) -> Result<Tokenizer, Error> {
+    use crate::file::{Model, StepRec};
+    let kind = match image.model {
+        Model::Bpe => Kind::Bpe {
+            byte_ids: image.byte_ids.ok_or("bpe file has no byte ids")?,
+            pairs: pair_map(&image.pairs),
+        },
+        Model::WordPiece => Kind::WordPiece {
+            vocab: string_map(&image.wp),
+            unk: image.unk,
+            prefix: image.prefix.clone(),
+            max_chars: image.max_chars as usize,
+        },
+        Model::Unigram => {
+            check_lattice(&image.nodes, &image.edges)?;
+            Kind::Unigram {
+                lattice: Lattice::from_parts(image.nodes.clone(), image.edges.clone(), image.unk, image.unk_score),
+            }
+        }
+        Model::Spm => Kind::Spm {
+            chars: char_map(&image.spm_chars)?,
+            bytes: image.spm_bytes.ok_or("sentencepiece file has no byte tokens")?,
+            pairs: pair_map(&image.pairs),
+        },
+    };
+    let mut steps = Vec::with_capacity(image.steps.len());
+    for step in &image.steps {
+        steps.push(match step {
+            StepRec::Norm(norm) => Step::Norm(*norm),
+            StepRec::Compiled(index) => {
+                let rec = image
+                    .charsmaps
+                    .get(*index as usize)
+                    .ok_or("compiled step has no charsmap")?;
+                let map = normalie::Precompiled::from_stored(&rec.blob, rec.bmp.clone())
+                    .map_err(|err| format!("precompiled charsmap: {err}"))?;
+                Step::Compiled {
+                    map,
+                    blob: rec.blob.clone(),
+                }
+            }
+            StepRec::Literal(index) => {
+                let (from, to) = image
+                    .literals
+                    .get(*index as usize)
+                    .ok_or("literal step has no replacement")?;
+                Step::Literal {
+                    from: from.clone(),
+                    to: to.clone(),
+                }
+            }
+        });
+    }
+    let vocab = vocab_from_slots(&image)?;
+    let raw_added = needles_of(image.added_raw.clone())?;
+    let norm_added = needles_of(image.added_norm.clone())?;
+    let mut cache = Cache::new();
+    for (piece, ids) in &image.pieces {
+        cache.insert(piece, ids);
+    }
+    Ok(Tokenizer {
+        cache,
+        scratch: Scratch::new(),
+        cut: image.cut,
+        prefix_space: image.prefix_space,
+        mark: image.mark,
+        sha: image.sha,
+        piece_seed: Arc::new(image.pieces),
+        tables: Arc::new(Tables {
+            steps,
+            raw_added,
+            norm_added,
+            raw_rows: image.added_raw,
+            norm_rows: image.added_norm,
+            kind,
+            post: Post {
+                prefix: image.post_prefix,
+                suffix: image.post_suffix,
+            },
+            vocab,
+        }),
+        threads: default_threads(),
+        pool: Pool::new(),
+    })
+}
+
+fn pair_map(pairs: &[(u32, u32, u32, u32)]) -> FxHashMap<(u32, u32), Pair> {
+    let mut map = FxHashMap::with_capacity_and_hasher(pairs.len(), Default::default());
+    for &(left, right, rank, id) in pairs {
+        map.insert((left, right), Pair { rank, id });
+    }
+    map
+}
+
+fn string_map(rows: &[(String, u32)]) -> FxHashMap<String, u32> {
+    let mut map = FxHashMap::with_capacity_and_hasher(rows.len(), Default::default());
+    for (token, id) in rows {
+        map.insert(token.clone(), *id);
+    }
+    map
+}
+
+fn char_map(rows: &[(u32, u32)]) -> Result<FxHashMap<char, u32>, String> {
+    let mut map = FxHashMap::default();
+    for &(scalar, id) in rows {
+        let ch = char::from_u32(scalar).ok_or("sentencepiece char is not a scalar")?;
+        map.insert(ch, id);
+    }
+    Ok(map)
+}
+
+fn check_lattice(nodes: &[(u32, u16, u32, f64)], edges: &[(u8, u32)]) -> Result<(), String> {
+    for &(edge_at, edge_n, _, _) in nodes {
+        let end = edge_at as usize + edge_n as usize;
+        if end > edges.len() {
+            return Err("unigram node edges run past the edge list".to_string());
+        }
+    }
+    for &(_, to) in edges {
+        if to as usize >= nodes.len() {
+            return Err("unigram edge leaves the lattice".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn vocab_from_slots(image: &crate::file::Image) -> Result<Vocab, String> {
+    if image.slots.len() != image.vocab_len as usize {
+        return Err("slot count does not match the vocab length".to_string());
+    }
+    let n = image.slots.len();
+    let mut vocab = Vocab {
+        arena: image.arena.clone(),
+        lead: Vec::with_capacity(n),
+        next: Vec::with_capacity(n),
+        tokens: Vec::with_capacity(n),
+        ids: FxHashMap::with_capacity_and_hasher(n, Default::default()),
+        special: Vec::with_capacity(n),
+        strip_space: image.strip_space,
+    };
+    for (id, slot) in image.slots.iter().enumerate() {
+        let lead = Slice {
+            at: slot.lead_at,
+            len: slot.lead_len,
+        };
+        let next = Slice {
+            at: slot.next_at,
+            len: slot.next_len,
+        };
+        check_slice(vocab.arena.len(), lead)?;
+        check_slice(vocab.arena.len(), next)?;
+        vocab.lead.push(lead);
+        vocab.next.push(next);
+        vocab.special.push(slot.special);
+        if let Some(token) = &slot.token {
+            vocab.ids.insert(token.clone(), id as u32);
+            vocab.tokens.push(Some(token.clone()));
+        } else {
+            vocab.tokens.push(None);
+        }
+    }
+    Ok(vocab)
+}
+
+fn check_slice(arena_len: usize, slice: Slice) -> Result<(), String> {
+    if slice.at == u32::MAX {
+        return Ok(());
+    }
+    let end = (slice.at as usize).saturating_add(slice.len as usize);
+    if end > arena_len {
+        return Err("decode slice runs past the arena".to_string());
+    }
+    Ok(())
+}
+
+fn added_of(
+    value: Option<&Value>,
+) -> Result<(Needles, Needles, Vec<(String, u32)>, Vec<(String, u32)>), String> {
     let Some(value) = value else {
-        return Ok((Needles::Empty, Needles::Empty));
+        return Ok((Needles::Empty, Needles::Empty, Vec::new(), Vec::new()));
     };
     if value.is_null() {
-        return Ok((Needles::Empty, Needles::Empty));
+        return Ok((Needles::Empty, Needles::Empty, Vec::new(), Vec::new()));
     }
     let list = value.as_array().ok_or("added_tokens is not a list")?;
     let mut raw = Vec::new();
@@ -1308,7 +1680,9 @@ fn added_of(value: Option<&Value>) -> Result<(Needles, Needles), String> {
             raw.push((content, id));
         }
     }
-    Ok((needles_of(raw)?, needles_of(norm)?))
+    let raw_rows = raw.clone();
+    let norm_rows = norm.clone();
+    Ok((needles_of(raw)?, needles_of(norm)?, raw_rows, norm_rows))
 }
 
 fn needles_of(tokens: Vec<(String, u32)>) -> Result<Needles, String> {

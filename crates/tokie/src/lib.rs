@@ -8,6 +8,7 @@ pub mod norm;
 pub mod unigram;
 pub mod wordpiece;
 
+mod file;
 mod prepare;
 mod tokenizer;
 

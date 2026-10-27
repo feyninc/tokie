@@ -162,6 +162,49 @@ impl Lattice {
         }
     }
 
+    pub(crate) fn unk(&self) -> u32 {
+        self.unk
+    }
+
+    pub(crate) fn unk_score(&self) -> f64 {
+        self.unk_score
+    }
+
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = (u32, u16, u32, f64)> + '_ {
+        self.nodes
+            .iter()
+            .map(|node| (node.edge_at, node.edge_n, node.id, node.score))
+    }
+
+    pub(crate) fn edges(&self) -> impl Iterator<Item = (u8, u32)> + '_ {
+        self.edges.iter().map(|edge| (edge.byte, edge.to))
+    }
+
+    pub(crate) fn from_parts(
+        nodes: Vec<(u32, u16, u32, f64)>,
+        edges: Vec<(u8, u32)>,
+        unk: u32,
+        unk_score: f64,
+    ) -> Self {
+        Self {
+            nodes: nodes
+                .into_iter()
+                .map(|(edge_at, edge_n, id, score)| Node {
+                    edge_at,
+                    edge_n,
+                    id,
+                    score,
+                })
+                .collect(),
+            edges: edges
+                .into_iter()
+                .map(|(byte, to)| Edge { byte, to })
+                .collect(),
+            unk,
+            unk_score,
+        }
+    }
+
     /// Append the ids for `text`.
     pub(crate) fn segment(&self, text: &[u8], out: &mut Vec<u32>) {
         let n = text.len();

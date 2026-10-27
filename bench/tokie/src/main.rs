@@ -21,6 +21,7 @@ fn main() {
     let mut only = None;
     let mut pieces = false;
     let mut skip_hf = false;
+    let mut load = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -42,8 +43,13 @@ fn main() {
             "--row" => only = Some(args.next().expect("--row needs a value")),
             "--pieces" => pieces = true,
             "--no-hf" => skip_hf = true,
+            "--load" => load = true,
             other => panic!("unknown argument: {other}"),
         }
+    }
+    if load {
+        time_loads(reps, only.as_deref(), skip_hf);
+        return;
     }
     let path = file.unwrap_or_else(|| DEFAULT_FILE.to_string());
     let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
@@ -399,6 +405,126 @@ fn load_giga(
             }
         }
     }
+}
+
+/// One warmup, then the median of `reps`. Times are milliseconds and include
+/// the read. The warmup leaves the file in the page cache.
+fn time_loads(reps: usize, only: Option<&str>, skip_hf: bool) {
+    println!("| row | tokie json ms | tokie .tokie ms | tokie 128MiB ms | gigatoken ms | hf ms |");
+    println!("| --- | ---: | ---: | ---: | ---: | ---: |");
+    for row in ROWS {
+        if only.is_some_and(|want| row.name != want) {
+            continue;
+        }
+        let Some(json) = tokie_bench::rows::model_path(row) else {
+            continue;
+        };
+        eprint!("{} ... ", row.name);
+        let json_ms = median_ms(reps, || {
+            let tok = tokie::Tokenizer::open(&json).expect("tokie json");
+            black_box(tok.token(0));
+        });
+        let saved = std::env::temp_dir().join(format!("tokie-load-{}.tokie", row.name));
+        tokie::Tokenizer::open(&json)
+            .expect("tokie json")
+            .save(&saved)
+            .expect("save .tokie");
+        let tokie_ms = median_ms(reps, || {
+            let tok = tokie::Tokenizer::open(&saved).expect("tokie file");
+            black_box(tok.token(0));
+        });
+        let piece_ms = if row.name == "gpt2" {
+            seed_gpt2(&json)
+        } else {
+            None
+        };
+        let piece_ms = piece_ms.map(|path| {
+            median_ms(reps, || {
+                let tok = tokie::Tokenizer::open(&path).expect("piece file");
+                black_box(tok.token(0));
+            })
+        });
+        let giga_ms = if load_giga(row.name, &json).is_some() {
+            Some(median_ms(reps, || {
+                black_box(load_giga(row.name, &json));
+            }))
+        } else {
+            None
+        };
+        let hf_ms = if skip_hf {
+            None
+        } else {
+            match hf::load(&json) {
+                Ok(_) => Some(median_ms(reps, || {
+                    let tok = hf::load(&json).expect("hf");
+                    black_box(tok);
+                })),
+                Err(err) => {
+                    eprintln!("tokenizers v1 refused {}: {err}", json.display());
+                    None
+                }
+            }
+        };
+        eprintln!("done");
+        println!(
+            "| {} | {:.1} | {:.1} | {} | {} | {} |",
+            row.name,
+            json_ms,
+            tokie_ms,
+            piece_ms.map(|ms| format!("{ms:.1}")).unwrap_or_default(),
+            giga_ms.map(|ms| format!("{ms:.1}")).unwrap_or_default(),
+            hf_ms.map(|ms| format!("{ms:.1}")).unwrap_or_default()
+        );
+    }
+}
+
+fn median_ms(reps: usize, mut load: impl FnMut()) -> f64 {
+    load();
+    let mut samples = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let start = Instant::now();
+        load();
+        samples.push(start.elapsed().as_secs_f64());
+    }
+    samples.sort_by(|left, right| left.partial_cmp(right).unwrap());
+    samples[samples.len() / 2] * 1_000.0
+}
+
+fn seed_gpt2(json: &std::path::Path) -> Option<std::path::PathBuf> {
+    let rank = std::path::Path::new("/home/bhavnick/.cache/tokie-fineweb/rank.bin");
+    if !rank.exists() {
+        return None;
+    }
+    eprintln!("seeding the 128 MiB gpt-2 piece list");
+    let bytes = std::fs::read(rank).expect("rank file");
+    if &bytes[..8] != b"FWPIECE1" {
+        return None;
+    }
+    let mut tok = tokie::Tokenizer::open(json).expect("gpt2");
+    let mut at = 8usize;
+    let mut cost = 0usize;
+    let budget = 128 * 1024 * 1024;
+    while at + 12 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
+        at += 12;
+        if at + len > bytes.len() {
+            break;
+        }
+        let piece = &bytes[at..at + len];
+        at += len;
+        let next = if piece.len() <= 15 { 32 } else { 32 + piece.len() };
+        if cost + next > budget {
+            break;
+        }
+        let Ok(piece) = std::str::from_utf8(piece) else {
+            continue;
+        };
+        cost += next;
+        tok.preload_piece(piece);
+    }
+    let path = std::env::temp_dir().join("tokie-load-gpt2-pieces.tokie");
+    tok.save(&path).expect("save piece file");
+    Some(path)
 }
 
 fn added_specials(path: &std::path::Path) -> Result<Vec<(String, u32)>, String> {

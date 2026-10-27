@@ -92,6 +92,26 @@ impl Cache {
         self.crc
     }
 
+    /// A second cache with the same entries. `fork` uses this for a loaded piece list.
+    pub(crate) fn duplicate(&self) -> Self {
+        let table = Table::new(self.table.cap);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.table.ptr.as_ptr(),
+                table.ptr.as_ptr(),
+                self.table.cap,
+            );
+        }
+        Self {
+            table,
+            mask: self.mask,
+            len: self.len,
+            crc: self.crc,
+            arena: self.arena.clone(),
+            long: self.long.clone(),
+        }
+    }
+
     /// `(filled slots, capacity, table address)`.
     pub fn occupancy(&self) -> (usize, usize, usize) {
         (self.len, self.table.cap, self.table.ptr.as_ptr() as usize)
