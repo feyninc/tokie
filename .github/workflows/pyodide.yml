@@ -95,16 +95,11 @@ jobs:
 
           # Verify module exports
           assert hasattr(tokie, 'Tokenizer'), 'Missing Tokenizer class'
-          assert hasattr(tokie, 'Encoding'), 'Missing Encoding class'
           assert hasattr(tokie, 'TokieError'), 'Missing TokieError exception'
 
-          # Verify Tokenizer methods are present
           t = tokie.Tokenizer
-          for method in ['from_json', 'from_file', 'encode', 'decode', 'encode_batch', 'decode_batch', 'count_tokens']:
+          for method in ['open', 'json', 'pretrained', 'encode', 'wrap', 'decode', 'batch', 'save', 'token', 'id', 'threads']:
               assert hasattr(t, method), f'Missing method: {method}'
-
-          # Verify from_pretrained is NOT available (hf feature disabled)
-          assert not hasattr(t, 'from_pretrained'), 'from_pretrained should be absent in wasm build'
 
           print('All Pyodide compatibility checks passed!')
           "

@@ -14,7 +14,7 @@ License is MIT OR Apache-2.0.
 | `crates/tokie-python` | `tokie-python` | PyO3 bindings. The Python module name is `tokie`. |
 | `crates/tokie-cli` | `tokie-cli` | `tokie` binary for building, verifying, and uploading tokenizers. |
 
-The workspace members are `crates/normalie`, `crates/pretokie`, and `crates/tokie`. `tokie-python` and `tokie-cli` stay in the tree and are not members until they are rewritten onto this tokie.
+The workspace members are `crates/normalie`, `crates/pretokie`, `crates/tokie`, `crates/tokie-cli`, and `crates/tokie-python`.
 
 ## Pretokie on this branch
 
