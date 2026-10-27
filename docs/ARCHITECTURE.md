@@ -44,7 +44,7 @@ crates/tokie/src/tokenizer.rs  load tokenizer.json and encode
 bench/tokie/                     tokenizers v1 oracle and the speed table
 ```
 
-`open` and `json` read `tokenizer.json`. `pretrained` reads the same file from the Hub cache. Load picks the cut and the normalizer, and builds the BPE pair table, the WordPiece vocab, or the Unigram lattice, plus the id-to-bytes table `decode` reads. Byte-level BPE, WordPiece, Unigram, and unaffixed SentencePiece BPE encode and decode. Affixed SentencePiece BPE is refused.
+`open` and `json` read `tokenizer.json`. `pretrained` reads the repo's `.tokie` file from the Hub, whatever its name. A repo with no `.tokie` file uses `tokenizer.json`. Load picks the cut and the normalizer, and builds the BPE pair table, the WordPiece vocab, or the Unigram lattice, plus the id-to-bytes table `decode` reads. Byte-level BPE, WordPiece, Unigram, and unaffixed SentencePiece BPE encode and decode. Affixed SentencePiece BPE is refused.
 
 ## Other crates
 

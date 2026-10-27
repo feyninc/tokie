@@ -2,7 +2,7 @@
 
 import tokie
 
-tokenizer = tokie.Tokenizer.pretrained("openai-community/gpt2")
+tokenizer = tokie.Tokenizer.from_pretrained("openai-community/gpt2")
 plain = tokenizer.encode("Hello world")
 wrapped = tokenizer.wrap("Hello world")
 print(plain.tolist())

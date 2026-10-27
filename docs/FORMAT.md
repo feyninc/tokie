@@ -25,7 +25,7 @@ again.encode("Hello world", &mut ids)?;
 
 `save` writes a temporary file in the destination directory, syncs it, and replaces the destination. On Linux that replace is `rename`. A crash before the replace leaves the previous file in place.
 
-`save` writes the piece list the tokenizer was given. A tokenizer opened from JSON has none, so its `save` omits the blob. An encode that ran first does not change the bytes on disk. `fork` shares the tables and copies the loaded piece list. Each tokenizer then updates its own copy. `pretrained` still downloads `tokenizer.json`. It does not look for a `.tokie` file on the Hub.
+`save` writes the piece list the tokenizer was given. A tokenizer opened from JSON has none, so its `save` omits the blob. An encode that ran first does not change the bytes on disk. `fork` shares the tables and copies the loaded piece list. Each tokenizer then updates its own copy. `pretrained` downloads the repo's `.tokie` file, whatever its name. A repo with no `.tokie` file is loaded from `tokenizer.json`.
 
 The public surface is `Tokenizer::open` and `Tokenizer::save`. Wire types stay in a private module. The crate root still exports `Tokenizer`, `Error`, and `Specials`.
 

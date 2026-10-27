@@ -98,7 +98,7 @@ jobs:
           assert hasattr(tokie, 'TokieError'), 'Missing TokieError exception'
 
           t = tokie.Tokenizer
-          for method in ['open', 'json', 'pretrained', 'encode', 'wrap', 'decode', 'batch', 'save', 'token', 'id', 'threads']:
+          for method in ['open', 'json', 'from_pretrained', 'encode', 'wrap', 'decode', 'batch', 'save', 'token', 'id', 'threads']:
               assert hasattr(t, method), f'Missing method: {method}'
 
           print('All Pyodide compatibility checks passed!')
