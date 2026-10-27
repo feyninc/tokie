@@ -29,7 +29,7 @@ tokenizer.decode(&ids, &mut text, Specials::Keep)?;
 | --- | --- |
 | `open` | A path. The file is `tokenizer.json`. |
 | `json` | The text of a `tokenizer.json`. |
-| `pretrained` | A Hub repo id, such as `"gpt2"`. The file is cached on disk, then parsed by `json`. |
+| `pretrained` | A Hub repo id, such as `"gpt2"`. The repo's `.tokie` file, whatever its name. A repo with no `.tokie` file uses `tokenizer.json`. The file stays in the Hub cache. |
 
 `open` and `json` return `Error` when the pattern or the normalizer is one this crate refuses. `pretrained` also returns `Error` when the repo cannot be fetched. `Error` implements `Display` and `std::error::Error`. The variants stay private.
 
@@ -109,7 +109,7 @@ The single-string encode path stays in place.
 
 - `wrap` calls `encode`, then splices the template.
 - `decode`, `token`, and `id` read the load-time table.
-- `pretrained` downloads, then calls `json`.
+- `pretrained` downloads the repo's `.tokie` file. A repo with no `.tokie` file uses `tokenizer.json`.
 - `batch` calls `encode` on forked tokenizers.
 - `fork` shares the tables and copies the loaded piece cache. The hit loop runs on the cache that tokenizer owns.
 

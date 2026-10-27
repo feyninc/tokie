@@ -455,17 +455,40 @@ impl Tokenizer {
         }
     }
 
-    /// Download `tokenizer.json` for a Hub repo and parse it.
+    /// Download a tokenizer for a Hub repo.
     ///
-    /// The file stays in the Hub cache. A later call with the same repo reads that copy.
+    /// The repo's `.tokie` file is opened, whatever its name. A repo with no
+    /// `.tokie` file is parsed from `tokenizer.json`. The file stays in the Hub
+    /// cache. A later call with the same repo reads that copy.
     pub fn pretrained(repo: &str) -> Result<Self, Error> {
         let api = hf_hub::api::sync::Api::new().map_err(|err| Error::new(format!("hub: {err}")))?;
-        let path = api
-            .model(repo.to_string())
-            .get("tokenizer.json")
-            .map_err(|err| Error::new(format!("hub: {err}")))?;
-        let text = fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        Self::json(&text)
+        let model = api.model(repo.to_string());
+        let info = model.info().map_err(|err| Error::new(format!("hub: {err}")))?;
+        let mut tokie_files: Vec<&str> = info
+            .siblings
+            .iter()
+            .map(|file| file.rfilename.as_str())
+            .filter(|name| name.ends_with(".tokie"))
+            .collect();
+        tokie_files.sort_unstable();
+        match tokie_files.as_slice() {
+            [name] => {
+                let path = model.get(name).map_err(|err| Error::new(format!("hub: {err}")))?;
+                Self::open(path)
+            }
+            [] => {
+                let path = model
+                    .get("tokenizer.json")
+                    .map_err(|err| Error::new(format!("hub: {err}")))?;
+                let text = fs::read_to_string(&path)
+                    .map_err(|err| format!("read {}: {err}", path.display()))?;
+                Self::json(&text)
+            }
+            names => Err(Error::new(format!(
+                "hub: {repo} has several .tokie files: {}",
+                names.join(", ")
+            ))),
+        }
     }
 
     /// `(filled slots, capacity, table address)` after the encodes so far.

@@ -56,9 +56,9 @@ impl PyTokenizer {
         Ok(fresh(inner))
     }
 
-    /// Download `tokenizer.json` for a Hub repo and parse it.
+    /// Download the repo's `.tokie` file, or `tokenizer.json` when the repo has none.
     #[staticmethod]
-    fn pretrained(py: Python<'_>, repo: &str) -> PyResult<Self> {
+    fn from_pretrained(py: Python<'_>, repo: &str) -> PyResult<Self> {
         let repo = repo.to_string();
         let inner = py.detach(|| Tokenizer::pretrained(&repo).map_err(to_py_err))?;
         Ok(fresh(inner))
