@@ -117,7 +117,7 @@ The piece cache, the pretokie walk, and the merge loop stay as they are. Pretoki
 
 ## Later
 
-These names stay free for the calls that come after this API. The open work, including the fast file, is listed in [GOAL.md](GOAL.md).
+These names stay free for the calls that come after this API. The open work, including `.tokie`, is listed in [GOAL.md](GOAL.md).
 
 | Name | Job |
 | --- | --- |
@@ -125,6 +125,6 @@ These names stay free for the calls that come after this API. The open work, inc
 | `pad` | Pad a batch to a width |
 | `truncate` | Cut ids to a length |
 | `offsets` | Byte offsets for each id |
-| `save` | Write the fast file |
+| `save` | Write the `.tokie` file |
 
-The fast file will use `open` and `save`. Its layout is a separate decision.
+The `.tokie` file uses `open` and `save`. The layout is in [FORMAT.md](FORMAT.md). It is not implemented yet.
