@@ -97,9 +97,7 @@ impl VocabDecoder {
         }
 
         // Use parallel decoding for large sequences
-        let num_cpus = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
+        let num_cpus = crate::tokenizer::num_cpus();
 
         if tokens.len() >= Self::PARALLEL_THRESHOLD && num_cpus > 1 {
             self.decode_parallel(tokens, num_cpus)
@@ -127,45 +125,33 @@ impl VocabDecoder {
     /// Parallel decode for large token sequences.
     /// Each thread decodes its chunk, then results are concatenated.
     fn decode_parallel(&self, tokens: &[TokenId], num_threads: usize) -> Vec<u8> {
-        use std::thread;
+        use rayon::prelude::*;
 
         // Split tokens into chunks
         let chunk_size = (tokens.len() + num_threads - 1) / num_threads;
         let chunks: Vec<&[TokenId]> = tokens.chunks(chunk_size).collect();
 
-        // Decode chunks in parallel, each thread returns its own Vec
-        let results: Vec<Vec<u8>> = thread::scope(|s| {
-            let handles: Vec<_> = chunks
-                .into_iter()
-                .map(|chunk| {
-                    let data = &self.data;
-                    let offsets = &self.offsets;
-
-                    s.spawn(move || {
-                        // Compute chunk size
-                        let size: usize = chunk
-                            .iter()
-                            .map(|&t| {
-                                let idx = t as usize;
-                                (offsets[idx + 1] - offsets[idx]) as usize
-                            })
-                            .sum();
-
-                        // Decode chunk
-                        let mut result = Vec::with_capacity(size);
-                        for &token in chunk {
-                            let t = token as usize;
-                            let start = offsets[t] as usize;
-                            let end = offsets[t + 1] as usize;
-                            result.extend_from_slice(&data[start..end]);
-                        }
-                        result
+        // Decode chunks in parallel on tokie's pool, each returning its own Vec
+        let (data, offsets) = (&self.data, &self.offsets);
+        let results: Vec<Vec<u8>> = crate::tokenizer::pool().install(|| chunks
+            .into_par_iter()
+            .with_max_len(1)
+            .map(|chunk| {
+                let size: usize = chunk
+                    .iter()
+                    .map(|&t| {
+                        let idx = t as usize;
+                        (offsets[idx + 1] - offsets[idx]) as usize
                     })
-                })
-                .collect();
-
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+                    .sum();
+                let mut result = Vec::with_capacity(size);
+                for &token in chunk {
+                    let t = token as usize;
+                    result.extend_from_slice(&data[offsets[t] as usize..offsets[t + 1] as usize]);
+                }
+                result
+            })
+            .collect());
 
         // Concatenate results
         let total_size: usize = results.iter().map(|v| v.len()).sum();

@@ -2014,6 +2014,7 @@ dependencies = [
  "libc",
  "memchr",
  "pretokie",
+ "rayon",
  "serde",
  "serde_json",
  "smallvec",

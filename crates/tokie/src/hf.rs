@@ -1167,18 +1167,13 @@ fn load_wordpiece(
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
 
-    // Build token bytes from vocab (tokens are UTF-8 strings)
-    let token_bytes: Vec<Vec<u8>> = vocab
-        .iter()
-        .map(|(s, _)| s.as_bytes().to_vec())
-        .collect();
+    // Token bytes by id (tokens are UTF-8 strings); an id the vocab skips
+    // stays empty rather than shifting the ids after it.
+    let by_id: Vec<(u32, Vec<u8>)> = vocab.iter().map(|(s, id)| (*id, s.as_bytes().to_vec())).collect();
+    let token_bytes = crate::encoder::bytes_by_id(&by_id);
 
     // Build vocab pairs for WordPieceEncoder
-    let vocab_pairs: Vec<(Vec<u8>, u32)> = token_bytes
-        .iter()
-        .enumerate()
-        .map(|(i, bytes)| (bytes.clone(), i as u32))
-        .collect();
+    let vocab_pairs: Vec<(Vec<u8>, u32)> = by_id.into_iter().map(|(id, bytes)| (bytes, id)).collect();
 
     // Create WordPiece encoder
     let encoder = WordPieceEncoder::from_vocab(

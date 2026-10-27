@@ -95,7 +95,8 @@ impl WordPieceEncoder {
             matcher,
             unk_token,
             continuation_prefix: continuation_prefix.to_vec(),
-            vocab_size: vocab.len(),
+            // Ids, not entries: a vocab may skip ids.
+            vocab_size: vocab.iter().map(|&(_, id)| id as usize + 1).max().unwrap_or(0),
             byte_lut,
             token_cache,
             max_input_chars_per_word,

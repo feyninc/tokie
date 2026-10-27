@@ -381,3 +381,35 @@ def test_encoding_tokens_and_masks_correct():
     for e in batch:
         assert e.tokens == [t.id_to_token(i) for i in e.ids]
         assert all(m == 0 for m in e.special_tokens_mask)
+
+
+def test_concurrent_encode_and_config_changes_do_not_deadlock():
+    # A setter used to wait for the write lock holding the GIL while a
+    # detached encode needed the GIL back to drop its read lock.
+    import threading
+    import time
+
+    t = tokie.Tokenizer.from_pretrained("bert-base-uncased")
+    text = "hello world " * 2000
+    stop = time.time() + 2.0
+
+    def encode():
+        while time.time() < stop:
+            t.encode(text)
+            t.encode_batch([text[:200]] * 8)
+
+    def toggle():
+        while time.time() < stop:
+            t.enable_padding(length=16)
+            t.enable_truncation(128)
+            assert t.padding is not None and t.vocab_size == 30522
+            t.no_padding()
+            t.no_truncation()
+
+    threads = [threading.Thread(target=encode, daemon=True) for _ in range(3)]
+    threads.append(threading.Thread(target=toggle, daemon=True))
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=30)
+    assert not any(th.is_alive() for th in threads), "deadlocked"

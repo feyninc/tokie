@@ -1,3 +1,15 @@
 [workspace]
 members = ["crates/*"]
 resolver = "2"
+
+# One optimization unit across crates: the hot loops call from tokie into
+# pretokie, and tokbench already builds tokie this way, so benches here match
+# it. `panic` stays `unwind`: PyO3 turns panics into Python exceptions.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+# `release` with line tables, for samply and other profilers.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

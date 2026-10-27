@@ -22,7 +22,7 @@ use std::collections::BinaryHeap;
 use foldhash::HashMap as FoldHashMap;
 use smallvec::SmallVec;
 
-use super::backtracking::{cache_seeds, key_words_within, CacheSeed, PretokenCache, WholeTable};
+use super::backtracking::{cache_seeds, key_words_within, CacheSeed, LazyWholeTable, PretokenCache};
 use super::fold::{self, CharFold, FoldStats};
 use crate::types::TokenId;
 
@@ -214,7 +214,7 @@ pub struct BytePairEncoder {
     seeds: OnceLock<Box<[CacheSeed]>>,
 
     /// [`WholeTable`] of `token_cache`, built on first use.
-    whole: OnceLock<WholeTable>,
+    whole: LazyWholeTable,
 
     /// `pair_lookup` flattened for the merge loop (plus the character fold).
     /// `None` for vocabularies too wide to pack (reference loop).
@@ -320,7 +320,7 @@ impl BytePairEncoder {
         num_base_tokens: usize,
         ignore_merges: bool,
     ) -> (Self, Vec<Vec<u8>>) {
-        let token_bytes: Vec<Vec<u8>> = vocab.iter().map(|(_, bytes)| bytes.clone()).collect();
+        let token_bytes = super::bytes_by_id(vocab);
 
         // Build byte -> token mapping by scanning ALL tokens.
         // For SentencePiece models, byte tokens (<0x00>, etc.) can be scattered
@@ -358,11 +358,13 @@ impl BytePairEncoder {
         // Build token_cache for early exit (foldhash for speed)
         let mut token_cache = FoldHashMap::default();
         for (token_id, bytes) in token_bytes.iter().enumerate() {
-            token_cache.insert(bytes.clone(), token_id as TokenId);
+            if !bytes.is_empty() {
+                token_cache.insert(bytes.clone(), token_id as TokenId);
+            }
         }
 
         let encoder =
-            Self::with_cache(pair_lookup, byte_lut, token_cache, ignore_merges, vocab.len(), num_base_tokens, Some(&token_bytes));
+            Self::with_cache(pair_lookup, byte_lut, token_cache, ignore_merges, token_bytes.len(), num_base_tokens, Some(&token_bytes));
 
         (encoder, token_bytes)
     }
@@ -391,7 +393,7 @@ impl BytePairEncoder {
             token_cache,
             ignore_merges,
             seeds: OnceLock::new(),
-            whole: OnceLock::new(),
+            whole: LazyWholeTable::new(),
             vocab_size,
             num_base_tokens,
         };
@@ -555,7 +557,7 @@ impl BytePairEncoder {
         // 2..=15-byte piece (1-byte pieces never get here) the flat table
         // answers the same question.
         debug_assert!(text.len() >= 2);
-        if let Some(t) = self.whole.get_or_init(|| WholeTable::build(&self.token_cache)).get(lo, hi) {
+        if let Some(t) = self.whole.get(&self.token_cache, text, lo, hi, &mut cache.whole_misses) {
             cache.insert_with_key(lo, hi, &[t]);
             return out.push(t);
         }

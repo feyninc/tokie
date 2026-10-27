@@ -43,6 +43,15 @@ impl WorkerCaches {
         }
     }
 
+    /// Caches for one call only (the pool's fallback when every slot is
+    /// busy). Never seeded: the seed (~1 ms, 8 MiB) only pays off across
+    /// calls.
+    pub(crate) fn private() -> Self {
+        let mut c = Self::new();
+        c.pretok.never_seed();
+        c
+    }
+
     pub fn clear(&mut self) {
         self.pretok.clear();
         self.unigram.clear();
@@ -310,3 +319,16 @@ impl Iterator for EncoderIter<'_> {
 }
 
 impl std::iter::FusedIterator for EncoderIter<'_> {}
+
+/// Token bytes indexed by id. An id the vocabulary skips (cl100k has no
+/// 100256, o200k no 199998) gets an empty entry, so a token's position is
+/// always its id: the builders index decoder tables, byte maps and caches by
+/// position, and a compacted list shifted every token after a gap.
+pub(crate) fn bytes_by_id(vocab: &[(u32, Vec<u8>)]) -> Vec<Vec<u8>> {
+    let n = vocab.iter().map(|&(id, _)| id as usize + 1).max().unwrap_or(0);
+    let mut out = vec![Vec::new(); n];
+    for (id, bytes) in vocab {
+        out[*id as usize] = bytes.clone();
+    }
+    out
+}

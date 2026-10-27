@@ -111,7 +111,7 @@ impl CacheLease {
             guard.last_used = now;
             return Self { guard: Some(guard), private: None };
         }
-        Self { guard: None, private: Some(WorkerCaches::new()) }
+        Self { guard: None, private: Some(WorkerCaches::private()) }
     }
 
     #[inline]
@@ -140,6 +140,16 @@ mod tests {
         let mut lease = CacheLease::checkout_in(slots, generation);
         let mut out = Vec::new();
         lease.caches().pretok.get(piece, &mut out).then(|| out[0])
+    }
+
+    #[test]
+    fn busy_pool_falls_back_to_unseeded_private_caches() {
+        let slots = pool(1);
+        let mut held = CacheLease::checkout_in(slots, 1);
+        assert!(held.caches().pretok.wants_seed());
+        let mut fallback = CacheLease::checkout_in(slots, 1);
+        assert!(fallback.guard.is_none());
+        assert!(!fallback.caches().pretok.wants_seed());
     }
 
     #[test]

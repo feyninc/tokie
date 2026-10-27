@@ -7,7 +7,6 @@
 
 use daggrs::{DoubleArrayAhoCorasick, MatchKind, Trie};
 use foldhash::HashMap as FoldHashMap;
-use chunk::chunk;
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -15,9 +14,6 @@ use std::thread;
 
 use super::simple::MergeCore;
 use crate::types::{Split, TokenId};
-
-/// Minimum text size to use parallel processing (10KB).
-const PARALLEL_THRESHOLD: usize = 10_000;
 
 /// Maximum token length to cache for early exit lookup.
 const MAX_CACHED_TOKEN_LEN: usize = 16;
@@ -184,20 +180,6 @@ impl RankPairTable {
     }
 }
 
-/// Split text into chunks at boundary characters (space/newline).
-#[inline]
-fn split_at_boundaries(text: &[u8]) -> Vec<&[u8]> {
-    let num_cpus = thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1);
-    let target_size = text.len() / num_cpus;
-    chunk(text)
-        .size(target_size)
-        .delimiters(b" \n")
-        .prefix()
-        .collect()
-}
-
 /// Streaming iterator over encoded tokens.
 ///
 /// Created by [`BacktrackingBytePairEncoder::encode_iter`]. Uses a small buffer (8 tokens)
@@ -328,7 +310,7 @@ pub struct BacktrackingBytePairEncoder {
     /// [`PretokenCache::seed`] entries, built on first use.
     seeds: OnceLock<Box<[CacheSeed]>>,
     /// [`WholeTable`] of `token_cache`, built on first use.
-    whole: OnceLock<WholeTable>,
+    whole: LazyWholeTable,
 }
 
 /// Vocab size up to which the merge core beats the DAAC walk at every
@@ -380,7 +362,7 @@ impl BacktrackingBytePairEncoder {
         merges: &[(TokenId, TokenId)],
         num_base_tokens: usize,
     ) -> (Self, Vec<Vec<u8>>) {
-        let token_bytes: Vec<Vec<u8>> = vocab.iter().map(|(_, bytes)| bytes.clone()).collect();
+        let token_bytes = super::bytes_by_id(vocab);
 
         let bytes_to_id: FoldHashMap<Vec<u8>, TokenId> = vocab
             .iter()
@@ -400,15 +382,12 @@ impl BacktrackingBytePairEncoder {
             }
         }
 
-        let mut split_table: Vec<Split> = Vec::with_capacity(vocab.len());
-        for (id, _) in vocab.iter() {
-            let id = *id as TokenId;
-            if let Some(&(left, right)) = merge_creates.get(&id) {
-                split_table.push(Split::merge(left, right));
-            } else {
-                split_table.push(Split::base(id));
-            }
-        }
+        let split_table: Vec<Split> = (0..token_bytes.len() as TokenId)
+            .map(|id| match merge_creates.get(&id) {
+                Some(&(left, right)) => Split::merge(left, right),
+                None => Split::base(id),
+            })
+            .collect();
 
         let (matcher, next_prefix_match) = Self::build_matcher_and_prefixes(&token_bytes);
         let token_lengths = Self::build_token_lengths(&token_bytes);
@@ -416,7 +395,7 @@ impl BacktrackingBytePairEncoder {
         // Build token_cache for early exit
         let mut token_cache = FoldHashMap::default();
         for (token_id, bytes) in token_bytes.iter().enumerate() {
-            if bytes.len() <= MAX_CACHED_TOKEN_LEN {
+            if !bytes.is_empty() && bytes.len() <= MAX_CACHED_TOKEN_LEN {
                 token_cache.insert(bytes.clone(), token_id as TokenId);
             }
         }
@@ -437,7 +416,7 @@ impl BacktrackingBytePairEncoder {
             core_max_len,
             byte_tok: [TokenId::MAX; 256],
             seeds: OnceLock::new(),
-            whole: OnceLock::new(),
+            whole: LazyWholeTable::new(),
         }
         .with_byte_tokens();
 
@@ -498,7 +477,7 @@ impl BacktrackingBytePairEncoder {
         // Build token_cache for early exit
         let mut token_cache = FoldHashMap::default();
         for (token_id, bytes) in token_bytes.iter().enumerate() {
-            if bytes.len() <= MAX_CACHED_TOKEN_LEN {
+            if !bytes.is_empty() && bytes.len() <= MAX_CACHED_TOKEN_LEN {
                 token_cache.insert(bytes.clone(), token_id as TokenId);
             }
         }
@@ -519,7 +498,7 @@ impl BacktrackingBytePairEncoder {
             core_max_len,
             byte_tok: [TokenId::MAX; 256],
             seeds: OnceLock::new(),
-            whole: OnceLock::new(),
+            whole: LazyWholeTable::new(),
         }
         .with_byte_tokens();
 
@@ -560,7 +539,7 @@ impl BacktrackingBytePairEncoder {
             core_max_len,
             byte_tok: [TokenId::MAX; 256],
             seeds: OnceLock::new(),
-            whole: OnceLock::new(),
+            whole: LazyWholeTable::new(),
         }
         .with_byte_tokens()
     }
@@ -589,7 +568,10 @@ impl BacktrackingBytePairEncoder {
     fn build_matcher_and_prefixes(token_bytes: &[Vec<u8>]) -> (DoubleArrayAhoCorasick, Vec<TokenId>) {
         let mut trie = Trie::new();
         for (id, bytes) in token_bytes.iter().enumerate() {
-            trie.add(bytes, id as TokenId);
+            // An empty entry is an id the vocab skips: never a match.
+            if !bytes.is_empty() {
+                trie.add(bytes, id as TokenId);
+            }
         }
         trie.build(MatchKind::LeftmostLongest);
         let matcher = trie.compile();
@@ -745,7 +727,7 @@ impl BacktrackingBytePairEncoder {
     fn encode_cache_miss(&self, text: &[u8], lo: u64, hi: u64, cache: &mut PretokenCache, out: &mut Vec<TokenId>) {
         debug_assert!(text.len() <= CACHE_KEY_MAX);
         let whole = if text.len() >= 2 {
-            self.whole.get_or_init(|| WholeTable::build(&self.token_cache)).get(lo, hi)
+            self.whole.get(&self.token_cache, text, lo, hi, &mut cache.whole_misses)
         } else {
             self.token_cache.get(text).copied()
         };
@@ -807,11 +789,8 @@ impl BacktrackingBytePairEncoder {
         if text.len() <= CACHE_KEY_MAX {
             return self.encode_short(text, out);
         }
-        if text.len() >= PARALLEL_THRESHOLD {
-            // Degenerate giant piece: fall back to the chunk-parallel path
-            out.extend(self.encode(text));
-            return;
-        }
+        // A giant piece (a long run of spaces, say) is encoded whole, like
+        // any other: cutting it into chunks would change its tokens.
         match &self.merge_core {
             Some(core) if text.len() <= self.core_max_len => core.encode(text, out),
             _ => self.encode_sequential_into(text, out),
@@ -941,31 +920,9 @@ impl BacktrackingBytePairEncoder {
             }
         }
 
-        if text.len() < PARALLEL_THRESHOLD {
-            return self.encode_sequential(text);
-        }
-
-        let chunks = split_at_boundaries(text);
-
-        if chunks.len() == 1 {
-            return self.encode_sequential(chunks[0]);
-        }
-
-        let results: Vec<Vec<TokenId>> = thread::scope(|s| {
-            let handles: Vec<_> = chunks
-                .iter()
-                .map(|chunk| s.spawn(|| self.encode_sequential(chunk)))
-                .collect();
-
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        let total: usize = results.iter().map(|v| v.len()).sum();
-        let mut output = Vec::with_capacity(total);
-        for chunk in results {
-            output.extend(chunk);
-        }
-        output
+        // Encoded whole: BPE merges cross any boundary a chunked encode
+        // would cut at, so chunks would change the tokens.
+        self.encode_sequential(text)
     }
 
     /// Returns a streaming iterator over encoded tokens.
@@ -1137,6 +1094,12 @@ pub struct PretokenCache {
     dirty: bool,
     /// [`Self::seed`] ran since the last [`Self::clear`].
     seeded: bool,
+    /// Unset by [`Self::never_seed`] for a one-call cache, which would pay
+    /// the seed and drop it. Survives [`Self::clear`].
+    seedable: bool,
+    /// Misses this cache asked of an encoder's not-yet-built whole-token
+    /// table (see [`LazyWholeTable`]).
+    pub(crate) whole_misses: u32,
 }
 
 /// The 2..=15-byte entries of a whole-piece token map, keyed by the
@@ -1153,9 +1116,12 @@ pub(crate) struct WholeTable {
 
 impl WholeTable {
     pub(crate) fn build(token_cache: &FoldHashMap<Vec<u8>, TokenId>) -> Self {
-        let n = token_cache.keys().filter(|b| (2..=CACHE_KEY_MAX).contains(&b.len())).count();
-        let cap = (n * 2).next_power_of_two().max(16);
-        let mut ents = vec![(0u64, 0u64, 0 as TokenId); cap].into_boxed_slice();
+        // `len()` bounds the 2..=15-byte entries: one pass over the keys,
+        // which are scattered on the heap.
+        let cap = (token_cache.len() * 2).next_power_of_two().max(16);
+        // SAFETY: the entries are plain integers, and all-zero is empty
+        // (`hi == 0`). Zeroed pages are only touched where entries land.
+        let mut ents = unsafe { Box::<[(u64, u64, TokenId)]>::new_zeroed_slice(cap).assume_init() };
         let mask = cap - 1;
         for (b, &tok) in token_cache {
             if !(2..=CACHE_KEY_MAX).contains(&b.len()) {
@@ -1195,6 +1161,40 @@ impl WholeTable {
     }
 }
 
+/// A [`WholeTable`] built only once a cache has met enough misses to repay
+/// it. The build walks every vocab entry (2.5 ms for a 50k vocab, ~10 ms for
+/// 150k–200k), which a tiny first call's few misses would pay alone. Each
+/// cache counts its own misses (a shared atomic counter, bounced between
+/// every batch worker's core, halved gpt-4o batch throughput), and misses
+/// before the build ask the token map, which holds the same entries.
+#[derive(Clone)]
+pub(crate) struct LazyWholeTable {
+    table: OnceLock<WholeTable>,
+}
+
+impl LazyWholeTable {
+    /// Misses one cache answers from the token map before the table is built.
+    const BUILD_AFTER: u32 = 256;
+
+    pub(crate) fn new() -> Self {
+        Self { table: OnceLock::new() }
+    }
+
+    /// The token of the 2..=15-byte piece `text` (key words `lo`, `hi`);
+    /// `misses` is the asking cache's own count.
+    #[inline]
+    pub(crate) fn get(&self, token_cache: &FoldHashMap<Vec<u8>, TokenId>, text: &[u8], lo: u64, hi: u64, misses: &mut u32) -> Option<TokenId> {
+        if let Some(t) = self.table.get() {
+            return t.get(lo, hi);
+        }
+        *misses += 1;
+        if *misses <= Self::BUILD_AFTER {
+            return token_cache.get(text).copied();
+        }
+        self.table.get_or_init(|| WholeTable::build(token_cache)).get(lo, hi)
+    }
+}
+
 /// A pretoken-cache entry known before any text is seen: a 2..=15-byte
 /// piece that is a vocab token, which the encoders' miss path resolves
 /// through the whole-piece `token_cache` to that one token.
@@ -1209,16 +1209,24 @@ pub(crate) struct CacheSeed {
 /// a probe window overflows, the later insert wins, so the lower ids —
 /// earlier, more frequent merges — keep their slots).
 pub(crate) fn cache_seeds(token_cache: &FoldHashMap<Vec<u8>, TokenId>) -> Box<[CacheSeed]> {
-    let mut seeds: Vec<CacheSeed> = token_cache
+    // Ids are unique and dense, so each entry goes straight to its id's
+    // slot and the lowest ids are a scan up from 0: no sort of the whole
+    // vocab (that sort was most of a 3.5–15 ms build).
+    let Some(&max) = token_cache.values().max() else {
+        return Box::new([]);
+    };
+    let mut by_id: Vec<Option<(u64, u64)>> = vec![None; max as usize + 1];
+    for (b, &tok) in token_cache {
+        if (2..=CACHE_KEY_MAX).contains(&b.len()) {
+            by_id[tok as usize] = Some(key_words(b));
+        }
+    }
+    let mut seeds: Vec<CacheSeed> = by_id
         .iter()
-        .filter(|(b, _)| (2..=CACHE_KEY_MAX).contains(&b.len()))
-        .map(|(b, &tok)| {
-            let (lo, hi) = key_words(b);
-            CacheSeed { lo, hi, tok }
-        })
+        .enumerate()
+        .filter_map(|(tok, k)| k.map(|(lo, hi)| CacheSeed { lo, hi, tok: tok as TokenId }))
+        .take(SEED_MAX)
         .collect();
-    seeds.sort_unstable_by_key(|s| s.tok);
-    seeds.truncate(SEED_MAX);
     seeds.reverse();
     seeds.into_boxed_slice()
 }
@@ -1448,7 +1456,12 @@ impl PretokenCache {
 
     pub fn new() -> Self {
         let pairs = Self::alloc_entries(CACHE_BITS);
-        Self { mask: pairs.len() * 2 - 1, pairs, filled: 0, long: None, dirty: false, seeded: false }
+        Self { mask: pairs.len() * 2 - 1, pairs, filled: 0, long: None, dirty: false, seeded: false, seedable: true, whole_misses: 0 }
+    }
+
+    /// Never [`Self::seed`] this cache (it lives for one call only).
+    pub(crate) fn never_seed(&mut self) {
+        self.seedable = false;
     }
 
     /// The table as a flat slice of entries.
@@ -1467,9 +1480,12 @@ impl PretokenCache {
 
     /// An empty table of `1 << bits` entries (as pairs).
     fn alloc_entries(bits: usize) -> Box<[CachePair]> {
-        let empty = CacheEntry { key_lo: 0, key_hi: 0, toks: [0; CACHE_MAX_TOKENS], ntok: 0 };
         let n = 1usize << bits;
-        let entries = vec![CachePair([empty; 2]); n / 2].into_boxed_slice();
+        // Zeroed allocation, not a fill: large tables come back as fresh
+        // zero pages that are only touched (faulted in) when probed.
+        // SAFETY: a `CachePair` is plain integers, and all-zero bytes are an
+        // empty entry (`key_hi == 0`).
+        let entries = unsafe { Box::<[CachePair]>::new_zeroed_slice(n / 2).assume_init() };
         // Advise transparent huge pages for the table on Linux: the default
         // table is exactly one 2 MiB page, and probes are uniform-random, so
         // THP removes almost all TLB misses on the probe path. Advisory only
@@ -1549,7 +1565,12 @@ impl PretokenCache {
     /// p99 about 2x).
     #[inline(always)]
     pub(crate) fn wants_seed(&self) -> bool {
-        !self.seeded
+        self.seedable && !self.seeded
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_seeded(&self) -> bool {
+        self.seeded
     }
 
     /// Insert every whole-token piece up front (as gigatoken does), so the
@@ -1791,9 +1812,12 @@ impl PretokenCache {
             let e = self.ents()[i];
             if e.key_lo == lo && e.key_hi == hi {
                 // Only swap with an entry of the same window, which stays
-                // inside it at slot 2 or 3.
+                // inside it at slot 2 or 3. An empty `home + 1` can't sit
+                // before a displaced key (inserts take the first empty slot),
+                // and swapping one in would leave a hole that ends probes
+                // early.
                 let o = self.ents()[home + 1];
-                if o.key_hi == 0 || self.slot(o.key_lo, o.key_hi) == home {
+                if o.key_hi != 0 && self.slot(o.key_lo, o.key_hi) == home {
                     self.ents_mut().swap(home + 1, i);
                 }
                 return;
@@ -1922,6 +1946,39 @@ impl Bitfield {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_seeds_are_the_lowest_ids_highest_first() {
+        // Random keys of 1..=20 bytes on ids with gaps (some keys collide,
+        // dropping their earlier id), against the sort it replaced.
+        let mut map: FoldHashMap<Vec<u8>, TokenId> = FoldHashMap::default();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for id in 0..300_000u32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if x % 5 == 0 {
+                continue;
+            }
+            let len = 1 + (x % 20) as usize;
+            map.insert((0..len).map(|i| b'a' + ((x >> (i * 3)) % 4) as u8).collect(), id);
+        }
+        let mut expect: Vec<(u64, u64, TokenId)> = map
+            .iter()
+            .filter(|(b, _)| (2..=CACHE_KEY_MAX).contains(&b.len()))
+            .map(|(b, &t)| {
+                let (lo, hi) = key_words(b);
+                (lo, hi, t)
+            })
+            .collect();
+        expect.sort_unstable_by_key(|e| e.2);
+        expect.truncate(SEED_MAX);
+        expect.reverse();
+        let got: Vec<_> = cache_seeds(&map).iter().map(|s| (s.lo, s.hi, s.tok)).collect();
+        assert_eq!(expect.len(), SEED_MAX, "the map must be big enough to truncate");
+        assert!(got == expect);
+        assert!(cache_seeds(&FoldHashMap::default()).is_empty());
+    }
     use crate::decoder::VocabDecoder;
 
     #[test]
@@ -2031,6 +2088,17 @@ mod tests {
             assert_eq!(fresh.ents()[(home + 2) & fresh.mask].key_lo, lo);
             assert_eq!(run(&mut fresh), expect, "displaced");
             assert_eq!(fresh.ents()[home + 1].key_lo, lo, "promoted into the home pair");
+            // The swapped-out filler stays findable in slot 2.
+            let f = fresh.ents()[(home + 2) & fresh.mask];
+            assert!(f.key_hi != 0 && fresh.get_with_key(f.key_lo, f.key_hi, &mut Vec::new()));
+
+            // An empty `home + 1` is never swapped deeper into the window.
+            let mut holey = PretokenCache::new();
+            let i = (home + 2) & holey.mask;
+            holey.ents_mut()[i] = fresh.ents()[home + 1];
+            holey.promote(lo, hi);
+            assert_eq!(holey.ents()[home + 1].key_hi, 0, "hole left in place");
+            assert_eq!(holey.ents()[i].key_lo, lo);
         }
 
         // Seeded: whole tokens inserted up front, same output.

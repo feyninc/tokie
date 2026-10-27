@@ -1244,7 +1244,10 @@ fn rebuild_pair_lookup(
         // keep only splits whose parts really concatenate to this token.
         if split.left == split.right {
             let is_merge = match (token_bytes.get(id), token_bytes.get(split.left as usize)) {
-                (Some(t), Some(part)) => t.len() == 2 * part.len() && t[..part.len()] == part[..] && t[part.len()..] == part[..],
+                // An id hole is an empty entry, never a merge.
+                (Some(t), Some(part)) => {
+                    !part.is_empty() && t.len() == 2 * part.len() && t[..part.len()] == part[..] && t[part.len()..] == part[..]
+                }
                 _ => false,
             };
             if !is_merge {
@@ -1586,6 +1589,7 @@ mod tests {
         let merges: Vec<(TokenId, TokenId)> = vec![(b'a' as u32, b'b' as u32), (256, b'c' as u32)];
         let (encoder, token_bytes) =
             crate::encoder::BacktrackingBytePairEncoder::from_vocab_and_merges(&vocab, &merges, 256);
+        assert_eq!(token_bytes.len(), 260, "laid out by id, hole included");
         assert!(encoder.has_rank_merge(), "precondition: fresh build has rank table");
 
         let tokenizer = Tokenizer::new(
@@ -1601,6 +1605,13 @@ mod tests {
         let enc = loaded.encoder().as_backtracking().expect("backtracking encoder");
         assert!(enc.has_rank_merge(), "rank table must survive .tkz roundtrip with id holes");
         assert_eq!(tokenizer.encode("abcab aa", false).ids, loaded.encode("abcab aa", false).ids);
+        // Tables are laid out by id: the token after the hole decodes as
+        // itself (it used to decode as nothing, one slot past the table).
+
+        for t in [&tokenizer, &loaded] {
+            assert_eq!(t.decode(&[257, 259]).as_deref(), Some("abc<|endoftext|>"));
+            assert_eq!(t.token_to_bytes(258), b"");
+        }
     }
 
     #[test]

@@ -93,12 +93,15 @@ impl PrecompiledCharsmap {
             ascii: std::array::from_fn(|_| None),
             crlf: None,
         };
+        // A replacement equal to its input is stored as `None` (kept
+        // verbatim): the same output, and the char stays on the bulk-copy
+        // path of `normalize_with`.
         let mut buf = [0u8; 1];
         this.ascii = std::array::from_fn(|b| {
-            this.transform((b as u8 as char).encode_utf8(&mut buf))
-                .map(Into::into)
+            let c: &str = (b as u8 as char).encode_utf8(&mut buf);
+            this.transform(c).filter(|r| *r != c).map(Into::into)
         });
-        this.crlf = this.transform("\r\n").map(Into::into);
+        this.crlf = this.transform("\r\n").filter(|r| *r != "\r\n").map(Into::into);
         Ok(this)
     }
 
@@ -172,20 +175,68 @@ impl PrecompiledCharsmap {
                 }
                 i += 1;
             } else {
-                // Slow region: extend until a safe boundary (ASCII char whose
-                // predecessor is also ASCII, not splitting a CR LF pair), then
-                // run full grapheme segmentation over it.
-                let mut j = i + 1;
-                while j < len {
-                    if bytes[j] < 0x80
-                        && bytes[j - 1] < 0x80
-                        && !(bytes[j - 1] == b'\r' && bytes[j] == b'\n')
-                    {
-                        break;
-                    }
-                    j += 1;
-                }
+                let j = region_end(bytes, i);
                 self.normalize_graphemes(&text[i..j], out);
+                i = j;
+            }
+        }
+    }
+
+    /// [`Self::normalize_into`] streamed into `sink` instead of a string, so
+    /// a following whitespace/metaspace step runs in the same pass. Runs of
+    /// ASCII bytes the charsmap keeps (and `sink` accepts in bulk) go to
+    /// [`CharsmapSink::run`] whole; every other output char goes to
+    /// [`CharsmapSink::char`], in order. `scratch` holds the output of one
+    /// non-ASCII region at a time.
+    pub(crate) fn normalize_with(&self, text: &str, sink: &mut impl CharsmapSink, scratch: &mut String) {
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        // Bytes that go out in runs: ASCII the charsmap keeps, outside a
+        // CR LF pair, that `sink` accepts in bulk.
+        let mut bulk = [false; 256];
+        for b in 0..128u8 {
+            bulk[b as usize] = b != b'\r' && self.ascii[b as usize].is_none() && sink.bulk(b);
+        }
+        let mut i = 0;
+        while i < len {
+            let b = bytes[i];
+            // The fast path of `normalize_into`: an ASCII char followed by
+            // ASCII (or the end) is its own grapheme cluster.
+            if b < 0x80 && (i + 1 >= len || bytes[i + 1] < 0x80) {
+                if bulk[b as usize] {
+                    let mut k = i + 1;
+                    while k < len && bulk[bytes[k] as usize] {
+                        k += 1;
+                    }
+                    // An ASCII char before a non-ASCII one belongs to the
+                    // grapheme region that starts with it. Then `k > i + 1`
+                    // (`bytes[i + 1]` is ASCII), so the run is never empty.
+                    let end = if k < len && bytes[k] >= 0x80 { k - 1 } else { k };
+                    sink.run(&text[i..end]);
+                    i = end;
+                    continue;
+                }
+                if b == b'\r' && i + 1 < len && bytes[i + 1] == b'\n' {
+                    match &self.crlf {
+                        Some(r) => r.chars().for_each(|c| sink.char(c)),
+                        None => {
+                            sink.char('\r');
+                            sink.char('\n');
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+                match &self.ascii[b as usize] {
+                    Some(r) => r.chars().for_each(|c| sink.char(c)),
+                    None => sink.char(b as char),
+                }
+                i += 1;
+            } else {
+                let j = region_end(bytes, i);
+                scratch.clear();
+                self.normalize_graphemes(&text[i..j], scratch);
+                scratch.chars().for_each(|c| sink.char(c));
                 i = j;
             }
         }
@@ -209,6 +260,32 @@ impl PrecompiledCharsmap {
             }
         }
     }
+}
+
+/// End of the slow region starting at `i`: extend until a safe boundary (an
+/// ASCII char whose predecessor is also ASCII, not splitting a CR LF pair),
+/// which full grapheme segmentation then covers.
+fn region_end(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < bytes.len() {
+        if bytes[j] < 0x80 && bytes[j - 1] < 0x80 && !(bytes[j - 1] == b'\r' && bytes[j] == b'\n') {
+            break;
+        }
+        j += 1;
+    }
+    j
+}
+
+/// Receives a charsmap transform's output as it is produced (see
+/// [`PrecompiledCharsmap::normalize_with`]).
+pub(crate) trait CharsmapSink {
+    /// Whether a kept ASCII byte may arrive inside a [`Self::run`]; bytes it
+    /// refuses come one at a time through [`Self::char`].
+    fn bulk(&self, b: u8) -> bool;
+    /// A run of kept ASCII bytes, each accepted by [`Self::bulk`].
+    fn run(&mut self, run: &str);
+    /// The next output char.
+    fn char(&mut self, c: char);
 }
 
 impl PartialEq for PrecompiledCharsmap {

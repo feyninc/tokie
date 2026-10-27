@@ -12,6 +12,9 @@ use crate::encoder::EncoderType;
 use crate::postprocessor::PostProcessor;
 use crate::types::TokenId;
 
+/// How far past the vocab table [`Decoder::set_added`] lays out added ids.
+const MAX_ADDED_PAST_TABLE: usize = 1 << 20;
+
 /// Text-level decoder type, mirroring [`EncoderType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
@@ -62,6 +65,10 @@ impl DecoderType {
 pub struct Decoder {
     vocab: VocabDecoder,
     decoder_type: DecoderType,
+    /// Bytes of the added tokens past the vocab table, for ids
+    /// `vocab_size()..` (empty where no token has the id). Set by
+    /// [`Self::set_added`]; not serialized (the added tokens are).
+    added: Vec<Box<[u8]>>,
 }
 
 impl Decoder {
@@ -72,6 +79,7 @@ impl Decoder {
         Self {
             vocab: VocabDecoder::new(token_bytes),
             decoder_type: DecoderType::ByteLevel,
+            added: Vec::new(),
         }
     }
 
@@ -80,12 +88,13 @@ impl Decoder {
         Self {
             vocab: VocabDecoder::new(token_bytes),
             decoder_type: DecoderType::from_encoder_type(encoder_type),
+            added: Vec::new(),
         }
     }
 
     /// Create a decoder with a specific decoder type.
     pub fn with_type(vocab: VocabDecoder, decoder_type: DecoderType) -> Self {
-        Self { vocab, decoder_type }
+        Self { vocab, decoder_type, added: Vec::new() }
     }
 
     /// Get the decoder type.
@@ -109,21 +118,82 @@ impl Decoder {
         self.vocab.vocab_size()
     }
 
-    /// Get the byte sequence for a token.
+    /// Ids past the vocab table that have an added token: `vocab_size()..`
+    /// up to this.
+    pub fn len_with_added(&self) -> usize {
+        self.vocab.vocab_size() + self.added.len()
+    }
+
+    /// Give the added tokens whose ids lie past the vocab table (Llama 3
+    /// keeps its special tokens only in the added vocabulary) their bytes,
+    /// so they decode instead of indexing off the table.
+    ///
+    /// A special token whose table entry disagrees with its content takes
+    /// the content, as HF's added vocabulary wins over the model's: tables
+    /// built before they were laid out by id had every token after an id
+    /// hole shifted by one (gpt-4 decoded `<|endoftext|>` as
+    /// `<|fim_prefix|>`). Other added tokens keep the table entry, which
+    /// holds decoded bytes: a byte-fallback `<0x0A>` or byte-level `ĠĠ`
+    /// spells its content differently from the bytes it stands for.
+    pub fn set_added<'a>(&mut self, tokens: impl IntoIterator<Item = (TokenId, &'a [u8], bool)>) {
+        let base = self.vocab.vocab_size();
+        let mut fixes: Vec<(usize, &[u8])> = Vec::new();
+        for (id, bytes, special) in tokens {
+            let id = id as usize;
+            let Some(i) = id.checked_sub(base) else {
+                if special && self.vocab.token_to_bytes(id as TokenId) != bytes {
+                    fixes.push((id, bytes));
+                }
+                continue;
+            };
+            // A declared id far past the table is ignored rather than
+            // allocating up to it.
+            if i >= MAX_ADDED_PAST_TABLE {
+                continue;
+            }
+            if self.added.len() <= i {
+                self.added.resize(i + 1, Box::default());
+            }
+            self.added[i] = bytes.into();
+        }
+        if !fixes.is_empty() {
+            let mut table = self.vocab.token_bytes();
+            for (id, bytes) in fixes {
+                table[id] = bytes.to_vec();
+            }
+            self.vocab = VocabDecoder::new(table);
+        }
+    }
+
+    /// Get the byte sequence for a token (empty for an id no token has).
     #[inline]
     pub fn token_to_bytes(&self, token: TokenId) -> &[u8] {
-        self.vocab.token_to_bytes(token)
+        let base = self.vocab.vocab_size();
+        match (token as usize).checked_sub(base) {
+            None => self.vocab.token_to_bytes(token),
+            Some(i) => self.added.get(i).map_or(&[], |b| &**b),
+        }
     }
 
     /// Get the length of a token in bytes.
     #[inline]
     pub fn token_len(&self, token: TokenId) -> usize {
-        self.vocab.token_len(token)
+        self.token_to_bytes(token).len()
+    }
+
+    /// Whether every id is in the vocab table (the fast decode paths).
+    #[inline]
+    fn in_table(&self, tokens: &[TokenId]) -> bool {
+        let base = self.vocab.vocab_size();
+        tokens.iter().all(|&t| (t as usize) < base)
     }
 
     /// Decode token IDs back to raw bytes (no text post-processing).
     pub fn decode_bytes(&self, tokens: &[TokenId]) -> Vec<u8> {
-        self.vocab.decode(tokens)
+        if self.in_table(tokens) {
+            return self.vocab.decode(tokens);
+        }
+        tokens.iter().flat_map(|&t| self.token_to_bytes(t)).copied().collect()
     }
 
     /// Decode token IDs to a string with text-level post-processing.
@@ -136,9 +206,10 @@ impl Decoder {
     /// Returns `None` if the result is not valid UTF-8.
     pub fn decode(&self, tokens: &[TokenId], post_processor: &PostProcessor) -> Option<String> {
         match self.decoder_type {
-            DecoderType::ByteLevel => self.vocab.decode_to_string(tokens),
-            DecoderType::WordPiece => decode_wordpiece(tokens, &self.vocab, post_processor),
-            DecoderType::Metaspace => decode_metaspace(tokens, &self.vocab, post_processor),
+            DecoderType::ByteLevel if self.in_table(tokens) => self.vocab.decode_to_string(tokens),
+            DecoderType::ByteLevel => String::from_utf8(self.decode_bytes(tokens)).ok(),
+            DecoderType::WordPiece => decode_wordpiece(tokens, self, post_processor),
+            DecoderType::Metaspace => decode_metaspace(tokens, self, post_processor),
         }
     }
 
@@ -156,6 +227,7 @@ impl Decoder {
         Self {
             vocab: VocabDecoder::from_parts(data, offsets),
             decoder_type,
+            added: Vec::new(),
         }
     }
 
@@ -172,7 +244,7 @@ impl Decoder {
 
 fn decode_wordpiece(
     tokens: &[TokenId],
-    vocab: &VocabDecoder,
+    vocab: &Decoder,
     post_processor: &PostProcessor,
 ) -> Option<String> {
     let mut result = String::new();
@@ -196,7 +268,7 @@ fn decode_wordpiece(
 
 fn decode_metaspace(
     tokens: &[TokenId],
-    vocab: &VocabDecoder,
+    vocab: &Decoder,
     post_processor: &PostProcessor,
 ) -> Option<String> {
     let mut result = String::new();
@@ -212,4 +284,26 @@ fn decode_metaspace(
         result.remove(0);
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_added_keeps_byte_tokens_and_repairs_shifted_specials() {
+        let mut table: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
+        table.push(b"<|wrong|>".to_vec()); // 256: a special shifted by a hole
+        let mut d = Decoder::new(table);
+        d.set_added([
+            (10, &b"<0x0A>"[..], false), // byte fallback: the table holds the byte
+            (256, &b"<|endoftext|>"[..], true),
+            (300, &b"<|past|>"[..], true),
+        ]);
+        assert_eq!(d.token_to_bytes(10), b"\n");
+        assert_eq!(d.token_to_bytes(256), b"<|endoftext|>");
+        assert_eq!(d.token_to_bytes(300), b"<|past|>");
+        assert_eq!(d.token_to_bytes(299), b"");
+        assert_eq!(d.decode_bytes(&[10, 256, 300]), b"\n<|endoftext|><|past|>");
+    }
 }

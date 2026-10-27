@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use pyo3::create_exception;
+use pyo3::pybacked::PyBackedStr;
 use pyo3::types::PyBytes;
 
 create_exception!(tokie, TokieError, pyo3::exceptions::PyException);
@@ -32,21 +33,19 @@ struct PyEncoding {
 #[pymethods]
 impl PyEncoding {
     #[getter]
-    fn tokens(&self) -> Vec<String> {
-        let tokenizer = self.tok.read().unwrap();
-        self.ids.iter().map(|&id| {
-            tokenizer.id_to_token(id)
-                .map(|s| s.into_owned())
-                .unwrap_or_default()
-        }).collect()
+    fn tokens(&self, py: Python<'_>) -> Vec<String> {
+        let ids = &self.ids;
+        read_with(&self.tok, py, |t| {
+            ids.iter().map(|&id| t.id_to_token(id).map(|s| s.into_owned()).unwrap_or_default()).collect()
+        })
     }
 
     #[getter]
-    fn special_tokens_mask(&self) -> Vec<u32> {
-        let tokenizer = self.tok.read().unwrap();
-        self.ids.iter().map(|&id| {
-            if tokenizer.post_processor().is_special_token(id) { 1 } else { 0 }
-        }).collect()
+    fn special_tokens_mask(&self, py: Python<'_>) -> Vec<u32> {
+        let ids = &self.ids;
+        read_with(&self.tok, py, |t| {
+            ids.iter().map(|&id| t.post_processor().is_special_token(id) as u32).collect()
+        })
     }
 
     #[getter]
@@ -107,13 +106,38 @@ struct PyTokenizer {
     inner: Arc<RwLock<tokie_core::Tokenizer>>,
 }
 
+/// Run `f` under the read lock, waiting for the lock with the GIL released.
+///
+/// Every lock is taken detached. A detached reader needs the GIL back before
+/// it can drop its guard, so a thread that waits on the lock while holding
+/// the GIL deadlocks against it: a writer always, and a reader too once a
+/// writer is queued (a queued writer blocks new readers).
+fn read_with<R: Send>(
+    tok: &RwLock<tokie_core::Tokenizer>,
+    py: Python<'_>,
+    f: impl FnOnce(&tokie_core::Tokenizer) -> R + Send,
+) -> R {
+    py.detach(|| f(&tok.read().unwrap()))
+}
+
 impl PyTokenizer {
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, tokie_core::Tokenizer> {
-        self.inner.read().unwrap()
+    fn read_with<R: Send>(&self, py: Python<'_>, f: impl FnOnce(&tokie_core::Tokenizer) -> R + Send) -> R {
+        read_with(&self.inner, py, f)
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, tokie_core::Tokenizer> {
-        self.inner.write().unwrap()
+    /// [`Self::read_with`] for cheap calls: try the lock without blocking
+    /// first, and only detach if it is contended.
+    fn peek<R: Send>(&self, py: Python<'_>, f: impl FnOnce(&tokie_core::Tokenizer) -> R + Send) -> R {
+        match self.inner.try_read() {
+            Ok(t) => f(&t),
+            Err(_) => self.read_with(py, f),
+        }
+    }
+
+    /// Run `f` under the write lock, waiting for it with the GIL released
+    /// (see [`read_with`]).
+    fn write_with(&self, py: Python<'_>, f: impl FnOnce(&mut tokie_core::Tokenizer) + Send) {
+        py.detach(|| f(&mut self.inner.write().unwrap()));
     }
 }
 
@@ -155,41 +179,34 @@ impl PyTokenizer {
         text_pair: Option<&str>,
         add_special_tokens: bool,
     ) -> PyEncoding {
-        match text_pair {
-            Some(pair) => {
-                let a = text.to_string();
-                let b = pair.to_string();
-                let inner = self.read();
-                let enc = py.detach(|| inner.encode_pair(&a, &b, add_special_tokens));
-                PyEncoding::from_encoding(enc, self.inner.clone())
-            }
-            None => {
-                let text = text.to_string();
-                let inner = self.read();
-                let enc = py.detach(|| inner.encode(&text, add_special_tokens));
-                PyEncoding::from_encoding(enc, self.inner.clone())
-            }
-        }
+        let enc = self.read_with(py, |t| match text_pair {
+            Some(pair) => t.encode_pair(text, pair, add_special_tokens),
+            None => t.encode(text, add_special_tokens),
+        });
+        PyEncoding::from_encoding(enc, self.inner.clone())
     }
 
     /// Encode text into an Encoding (ids, attention_mask, type_ids).
     #[pyo3(signature = (text, add_special_tokens=true))]
     fn encode(&self, py: Python<'_>, text: &str, add_special_tokens: bool) -> PyEncoding {
-        let text = text.to_string();
-        let inner = self.read();
-        if inner.padding().is_none() {
-            // Fast path: bare ids; masks are synthesized lazily on access
-            let ids = py.detach(|| inner.encode_ids(&text, add_special_tokens));
-            return PyEncoding {
+        let enc = self.read_with(py, |t| {
+            if t.padding().is_none() {
+                // Fast path: bare ids; masks are synthesized lazily on access
+                Err(t.encode_ids(text, add_special_tokens))
+            } else {
+                Ok(t.encode(text, add_special_tokens))
+            }
+        });
+        match enc {
+            Ok(enc) => PyEncoding::from_encoding(enc, self.inner.clone()),
+            Err(ids) => PyEncoding {
                 ids,
                 attention_mask_inner: Vec::new(),
                 type_ids_inner: Vec::new(),
                 offsets_inner: Vec::new(),
                 tok: self.inner.clone(),
-            };
+            },
         }
-        let enc = py.detach(|| inner.encode(&text, add_special_tokens));
-        PyEncoding::from_encoding(enc, self.inner.clone())
     }
 
     /// Encode a pair of texts (e.g. for cross-encoder models).
@@ -201,68 +218,62 @@ impl PyTokenizer {
         text_b: &str,
         add_special_tokens: bool,
     ) -> PyEncoding {
-        let a = text_a.to_string();
-        let b = text_b.to_string();
-        let inner = self.read();
-        let enc = py.detach(|| inner.encode_pair(&a, &b, add_special_tokens));
+        let enc = self.read_with(py, |t| t.encode_pair(text_a, text_b, add_special_tokens));
         PyEncoding::from_encoding(enc, self.inner.clone())
     }
 
     /// Encode text into an Encoding with byte offsets into the (normalized) input.
     #[pyo3(signature = (text, add_special_tokens=true))]
     fn encode_with_offsets(&self, py: Python<'_>, text: &str, add_special_tokens: bool) -> PyEncoding {
-        let text = text.to_string();
-        let inner = self.read();
-        let enc = py.detach(|| inner.encode_with_offsets(&text, add_special_tokens));
+        let enc = self.read_with(py, |t| t.encode_with_offsets(text, add_special_tokens));
         PyEncoding::from_encoding(enc, self.inner.clone())
     }
 
     /// Encode raw bytes into token IDs.
-    fn encode_bytes(&self, data: &[u8]) -> Vec<u32> {
-        self.read().encode_bytes(data)
+    fn encode_bytes(&self, py: Python<'_>, data: &[u8]) -> Vec<u32> {
+        self.read_with(py, |t| t.encode_bytes(data))
     }
 
     /// Decode token IDs back to a string. Returns None if not valid UTF-8.
-    fn decode(&self, tokens: Vec<u32>) -> Option<String> {
-        self.read().decode(&tokens)
+    fn decode(&self, py: Python<'_>, tokens: Vec<u32>) -> Option<String> {
+        self.read_with(py, |t| t.decode(&tokens))
     }
 
     /// Decode token IDs back to raw bytes.
     fn decode_bytes<'py>(&self, py: Python<'py>, tokens: Vec<u32>) -> Bound<'py, PyBytes> {
-        let bytes = self.read().decode_bytes(&tokens);
+        let bytes = self.read_with(py, |t| t.decode_bytes(&tokens));
         PyBytes::new(py, &bytes)
     }
 
     /// Convert a token ID to its string representation.
-    fn id_to_token(&self, id: u32) -> Option<String> {
-        self.read().id_to_token(id).map(|s| s.into_owned())
+    fn id_to_token(&self, py: Python<'_>, id: u32) -> Option<String> {
+        self.peek(py, |t| t.id_to_token(id).map(|s| s.into_owned()))
     }
 
     /// Convert a token string to its ID.
-    fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.read().token_to_id(token)
+    fn token_to_id(&self, py: Python<'_>, token: &str) -> Option<u32> {
+        self.peek(py, |t| t.token_to_id(token))
     }
 
     /// Get the full vocabulary as a dict mapping token strings to IDs.
-    fn get_vocab(&self) -> HashMap<String, u32> {
-        self.read().get_vocab()
+    fn get_vocab(&self, py: Python<'_>) -> HashMap<String, u32> {
+        self.read_with(py, |t| t.get_vocab())
     }
 
     /// Decode multiple token ID sequences in parallel.
     fn decode_batch(&self, py: Python<'_>, sequences: Vec<Vec<u32>>) -> Vec<Option<String>> {
-        let inner = self.read();
-        py.detach(|| {
-            sequences.iter().map(|tokens| inner.decode(tokens)).collect()
+        self.read_with(py, |t| {
+            let refs: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
+            t.decode_batch(&refs)
         })
     }
 
     /// Encode multiple texts in parallel, returning a list of Encoding objects.
     #[pyo3(signature = (texts, add_special_tokens=true))]
-    fn encode_batch(&self, py: Python<'_>, texts: Vec<String>, add_special_tokens: bool) -> Vec<PyEncoding> {
-        let inner = self.read();
-        let encodings = py.detach(|| {
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            inner.encode_batch(&text_refs, add_special_tokens)
+    fn encode_batch(&self, py: Python<'_>, texts: Vec<PyBackedStr>, add_special_tokens: bool) -> Vec<PyEncoding> {
+        let encodings = self.read_with(py, |t| {
+            let text_refs: Vec<&str> = texts.iter().map(|s| &**s).collect();
+            t.encode_batch(&text_refs, add_special_tokens)
         });
         encodings.into_iter()
             .map(|enc| PyEncoding::from_encoding(enc, self.inner.clone()))
@@ -281,14 +292,13 @@ impl PyTokenizer {
     fn encode_batch_flat<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<String>,
+        texts: Vec<PyBackedStr>,
         add_special_tokens: bool,
     ) -> (Bound<'py, numpy::PyArray1<u32>>, Bound<'py, numpy::PyArray1<u64>>) {
         use numpy::IntoPyArray;
-        let inner = self.read();
-        let (ids, lens) = py.detach(|| {
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            inner.encode_batch_flat(&text_refs, add_special_tokens)
+        let (ids, lens) = self.read_with(py, |t| {
+            let text_refs: Vec<&str> = texts.iter().map(|s| &**s).collect();
+            t.encode_batch_flat(&text_refs, add_special_tokens)
         });
         (ids.into_pyarray(py), lens.into_pyarray(py))
     }
@@ -320,10 +330,7 @@ impl PyTokenizer {
     ) -> PyResult<(Bound<'py, numpy::PyArray1<u32>>, Bound<'py, numpy::PyArray1<u64>>)> {
         use numpy::IntoPyArray;
         let separator = separator.unwrap_or_else(|| b"<|endoftext|>".to_vec());
-        let inner = self.read();
-        let (ids, offsets) = py.detach(|| {
-            inner.encode_files_flat(&paths, &separator, add_special_tokens)
-        })?;
+        let (ids, offsets) = self.read_with(py, |t| t.encode_files_flat(&paths, &separator, add_special_tokens))?;
         Ok((ids.into_pyarray(py), offsets.into_pyarray(py)))
     }
 
@@ -340,47 +347,44 @@ impl PyTokenizer {
         separator: Option<Vec<u8>>,
     ) -> PyResult<usize> {
         let separator = separator.unwrap_or_else(|| b"<|endoftext|>".to_vec());
-        let inner = self.read();
-        Ok(py.detach(|| inner.count_tokens_files(&paths, &separator))?)
+        Ok(self.read_with(py, |t| t.count_tokens_files(&paths, &separator))?)
     }
 
     /// Count the number of tokens in the text.
     fn count_tokens(&self, py: Python<'_>, text: &str) -> usize {
-        let text = text.to_string();
-        let inner = self.read();
-        py.detach(|| inner.count_tokens(&text))
+        self.read_with(py, |t| t.count_tokens(text))
     }
 
     /// Count tokens for multiple texts in parallel.
-    fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<String>) -> Vec<usize> {
-        let inner = self.read();
-        py.detach(|| {
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            inner.count_tokens_batch(&text_refs)
+    fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<PyBackedStr>) -> Vec<usize> {
+        self.read_with(py, |t| {
+            let text_refs: Vec<&str> = texts.iter().map(|s| &**s).collect();
+            t.count_tokens_batch(&text_refs)
         })
     }
 
     /// Save the tokenizer to a .tkz binary file.
-    fn save(&self, path: &str) -> PyResult<()> {
-        self.read().to_file(path).map_err(to_py_err)
+    fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.read_with(py, |t| t.to_file(path).map_err(|e| e.to_string())).map_err(to_py_err)
     }
 
     /// The vocabulary size.
     #[getter]
-    fn vocab_size(&self) -> usize {
-        self.read().vocab_size()
+    fn vocab_size(&self, py: Python<'_>) -> usize {
+        self.peek(py, |t| t.vocab_size())
     }
 
     /// The pad token ID, if set.
     #[getter]
-    fn pad_token_id(&self) -> Option<u32> {
-        self.read().pad_token_id()
+    fn pad_token_id(&self, py: Python<'_>) -> Option<u32> {
+        self.peek(py, |t| t.pad_token_id())
     }
 
     /// Enable padding for encode_batch.
     #[pyo3(signature = (*, direction="right", pad_id=0, pad_type_id=0, length=None, pad_to_multiple_of=None))]
     fn enable_padding(
         &self,
+        py: Python<'_>,
         direction: &str,
         pad_id: u32,
         pad_type_id: u8,
@@ -403,7 +407,7 @@ impl PyTokenizer {
             pad_id,
             pad_type_id,
         };
-        self.write().enable_padding(params);
+        self.write_with(py, |t| { t.enable_padding(params); });
         Ok(())
     }
 
@@ -411,6 +415,7 @@ impl PyTokenizer {
     #[pyo3(signature = (max_length, *, stride=0, strategy="longest_first", direction="right"))]
     fn enable_truncation(
         &self,
+        py: Python<'_>,
         max_length: usize,
         stride: usize,
         strategy: &str,
@@ -433,79 +438,75 @@ impl PyTokenizer {
             direction,
             stride,
         };
-        self.write().enable_truncation(params);
+        self.write_with(py, |t| { t.enable_truncation(params); });
         Ok(())
     }
 
     /// Get current padding configuration, or None if disabled.
     #[getter]
-    fn padding(&self) -> Option<HashMap<String, Py<PyAny>>> {
-        Python::attach(|py| {
-            self.read().padding().map(|p| {
-                let mut d = HashMap::new();
-                match p.strategy {
-                    tokie_core::PaddingStrategy::Fixed(n) =>
-                        d.insert("length".to_string(), n.into_pyobject(py).unwrap().into_any().unbind()),
-                    tokie_core::PaddingStrategy::BatchLongest =>
-                        d.insert("length".to_string(), py.None()),
-                };
-                d.insert("pad_to_multiple_of".to_string(),
-                    p.pad_to_multiple_of.map(|n| n.into_pyobject(py).unwrap().into_any().unbind())
-                        .unwrap_or_else(|| py.None()));
-                d.insert("pad_id".to_string(), p.pad_id.into_pyobject(py).unwrap().into_any().unbind());
-                d.insert("pad_type_id".to_string(), p.pad_type_id.into_pyobject(py).unwrap().into_any().unbind());
-                let dir_str = match p.direction {
-                    tokie_core::PaddingDirection::Right => "right",
-                    tokie_core::PaddingDirection::Left => "left",
-                };
-                d.insert("direction".to_string(), dir_str.into_pyobject(py).unwrap().into_any().unbind());
-                d
-            })
+    fn padding(&self, py: Python<'_>) -> Option<HashMap<String, Py<PyAny>>> {
+        self.peek(py, |t| t.padding().cloned()).map(|p| {
+            let mut d = HashMap::new();
+            match p.strategy {
+                tokie_core::PaddingStrategy::Fixed(n) =>
+                    d.insert("length".to_string(), n.into_pyobject(py).unwrap().into_any().unbind()),
+                tokie_core::PaddingStrategy::BatchLongest =>
+                    d.insert("length".to_string(), py.None()),
+            };
+            d.insert("pad_to_multiple_of".to_string(),
+                p.pad_to_multiple_of.map(|n| n.into_pyobject(py).unwrap().into_any().unbind())
+                    .unwrap_or_else(|| py.None()));
+            d.insert("pad_id".to_string(), p.pad_id.into_pyobject(py).unwrap().into_any().unbind());
+            d.insert("pad_type_id".to_string(), p.pad_type_id.into_pyobject(py).unwrap().into_any().unbind());
+            let dir_str = match p.direction {
+                tokie_core::PaddingDirection::Right => "right",
+                tokie_core::PaddingDirection::Left => "left",
+            };
+            d.insert("direction".to_string(), dir_str.into_pyobject(py).unwrap().into_any().unbind());
+            d
         })
     }
 
     /// Get current truncation configuration, or None if disabled.
     #[getter]
-    fn truncation(&self) -> Option<HashMap<String, Py<PyAny>>> {
-        Python::attach(|py| {
-            self.read().truncation().map(|t| {
-                let mut d = HashMap::new();
-                d.insert("max_length".to_string(), t.max_length.into_pyobject(py).unwrap().into_any().unbind());
-                d.insert("stride".to_string(), t.stride.into_pyobject(py).unwrap().into_any().unbind());
-                let strat = match t.strategy {
-                    tokie_core::TruncationStrategy::LongestFirst => "longest_first",
-                    tokie_core::TruncationStrategy::OnlyFirst => "only_first",
-                    tokie_core::TruncationStrategy::OnlySecond => "only_second",
-                };
-                d.insert("strategy".to_string(), strat.into_pyobject(py).unwrap().into_any().unbind());
-                let dir_str = match t.direction {
-                    tokie_core::TruncationDirection::Right => "right",
-                    tokie_core::TruncationDirection::Left => "left",
-                };
-                d.insert("direction".to_string(), dir_str.into_pyobject(py).unwrap().into_any().unbind());
-                d
-            })
+    fn truncation(&self, py: Python<'_>) -> Option<HashMap<String, Py<PyAny>>> {
+        self.peek(py, |t| t.truncation().cloned()).map(|t| {
+            let mut d = HashMap::new();
+            d.insert("max_length".to_string(), t.max_length.into_pyobject(py).unwrap().into_any().unbind());
+            d.insert("stride".to_string(), t.stride.into_pyobject(py).unwrap().into_any().unbind());
+            let strat = match t.strategy {
+                tokie_core::TruncationStrategy::LongestFirst => "longest_first",
+                tokie_core::TruncationStrategy::OnlyFirst => "only_first",
+                tokie_core::TruncationStrategy::OnlySecond => "only_second",
+            };
+            d.insert("strategy".to_string(), strat.into_pyobject(py).unwrap().into_any().unbind());
+            let dir_str = match t.direction {
+                tokie_core::TruncationDirection::Right => "right",
+                tokie_core::TruncationDirection::Left => "left",
+            };
+            d.insert("direction".to_string(), dir_str.into_pyobject(py).unwrap().into_any().unbind());
+            d
         })
     }
 
     /// Disable padding.
-    fn no_padding(&self) {
-        self.write().no_padding();
+    fn no_padding(&self, py: Python<'_>) {
+        self.write_with(py, |t| { t.no_padding(); });
     }
 
     /// Disable truncation.
-    fn no_truncation(&self) {
-        self.write().no_truncation();
+    fn no_truncation(&self, py: Python<'_>) {
+        self.write_with(py, |t| { t.no_truncation(); });
     }
 
     /// Number of special tokens added for a single sequence or pair.
     #[pyo3(signature = (is_pair=false))]
-    fn num_special_tokens_to_add(&self, is_pair: bool) -> usize {
-        self.read().num_special_tokens_to_add(is_pair)
+    fn num_special_tokens_to_add(&self, py: Python<'_>, is_pair: bool) -> usize {
+        self.peek(py, |t| t.num_special_tokens_to_add(is_pair))
     }
 
-    fn __repr__(&self) -> String {
-        format!("Tokenizer(vocab_size={})", self.read().vocab_size())
+    fn __repr__(&self, py: Python<'_>) -> String {
+        format!("Tokenizer(vocab_size={})", self.vocab_size(py))
     }
 }
 
