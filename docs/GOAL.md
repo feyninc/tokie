@@ -40,7 +40,6 @@ Most pieces are 15 bytes or fewer and repeat. Those pack into one `u128`. A hit 
 ## Remaining
 
 - GPT-2 on the whole OpenWebText file is still sometimes under gigatoken. GPT-2 and cl100k line rates sit a few percent under. WordPiece, Unigram, and unaffixed SentencePiece still need a timing against tokenizers v1 on this binary.
-- Rebuild `tokie-python` and `tokie-cli` on this `Tokenizer`. Both still call the old `Tokenizer`, so they do not open or save a `.tokie` file.
 - Pair encoding, padding, truncation, and offsets. `wrap` only wraps the single-sequence template.
 - Added-token `lstrip`, `rstrip`, and `single_word`. A `normalized` token is matched as written, and the normalizer does not rewrite that needle.
 - Affixed SentencePiece BPE. A continuing-subword prefix or an end-of-word suffix is refused. Llama 2, Mistral, and Gemma use that form.

@@ -1,10 +1,18 @@
+//! CLI for the tokie 0.2 tokenizer.
+//!
+//! `encode`, `wrap`, `decode`, `batch`, `save`, and `open` are the calls.
+//! `ids` prints one id list per length-prefixed text so a Python test can
+//! compare against this binary. `bench` times one file.
+
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use tokie::build::VerifyResult;
+use tokie::{Specials, Tokenizer};
 
 #[derive(Parser)]
-#[command(name = "tokie", about = "Build, verify, and upload tokie tokenizers")]
+#[command(name = "tokie", about = "Encode and decode with a tokie 0.2 tokenizer")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -12,285 +20,185 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Convert a HuggingFace tokenizer.json to .tkz format
-    Convert {
-        /// HuggingFace repo ID (e.g., "openai-community/gpt2", "meta-llama/Llama-3.2-1B")
-        repo_id: String,
-
-        /// Output path for the .tkz file
+    /// Encode one text, or a whole file, and print the ids.
+    Encode {
+        /// `.tokie` file or `tokenizer.json`
+        tokenizer: PathBuf,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Apply the single-sequence template.
+        #[arg(long)]
+        wrap: bool,
+    },
+    /// Print ids for length-prefixed texts on stdin.
+    Ids {
+        tokenizer: PathBuf,
+        #[arg(long)]
+        wrap: bool,
+    },
+    /// Decode ids to text.
+    Decode {
+        tokenizer: PathBuf,
+        ids: Vec<u32>,
+        /// Omit specials.
+        #[arg(long)]
+        skip: bool,
+    },
+    /// Write a `.tokie` file.
+    Save {
+        tokenizer: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
-
-        /// Verify the converted .tkz against the reference tokenizer
-        #[arg(short, long)]
-        verify: bool,
-
-        /// Upload to tokiers/ org on HuggingFace Hub (implies --verify)
-        #[arg(short, long)]
-        upload: bool,
-
-        /// HuggingFace API token (falls back to HF_TOKEN env or cached token)
+    },
+    /// Time encode of one file. One warmup, then the median of `--reps`.
+    Bench {
+        tokenizer: PathBuf,
         #[arg(long)]
-        token: Option<String>,
+        file: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        reps: usize,
     },
-    /// Verify a .tkz tokenizer against the reference backend
-    Verify {
-        /// HuggingFace repo ID
-        repo_id: String,
-
-        /// Path to the .tkz file (if omitted, downloads from tokiers/)
-        #[arg(long)]
-        tkz: Option<PathBuf>,
-    },
-    /// Manage tokie's local caches
-    Cache {
-        #[command(subcommand)]
-        command: CacheCommands,
-    },
-}
-
-#[derive(Subcommand)]
-enum CacheCommands {
-    /// Delete compiled tokenizer artifacts (tokenizer.compiled-*.tkz) from the
-    /// HuggingFace hub cache. Downloaded tokenizer.json files are untouched;
-    /// artifacts are rebuilt on the next load.
-    Clear {
-        /// Cache directory to scan (defaults to the HuggingFace hub cache)
-        #[arg(long)]
-        cache_dir: Option<PathBuf>,
-    },
-}
-
-const MAX_MISMATCHES_SHOWN: usize = 5;
-
-fn print_verify_result(result: &VerifyResult) {
-    if result.failed == 0 {
-        println!("OK  {}/{} chunks pass", result.passed, result.total);
-        return;
-    }
-
-    println!(
-        "FAILED  {}/{} chunks pass ({} mismatches)",
-        result.passed, result.total, result.failed
-    );
-
-    let shown = result.mismatches.len().min(MAX_MISMATCHES_SHOWN);
-    for m in &result.mismatches[..shown] {
-        println!("  MISMATCH: \"{}\"", m.text);
-
-        // Find first divergence index
-        let first_diff = m
-            .tokie_ids
-            .iter()
-            .zip(m.reference_ids.iter())
-            .position(|(a, b)| a != b)
-            .unwrap_or(m.tokie_ids.len().min(m.reference_ids.len()));
-
-        let start = first_diff.saturating_sub(2);
-        let tokie_end = (first_diff + 5).min(m.tokie_ids.len());
-        let ref_end = (first_diff + 5).min(m.reference_ids.len());
-
-        println!(
-            "    first diff at token {}: tokie[{}..{}]={:?}  ref[{}..{}]={:?}",
-            first_diff,
-            start,
-            tokie_end,
-            &m.tokie_ids[start..tokie_end],
-            start,
-            ref_end,
-            &m.reference_ids[start..ref_end],
-        );
-    }
-
-    let remaining = result.mismatches.len() - shown;
-    if remaining > 0 {
-        println!("  ... and {remaining} more mismatches");
-    }
 }
 
 fn main() {
     let cli = Cli::parse();
+    if let Err(err) = run(cli) {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
+}
 
+fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
-        Commands::Convert {
-            repo_id,
-            output,
-            verify,
-            upload,
-            token,
+        Commands::Encode {
+            tokenizer,
+            text,
+            file,
+            wrap,
         } => {
-            cmd_convert(&repo_id, &output, verify || upload, upload, token.as_deref());
-        }
-        Commands::Verify { repo_id, tkz } => {
-            cmd_verify(&repo_id, tkz);
-        }
-        Commands::Cache { command } => match command {
-            CacheCommands::Clear { cache_dir } => {
-                cmd_cache_clear(cache_dir);
+            let mut tok = Tokenizer::open(&tokenizer).map_err(|err| err.to_string())?;
+            let body = match (text, file) {
+                (Some(text), None) => text,
+                (None, Some(path)) => std::fs::read_to_string(&path).map_err(|err| err.to_string())?,
+                _ => return Err("pass --text or --file".to_string()),
+            };
+            let mut ids = Vec::new();
+            if wrap {
+                tok.wrap(&body, &mut ids).map_err(|err| err.to_string())?;
+            } else {
+                tok.encode(&body, &mut ids).map_err(|err| err.to_string())?;
             }
-        },
-    }
-}
-
-fn cmd_cache_clear(cache_dir: Option<PathBuf>) {
-    let root = cache_dir.unwrap_or_else(|| hf_hub::Cache::default().path().clone());
-    if !root.exists() {
-        println!("cache directory {} does not exist, nothing to do", root.display());
-        return;
-    }
-
-    let mut removed = 0usize;
-    let mut bytes = 0u64;
-    remove_compiled_artifacts(&root, &mut removed, &mut bytes);
-    println!(
-        "removed {removed} compiled artifact(s), freed {:.1} MiB from {}",
-        bytes as f64 / (1024.0 * 1024.0),
-        root.display()
-    );
-}
-
-/// Recursively delete compiled tokenizer artifacts under `dir`. Symlinks are
-/// never followed: compiled artifacts are always regular files (written via
-/// temp + rename), and hub snapshot dirs symlink everything else to blobs.
-fn remove_compiled_artifacts(dir: &std::path::Path, removed: &mut usize, bytes: &mut u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else { continue };
-        if file_type.is_dir() {
-            remove_compiled_artifacts(&entry.path(), removed, bytes);
-        } else if file_type.is_file() && is_compiled_artifact(&entry.file_name().to_string_lossy()) {
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            if std::fs::remove_file(entry.path()).is_ok() {
-                *removed += 1;
-                *bytes += size;
+            print_ids(&ids);
+            Ok(())
+        }
+        Commands::Ids { tokenizer, wrap } => {
+            let mut tok = Tokenizer::open(&tokenizer).map_err(|err| err.to_string())?;
+            let texts = read_texts(std::io::stdin())?;
+            let mut ids = Vec::new();
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            for text in &texts {
+                ids.clear();
+                if wrap {
+                    tok.wrap(text, &mut ids).map_err(|err| err.to_string())?;
+                } else {
+                    tok.encode(text, &mut ids).map_err(|err| err.to_string())?;
+                }
+                writeln!(out, "{}", ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(" "))
+                    .map_err(|err| err.to_string())?;
             }
+            Ok(())
+        }
+        Commands::Decode {
+            tokenizer,
+            ids,
+            skip,
+        } => {
+            let tok = Tokenizer::open(&tokenizer).map_err(|err| err.to_string())?;
+            let mut text = String::new();
+            let specials = if skip { Specials::Skip } else { Specials::Keep };
+            tok.decode(&ids, &mut text, specials).map_err(|err| err.to_string())?;
+            println!("{text}");
+            Ok(())
+        }
+        Commands::Save { tokenizer, output } => {
+            let tok = Tokenizer::open(&tokenizer).map_err(|err| err.to_string())?;
+            tok.save(&output).map_err(|err| err.to_string())
+        }
+        Commands::Bench {
+            tokenizer,
+            file,
+            reps,
+        } => {
+            let text = std::fs::read_to_string(&file).map_err(|err| err.to_string())?;
+            let mut tok = Tokenizer::open(&tokenizer).map_err(|err| err.to_string())?;
+            let mut ids = Vec::new();
+            tok.encode(&text, &mut ids).map_err(|err| err.to_string())?;
+            let mut samples = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                ids.clear();
+                let start = Instant::now();
+                tok.encode(&text, &mut ids).map_err(|err| err.to_string())?;
+                samples.push(start.elapsed().as_secs_f64());
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = samples[samples.len() / 2];
+            let mb = text.len() as f64 / 1_000_000.0 / median;
+            println!("{mb:.1} MB/s  {} ids  {} bytes", ids.len(), text.len());
+            Ok(())
         }
     }
 }
 
-fn is_compiled_artifact(name: &str) -> bool {
-    name.starts_with("tokenizer.compiled-") && (name.ends_with(".tkz") || name.ends_with(".tkz.tmp"))
+fn print_ids(ids: &[u32]) {
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            print!(" ");
+        }
+        print!("{id}");
+    }
+    println!();
+}
+
+/// Each text is a decimal byte length, a newline, that many bytes, and a newline.
+fn read_texts(mut input: impl Read) -> Result<Vec<String>, String> {
+    let mut bytes = Vec::new();
+    input.read_to_end(&mut bytes).map_err(|err| err.to_string())?;
+    let mut texts = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let nl = bytes[at..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .ok_or("ids input ended inside a length")?;
+        let len: usize = std::str::from_utf8(&bytes[at..at + nl])
+            .map_err(|_| "length is not utf-8".to_string())?
+            .parse()
+            .map_err(|_| "length is not an integer".to_string())?;
+        at += nl + 1;
+        if at + len > bytes.len() {
+            return Err("ids input ended inside a text".to_string());
+        }
+        let text = std::str::from_utf8(&bytes[at..at + len]).map_err(|_| "text is not utf-8".to_string())?;
+        texts.push(text.to_string());
+        at += len;
+        if at < bytes.len() && bytes[at] == b'\n' {
+            at += 1;
+        }
+    }
+    Ok(texts)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::read_texts;
 
     #[test]
-    fn test_is_compiled_artifact() {
-        assert!(is_compiled_artifact("tokenizer.compiled-v0.1.1-f13.tkz"));
-        assert!(is_compiled_artifact("tokenizer.compiled-v0.1.1-f13-b1a2b3c4d5e6f708.tkz"));
-        assert!(is_compiled_artifact("tokenizer.compiled-v0.1.1-f13.tkz.tmp"));
-        assert!(!is_compiled_artifact("tokenizer.json"));
-        assert!(!is_compiled_artifact("tokenizer.tkz"));
-        assert!(!is_compiled_artifact("model.compiled-v1.tkz"));
-    }
-
-    #[test]
-    fn test_remove_compiled_artifacts() {
-        let root = std::env::temp_dir().join(format!("tokie-cache-clear-test-{}", std::process::id()));
-        let snapshot = root.join("models--gpt2/snapshots/abc123");
-        std::fs::create_dir_all(&snapshot).unwrap();
-        let stale = snapshot.join("tokenizer.compiled-v0.1.0-f12.tkz");
-        let tmp = snapshot.join("tokenizer.compiled-v0.1.0-f12.tkz.tmp");
-        let json = snapshot.join("tokenizer.json");
-        std::fs::write(&stale, b"stale").unwrap();
-        std::fs::write(&tmp, b"tmp").unwrap();
-        std::fs::write(&json, b"{}").unwrap();
-
-        let mut removed = 0;
-        let mut bytes = 0;
-        remove_compiled_artifacts(&root, &mut removed, &mut bytes);
-
-        assert_eq!(removed, 2);
-        assert_eq!(bytes, 8);
-        assert!(!stale.exists());
-        assert!(!tmp.exists());
-        assert!(json.exists(), "tokenizer.json must be untouched");
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-}
-
-fn cmd_convert(repo_id: &str, output: &PathBuf, verify: bool, upload: bool, token: Option<&str>) {
-    print!("Converting {repo_id} ... ");
-
-    match tokie::build::convert(repo_id, output) {
-        Ok(result) => {
-            println!(
-                "OK  vocab={} size={:.1}KB",
-                result.vocab_size,
-                result.file_size_bytes as f64 / 1024.0
-            );
-        }
-        Err(e) => {
-            println!("FAILED: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    if verify {
-        print!("Verifying ... ");
-        match tokie::build::verify(repo_id, output) {
-            Ok(result) => {
-                let failed = result.failed > 0;
-                print_verify_result(&result);
-                if failed {
-                    std::process::exit(1);
-                }
-            }
-            Err(e) => {
-                println!("FAILED: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    if upload {
-        let tokiers_name = repo_id.rsplit('/').next().unwrap_or(repo_id);
-        print!("Uploading to tokiers/{tokiers_name} ... ");
-        match tokie::build::upload(output, tokiers_name, token) {
-            Ok(()) => println!("OK"),
-            Err(e) => {
-                println!("FAILED: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-}
-
-fn cmd_verify(repo_id: &str, tkz: Option<PathBuf>) {
-    let tkz_path = if let Some(path) = tkz {
-        path
-    } else {
-        let name = repo_id.rsplit('/').next().unwrap_or(repo_id);
-        print!("Downloading tokiers/{name} ... ");
-        let api = hf_hub::api::sync::ApiBuilder::new().build().unwrap();
-        let repo = hf_hub::Repo::model(format!("tokiers/{name}"));
-        match api.repo(repo).get("tokenizer.tkz") {
-            Ok(p) => {
-                println!("OK");
-                p
-            }
-            Err(e) => {
-                println!("FAILED: {e}");
-                std::process::exit(1);
-            }
-        }
-    };
-
-    print!("Verifying {repo_id} ... ");
-    match tokie::build::verify(repo_id, &tkz_path) {
-        Ok(result) => {
-            let failed = result.failed > 0;
-            print_verify_result(&result);
-            if failed {
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            println!("FAILED: {e}");
-            std::process::exit(1);
-        }
+    fn length_prefixed_texts_keep_newlines() {
+        let raw = b"5\nhello\n11\nHello\nworld\n0\n\n";
+        let texts = read_texts(&raw[..]).unwrap();
+        assert_eq!(texts, ["hello", "Hello\nworld", ""]);
     }
 }

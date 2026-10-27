@@ -1,518 +1,236 @@
-use std::sync::{Arc, RwLock};
+//! Python bindings for the tokie 0.2 tokenizer.
+//!
+//! `encode` and `batch` borrow the Python strings, release the GIL, and return
+//! NumPy arrays that own the id buffer. The Rust call is `Tokenizer::encode`
+//! and `Tokenizer::batch`. No per-id Python objects are built.
 
-use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use pyo3::prelude::*;
+use numpy::Element;
+use numpy::IntoPyArray;
+use numpy::PyArray1;
+use numpy::PyArrayDescrMethods;
+use numpy::npyffi::{self, PY_ARRAY_API};
 use pyo3::create_exception;
-use pyo3::types::PyBytes;
+use pyo3::prelude::*;
+use pyo3::types::{PyString, PyStringMethods};
+use tokie_core::{Specials, Tokenizer};
 
 create_exception!(tokie, TokieError, pyo3::exceptions::PyException);
 
-fn to_py_err(e: impl std::fmt::Display) -> PyErr {
-    TokieError::new_err(e.to_string())
+fn to_py_err(err: impl std::fmt::Display) -> PyErr {
+    TokieError::new_err(err.to_string())
 }
 
-/// Result of encoding text, with token IDs, attention mask, and type IDs.
-///
-/// `tokens` and `special_tokens_mask` are derived lazily from `ids` on access:
-/// building per-token strings for every encoding is pure overhead for the
-/// common ids-only consumers, and it used to happen under the GIL, serially,
-/// for every batch element.
-#[pyclass(name = "Encoding", skip_from_py_object)]
-#[derive(Clone)]
-struct PyEncoding {
-    #[pyo3(get)]
-    ids: Vec<u32>,
-    attention_mask_inner: Vec<u8>,
-    type_ids_inner: Vec<u8>,
-    offsets_inner: Vec<(usize, usize)>,
-    tok: Arc<RwLock<tokie_core::Tokenizer>>,
-}
-
-#[pymethods]
-impl PyEncoding {
-    #[getter]
-    fn tokens(&self) -> Vec<String> {
-        let tokenizer = self.tok.read().unwrap();
-        self.ids.iter().map(|&id| {
-            tokenizer.id_to_token(id)
-                .map(|s| s.into_owned())
-                .unwrap_or_default()
-        }).collect()
-    }
-
-    #[getter]
-    fn special_tokens_mask(&self) -> Vec<u32> {
-        let tokenizer = self.tok.read().unwrap();
-        self.ids.iter().map(|&id| {
-            if tokenizer.post_processor().is_special_token(id) { 1 } else { 0 }
-        }).collect()
-    }
-
-    #[getter]
-    fn attention_mask(&self) -> Vec<u32> {
-        // Empty inner + non-empty ids means the fast ids-only path was taken:
-        // no padding was configured, so the mask is all ones by construction
-        if self.attention_mask_inner.len() != self.ids.len() {
-            return vec![1u32; self.ids.len()];
-        }
-        self.attention_mask_inner.iter().map(|&x| x as u32).collect()
-    }
-
-    #[getter]
-    fn type_ids(&self) -> Vec<u32> {
-        if self.type_ids_inner.len() != self.ids.len() {
-            return vec![0u32; self.ids.len()];
-        }
-        self.type_ids_inner.iter().map(|&x| x as u32).collect()
-    }
-
-    #[getter]
-    fn offsets(&self) -> Vec<(usize, usize)> {
-        self.offsets_inner.clone()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "Encoding(ids=[...{}], attention_mask=[...{}], type_ids=[...{}])",
-            self.ids.len(),
-            self.attention_mask_inner.len(),
-            self.type_ids_inner.len(),
-        )
-    }
-
-    fn __len__(&self) -> usize {
-        self.ids.len()
-    }
-}
-
-impl PyEncoding {
-    /// Create from a core Encoding. O(1) beyond moving the buffers — token
-    /// strings and special-token masks are derived on attribute access.
-    fn from_encoding(enc: tokie_core::Encoding, tok: Arc<RwLock<tokie_core::Tokenizer>>) -> Self {
-        Self {
-            ids: enc.ids,
-            attention_mask_inner: enc.attention_mask,
-            type_ids_inner: enc.type_ids,
-            offsets_inner: enc.offsets,
-            tok,
-        }
-    }
-
-}
-
-/// Fast, correct tokenizer. Supports BPE, WordPiece, and Unigram.
+/// One tokenizer. Encode and batch take the lock and run without the GIL.
 #[pyclass(name = "Tokenizer")]
 struct PyTokenizer {
-    inner: Arc<RwLock<tokie_core::Tokenizer>>,
+    inner: Mutex<Tokenizer>,
+    /// Id storage from the last array the caller dropped. The next encode
+    /// writes into it, so the pages stay resident.
+    ids: Arc<Mutex<Vec<u32>>>,
 }
 
-impl PyTokenizer {
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, tokie_core::Tokenizer> {
-        self.inner.read().unwrap()
-    }
-
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, tokie_core::Tokenizer> {
-        self.inner.write().unwrap()
+fn fresh(inner: Tokenizer) -> PyTokenizer {
+    PyTokenizer {
+        inner: Mutex::new(inner),
+        ids: Arc::new(Mutex::new(Vec::new())),
     }
 }
 
 #[pymethods]
 impl PyTokenizer {
-    /// Load a tokenizer from a HuggingFace tokenizer.json file.
+    /// Read a `.tokie` file or a `tokenizer.json`.
     #[staticmethod]
-    fn from_json(path: &str) -> PyResult<Self> {
-        let inner = tokie_core::Tokenizer::from_json(path).map_err(to_py_err)?;
-        Ok(Self { inner: Arc::new(RwLock::new(inner)) })
+    fn open(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let path = path.to_string();
+        let inner = py.detach(|| Tokenizer::open(&path).map_err(to_py_err))?;
+        Ok(fresh(inner))
     }
 
-    /// Load a tokenizer from a .tkz binary file.
+    /// Parse the text of a `tokenizer.json`.
     #[staticmethod]
-    fn from_file(path: &str) -> PyResult<Self> {
-        let inner = tokie_core::Tokenizer::from_file(path).map_err(to_py_err)?;
-        Ok(Self { inner: Arc::new(RwLock::new(inner)) })
-    }
-
-    /// Download and load a tokenizer from the HuggingFace Hub.
-    /// Tries .tkz first, then falls back to tokenizer.json.
-    #[cfg(feature = "hf")]
-    #[staticmethod]
-    fn from_pretrained(py: Python<'_>, repo_id: &str) -> PyResult<Self> {
-        let repo = repo_id.to_string();
-        let inner = py.detach(|| {
-            tokie_core::Tokenizer::from_pretrained(&repo).map_err(to_py_err)
-        })?;
-        Ok(Self { inner: Arc::new(RwLock::new(inner)) })
-    }
-
-    /// Call the tokenizer: encode text or a text pair.
-    /// Usage: tokenizer("text") or tokenizer("text_a", "text_b")
-    #[pyo3(signature = (text, text_pair=None, add_special_tokens=true))]
-    fn __call__(
-        &self,
-        py: Python<'_>,
-        text: &str,
-        text_pair: Option<&str>,
-        add_special_tokens: bool,
-    ) -> PyEncoding {
-        match text_pair {
-            Some(pair) => {
-                let a = text.to_string();
-                let b = pair.to_string();
-                let inner = self.read();
-                let enc = py.detach(|| inner.encode_pair(&a, &b, add_special_tokens));
-                PyEncoding::from_encoding(enc, self.inner.clone())
-            }
-            None => {
-                let text = text.to_string();
-                let inner = self.read();
-                let enc = py.detach(|| inner.encode(&text, add_special_tokens));
-                PyEncoding::from_encoding(enc, self.inner.clone())
-            }
-        }
-    }
-
-    /// Encode text into an Encoding (ids, attention_mask, type_ids).
-    #[pyo3(signature = (text, add_special_tokens=true))]
-    fn encode(&self, py: Python<'_>, text: &str, add_special_tokens: bool) -> PyEncoding {
+    fn json(py: Python<'_>, text: &str) -> PyResult<Self> {
         let text = text.to_string();
-        let inner = self.read();
-        if inner.padding().is_none() {
-            // Fast path: bare ids; masks are synthesized lazily on access
-            let ids = py.detach(|| inner.encode_ids(&text, add_special_tokens));
-            return PyEncoding {
-                ids,
-                attention_mask_inner: Vec::new(),
-                type_ids_inner: Vec::new(),
-                offsets_inner: Vec::new(),
-                tok: self.inner.clone(),
-            };
-        }
-        let enc = py.detach(|| inner.encode(&text, add_special_tokens));
-        PyEncoding::from_encoding(enc, self.inner.clone())
+        let inner = py.detach(|| Tokenizer::json(&text).map_err(to_py_err))?;
+        Ok(fresh(inner))
     }
 
-    /// Encode a pair of texts (e.g. for cross-encoder models).
-    #[pyo3(signature = (text_a, text_b, add_special_tokens=true))]
-    fn encode_pair(
-        &self,
-        py: Python<'_>,
-        text_a: &str,
-        text_b: &str,
-        add_special_tokens: bool,
-    ) -> PyEncoding {
-        let a = text_a.to_string();
-        let b = text_b.to_string();
-        let inner = self.read();
-        let enc = py.detach(|| inner.encode_pair(&a, &b, add_special_tokens));
-        PyEncoding::from_encoding(enc, self.inner.clone())
+    /// Download `tokenizer.json` for a Hub repo and parse it.
+    #[staticmethod]
+    fn pretrained(py: Python<'_>, repo: &str) -> PyResult<Self> {
+        let repo = repo.to_string();
+        let inner = py.detach(|| Tokenizer::pretrained(&repo).map_err(to_py_err))?;
+        Ok(fresh(inner))
     }
 
-    /// Encode text into an Encoding with byte offsets into the (normalized) input.
-    #[pyo3(signature = (text, add_special_tokens=true))]
-    fn encode_with_offsets(&self, py: Python<'_>, text: &str, add_special_tokens: bool) -> PyEncoding {
-        let text = text.to_string();
-        let inner = self.read();
-        let enc = py.detach(|| inner.encode_with_offsets(&text, add_special_tokens));
-        PyEncoding::from_encoding(enc, self.inner.clone())
-    }
-
-    /// Encode raw bytes into token IDs.
-    fn encode_bytes(&self, data: &[u8]) -> Vec<u32> {
-        self.read().encode_bytes(data)
-    }
-
-    /// Decode token IDs back to a string. Returns None if not valid UTF-8.
-    fn decode(&self, tokens: Vec<u32>) -> Option<String> {
-        self.read().decode(&tokens)
-    }
-
-    /// Decode token IDs back to raw bytes.
-    fn decode_bytes<'py>(&self, py: Python<'py>, tokens: Vec<u32>) -> Bound<'py, PyBytes> {
-        let bytes = self.read().decode_bytes(&tokens);
-        PyBytes::new(py, &bytes)
-    }
-
-    /// Convert a token ID to its string representation.
-    fn id_to_token(&self, id: u32) -> Option<String> {
-        self.read().id_to_token(id).map(|s| s.into_owned())
-    }
-
-    /// Convert a token string to its ID.
-    fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.read().token_to_id(token)
-    }
-
-    /// Get the full vocabulary as a dict mapping token strings to IDs.
-    fn get_vocab(&self) -> HashMap<String, u32> {
-        self.read().get_vocab()
-    }
-
-    /// Decode multiple token ID sequences in parallel.
-    fn decode_batch(&self, py: Python<'_>, sequences: Vec<Vec<u32>>) -> Vec<Option<String>> {
-        let inner = self.read();
-        py.detach(|| {
-            sequences.iter().map(|tokens| inner.decode(tokens)).collect()
+    /// Append-style encode. Specials that occur in `text` are emitted.
+    /// The single-sequence template is not applied. Returns a `uint32` array.
+    fn encode<'py>(&self, py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        // `text` points at the Python string's UTF-8 cache. The object stays
+        // alive for this call, and the cache is immutable, so encode can run
+        // without copying the text.
+        let ids = py.detach(|| {
+            let mut tok = self.inner.lock().unwrap();
+            let mut ids = checkout(&self.ids, text.len() / 4 + 16);
+            tok.encode(text, &mut ids).map_err(|err| err.to_string())?;
+            Ok::<Vec<u32>, String>(ids)
         })
+        .map_err(to_py_err)?;
+        ids_array(py, &self.ids, ids)
     }
 
-    /// Encode multiple texts in parallel, returning a list of Encoding objects.
-    #[pyo3(signature = (texts, add_special_tokens=true))]
-    fn encode_batch(&self, py: Python<'_>, texts: Vec<String>, add_special_tokens: bool) -> Vec<PyEncoding> {
-        let inner = self.read();
-        let encodings = py.detach(|| {
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            inner.encode_batch(&text_refs, add_special_tokens)
-        });
-        encodings.into_iter()
-            .map(|enc| PyEncoding::from_encoding(enc, self.inner.clone()))
-            .collect()
+    /// `encode`, then the single-sequence template.
+    fn wrap<'py>(&self, py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let ids = py.detach(|| {
+            let mut tok = self.inner.lock().unwrap();
+            let mut ids = checkout(&self.ids, text.len() / 4 + 16);
+            tok.wrap(text, &mut ids).map_err(|err| err.to_string())?;
+            Ok::<Vec<u32>, String>(ids)
+        })
+        .map_err(to_py_err)?;
+        ids_array(py, &self.ids, ids)
     }
 
-    /// Encode multiple texts in parallel into one contiguous buffer.
-    ///
-    /// Returns `(ids, lengths)` as numpy arrays: `ids` is a uint32 array of
-    /// every document's token ids concatenated in order; `lengths` is a
-    /// uint64 array of per-document id counts (`np.cumsum(lengths)` gives
-    /// document end offsets). No per-document Python objects are
-    /// materialized; the Rust buffers are handed to numpy without copying.
-    /// Padding is not applied; truncation and special tokens are.
-    #[pyo3(signature = (texts, add_special_tokens=true))]
-    fn encode_batch_flat<'py>(
+    /// Text for `ids`. `skip` omits specials.
+    #[pyo3(signature = (ids, skip=false))]
+    fn decode(&self, py: Python<'_>, ids: Vec<u32>, skip: bool) -> PyResult<String> {
+        let specials = if skip { Specials::Skip } else { Specials::Keep };
+        py.detach(|| {
+            let tok = self.inner.lock().unwrap();
+            let mut text = String::new();
+            tok.decode(&ids, &mut text, specials).map_err(|err| err.to_string())?;
+            Ok::<String, String>(text)
+        })
+        .map_err(to_py_err)
+    }
+
+    /// Encode each text with `encode`. Returns `(ids, ends)` as `uint32` and
+    /// `uint64` arrays. `ends[i]` is the id count after text `i`.
+    fn batch<'py>(
         &self,
         py: Python<'py>,
-        texts: Vec<String>,
-        add_special_tokens: bool,
-    ) -> (Bound<'py, numpy::PyArray1<u32>>, Bound<'py, numpy::PyArray1<u64>>) {
-        use numpy::IntoPyArray;
-        let inner = self.read();
-        let (ids, lens) = py.detach(|| {
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            inner.encode_batch_flat(&text_refs, add_special_tokens)
-        });
-        (ids.into_pyarray(py), lens.into_pyarray(py))
+        texts: Vec<Bound<'py, PyString>>,
+    ) -> PyResult<(Bound<'py, PyArray1<u32>>, Bound<'py, PyArray1<u64>>)> {
+        let borrowed = texts
+            .iter()
+            .map(|text| text.to_str())
+            .collect::<PyResult<Vec<&str>>>()?;
+        let (ids, ends) = py.detach(|| {
+            let mut tok = self.inner.lock().unwrap();
+            let bytes = borrowed.iter().map(|text| text.len()).sum::<usize>();
+            let mut ids = checkout(&self.ids, bytes / 4 + 16);
+            let mut ends = Vec::with_capacity(borrowed.len());
+            tok.batch(&borrowed, &mut ids, &mut ends)
+                .map_err(|err| err.to_string())?;
+            let ends: Vec<u64> = ends.into_iter().map(|n| n as u64).collect();
+            Ok::<(Vec<u32>, Vec<u64>), String>((ids, ends))
+        })
+        .map_err(to_py_err)?;
+        Ok((ids_array(py, &self.ids, ids)?, ends.into_pyarray(py)))
     }
 
-    /// Encode corpus files in bulk, entirely in Rust.
-    ///
-    /// Reads each file's bytes in Rust, splits every file on the
-    /// `separator` byte sequence (empty separator: one document per
-    /// file), drops empty documents — matching
-    /// `[d for d in text.split(sep) if d]` — and encodes all documents
-    /// with the parallel bulk pipeline. No text ever crosses the Python
-    /// boundary, so this is the fastest way to tokenize corpora from
-    /// disk. Documents with invalid UTF-8 are lossy-converted (invalid
-    /// sequences become U+FFFD) instead of raising.
-    ///
-    /// Returns `(ids, offsets)` as numpy arrays: `ids` is a uint32 array
-    /// of every document's token ids concatenated in order; `offsets` is
-    /// a uint64 array of `ndocs + 1` boundaries — document `i` is
-    /// `ids[offsets[i]:offsets[i + 1]]`. The Rust buffers are handed to
-    /// numpy without copying. Padding is not applied; truncation and
-    /// special tokens are (special tokens off by default).
-    #[pyo3(signature = (paths, separator=None, add_special_tokens=false))]
-    fn encode_files<'py>(
-        &self,
-        py: Python<'py>,
-        paths: Vec<std::path::PathBuf>,
-        separator: Option<Vec<u8>>,
-        add_special_tokens: bool,
-    ) -> PyResult<(Bound<'py, numpy::PyArray1<u32>>, Bound<'py, numpy::PyArray1<u64>>)> {
-        use numpy::IntoPyArray;
-        let separator = separator.unwrap_or_else(|| b"<|endoftext|>".to_vec());
-        let inner = self.read();
-        let (ids, offsets) = py.detach(|| {
-            inner.encode_files_flat(&paths, &separator, add_special_tokens)
-        })?;
-        Ok((ids.into_pyarray(py), offsets.into_pyarray(py)))
+    /// How many workers `batch` uses.
+    fn threads(&self, n: usize) {
+        self.inner.lock().unwrap().threads(n);
     }
 
-    /// Count tokens across corpus files without materializing ids.
-    ///
-    /// Same file reading, separator splitting, empty-document filtering,
-    /// and lossy UTF-8 handling as `encode_files`; returns the total
-    /// token count over all documents (no special tokens).
-    #[pyo3(signature = (paths, separator=None))]
-    fn count_tokens_files(
-        &self,
-        py: Python<'_>,
-        paths: Vec<std::path::PathBuf>,
-        separator: Option<Vec<u8>>,
-    ) -> PyResult<usize> {
-        let separator = separator.unwrap_or_else(|| b"<|endoftext|>".to_vec());
-        let inner = self.read();
-        Ok(py.detach(|| inner.count_tokens_files(&paths, &separator))?)
+    /// The vocab string for `id`.
+    fn token(&self, id: u32) -> Option<String> {
+        self.inner.lock().unwrap().token(id).map(str::to_string)
     }
 
-    /// Count the number of tokens in the text.
-    fn count_tokens(&self, py: Python<'_>, text: &str) -> usize {
-        let text = text.to_string();
-        let inner = self.read();
-        py.detach(|| inner.count_tokens(&text))
+    /// The id for a vocab string.
+    fn id(&self, token: &str) -> Option<u32> {
+        self.inner.lock().unwrap().id(token)
     }
 
-    /// Count tokens for multiple texts in parallel.
-    fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<String>) -> Vec<usize> {
-        let inner = self.read();
+    /// Write this tokenizer as a `.tokie` file.
+    fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let path = path.to_string();
         py.detach(|| {
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            inner.count_tokens_batch(&text_refs)
+            self.inner.lock().unwrap().save(&path).map_err(to_py_err)
         })
     }
 
-    /// Save the tokenizer to a .tkz binary file.
-    fn save(&self, path: &str) -> PyResult<()> {
-        self.read().to_file(path).map_err(to_py_err)
+    fn __repr__(&self) -> &'static str {
+        "Tokenizer()"
     }
+}
 
-    /// The vocabulary size.
-    #[getter]
-    fn vocab_size(&self) -> usize {
-        self.read().vocab_size()
+/// Owns an id buffer for as long as the NumPy array that views it is alive.
+/// Dropping the array returns the buffer to the tokenizer.
+#[pyclass]
+struct IdOwner {
+    pool: Arc<Mutex<Vec<u32>>>,
+    buf: Vec<u32>,
+}
+
+impl Drop for IdOwner {
+    fn drop(&mut self) {
+        let mut slot = self.pool.lock().unwrap();
+        self.buf.clear();
+        if self.buf.capacity() > slot.capacity() {
+            *slot = std::mem::take(&mut self.buf);
+        }
     }
+}
 
-    /// The pad token ID, if set.
-    #[getter]
-    fn pad_token_id(&self) -> Option<u32> {
-        self.read().pad_token_id()
+fn checkout(pool: &Mutex<Vec<u32>>, need: usize) -> Vec<u32> {
+    let mut slot = pool.lock().unwrap();
+    let mut ids = std::mem::take(&mut *slot);
+    drop(slot);
+    ids.clear();
+    if ids.capacity() < need {
+        ids.reserve(need);
     }
+    ids
+}
 
-    /// Enable padding for encode_batch.
-    #[pyo3(signature = (*, direction="right", pad_id=0, pad_type_id=0, length=None, pad_to_multiple_of=None))]
-    fn enable_padding(
-        &self,
-        direction: &str,
-        pad_id: u32,
-        pad_type_id: u8,
-        length: Option<usize>,
-        pad_to_multiple_of: Option<usize>,
-    ) -> PyResult<()> {
-        let direction = match direction {
-            "right" => tokie_core::PaddingDirection::Right,
-            "left" => tokie_core::PaddingDirection::Left,
-            _ => return Err(TokieError::new_err("direction must be 'left' or 'right'")),
-        };
-        let strategy = match length {
-            Some(n) => tokie_core::PaddingStrategy::Fixed(n),
-            None => tokie_core::PaddingStrategy::BatchLongest,
-        };
-        let params = tokie_core::PaddingParams {
-            strategy,
-            direction,
-            pad_to_multiple_of,
-            pad_id,
-            pad_type_id,
-        };
-        self.write().enable_padding(params);
-        Ok(())
-    }
-
-    /// Enable truncation.
-    #[pyo3(signature = (max_length, *, stride=0, strategy="longest_first", direction="right"))]
-    fn enable_truncation(
-        &self,
-        max_length: usize,
-        stride: usize,
-        strategy: &str,
-        direction: &str,
-    ) -> PyResult<()> {
-        let strategy = match strategy {
-            "longest_first" => tokie_core::TruncationStrategy::LongestFirst,
-            "only_first" => tokie_core::TruncationStrategy::OnlyFirst,
-            "only_second" => tokie_core::TruncationStrategy::OnlySecond,
-            _ => return Err(TokieError::new_err("strategy must be 'longest_first', 'only_first', or 'only_second'")),
-        };
-        let direction = match direction {
-            "right" => tokie_core::TruncationDirection::Right,
-            "left" => tokie_core::TruncationDirection::Left,
-            _ => return Err(TokieError::new_err("direction must be 'left' or 'right'")),
-        };
-        let params = tokie_core::TruncationParams {
-            max_length,
-            strategy,
-            direction,
-            stride,
-        };
-        self.write().enable_truncation(params);
-        Ok(())
-    }
-
-    /// Get current padding configuration, or None if disabled.
-    #[getter]
-    fn padding(&self) -> Option<HashMap<String, Py<PyAny>>> {
-        Python::attach(|py| {
-            self.read().padding().map(|p| {
-                let mut d = HashMap::new();
-                match p.strategy {
-                    tokie_core::PaddingStrategy::Fixed(n) =>
-                        d.insert("length".to_string(), n.into_pyobject(py).unwrap().into_any().unbind()),
-                    tokie_core::PaddingStrategy::BatchLongest =>
-                        d.insert("length".to_string(), py.None()),
-                };
-                d.insert("pad_to_multiple_of".to_string(),
-                    p.pad_to_multiple_of.map(|n| n.into_pyobject(py).unwrap().into_any().unbind())
-                        .unwrap_or_else(|| py.None()));
-                d.insert("pad_id".to_string(), p.pad_id.into_pyobject(py).unwrap().into_any().unbind());
-                d.insert("pad_type_id".to_string(), p.pad_type_id.into_pyobject(py).unwrap().into_any().unbind());
-                let dir_str = match p.direction {
-                    tokie_core::PaddingDirection::Right => "right",
-                    tokie_core::PaddingDirection::Left => "left",
-                };
-                d.insert("direction".to_string(), dir_str.into_pyobject(py).unwrap().into_any().unbind());
-                d
-            })
-        })
-    }
-
-    /// Get current truncation configuration, or None if disabled.
-    #[getter]
-    fn truncation(&self) -> Option<HashMap<String, Py<PyAny>>> {
-        Python::attach(|py| {
-            self.read().truncation().map(|t| {
-                let mut d = HashMap::new();
-                d.insert("max_length".to_string(), t.max_length.into_pyobject(py).unwrap().into_any().unbind());
-                d.insert("stride".to_string(), t.stride.into_pyobject(py).unwrap().into_any().unbind());
-                let strat = match t.strategy {
-                    tokie_core::TruncationStrategy::LongestFirst => "longest_first",
-                    tokie_core::TruncationStrategy::OnlyFirst => "only_first",
-                    tokie_core::TruncationStrategy::OnlySecond => "only_second",
-                };
-                d.insert("strategy".to_string(), strat.into_pyobject(py).unwrap().into_any().unbind());
-                let dir_str = match t.direction {
-                    tokie_core::TruncationDirection::Right => "right",
-                    tokie_core::TruncationDirection::Left => "left",
-                };
-                d.insert("direction".to_string(), dir_str.into_pyobject(py).unwrap().into_any().unbind());
-                d
-            })
-        })
-    }
-
-    /// Disable padding.
-    fn no_padding(&self) {
-        self.write().no_padding();
-    }
-
-    /// Disable truncation.
-    fn no_truncation(&self) {
-        self.write().no_truncation();
-    }
-
-    /// Number of special tokens added for a single sequence or pair.
-    #[pyo3(signature = (is_pair=false))]
-    fn num_special_tokens_to_add(&self, is_pair: bool) -> usize {
-        self.read().num_special_tokens_to_add(is_pair)
-    }
-
-    fn __repr__(&self) -> String {
-        format!("Tokenizer(vocab_size={})", self.read().vocab_size())
+fn ids_array<'py>(
+    py: Python<'py>,
+    pool: &Arc<Mutex<Vec<u32>>>,
+    ids: Vec<u32>,
+) -> PyResult<Bound<'py, PyArray1<u32>>> {
+    let len = ids.len();
+    let owner = Bound::new(
+        py,
+        IdOwner {
+            pool: Arc::clone(pool),
+            buf: ids,
+        },
+    )?;
+    let data = owner.borrow().buf.as_ptr();
+    let mut dims = [len as npyffi::npy_intp];
+    let strides = [std::mem::size_of::<u32>() as npyffi::npy_intp];
+    unsafe {
+        let ptr = PY_ARRAY_API.PyArray_NewFromDescr(
+            py,
+            npyffi::get_type_object(py, npyffi::NpyTypes::PyArray_Type),
+            u32::get_dtype(py).into_dtype_ptr(),
+            1,
+            dims.as_mut_ptr(),
+            strides.as_ptr() as *mut npyffi::npy_intp,
+            data as *mut std::ffi::c_void,
+            npyffi::NPY_ARRAY_WRITEABLE,
+            std::ptr::null_mut(),
+        );
+        if ptr.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let owner_ptr = owner.into_ptr();
+        if PY_ARRAY_API.PyArray_SetBaseObject(py, ptr.cast(), owner_ptr) < 0 {
+            pyo3::ffi::Py_DECREF(owner_ptr);
+            pyo3::ffi::Py_DECREF(ptr);
+            return Err(PyErr::fetch(py));
+        }
+        Ok(Bound::from_owned_ptr(py, ptr).cast_into_unchecked())
     }
 }
 
 #[pymodule]
 fn tokie(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTokenizer>()?;
-    m.add_class::<PyEncoding>()?;
     m.add("TokieError", m.py().get_type::<TokieError>())?;
     Ok(())
 }

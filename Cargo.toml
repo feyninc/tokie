@@ -1,3 +1,9 @@
 [workspace]
-members = ["crates/normalie", "crates/pretokie", "crates/tokie"]
+members = [
+    "crates/normalie",
+    "crates/pretokie",
+    "crates/tokie",
+    "crates/tokie-cli",
+    "crates/tokie-python",
+]
 resolver = "2"
