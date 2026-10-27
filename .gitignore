@@ -32,6 +32,10 @@ models/
 # Benchmark data (download instructions in benches/tokenize.rs)
 **/benches/data/
 
+# Local tokenizer.json copies. The Hub cache is the default source.
+bench/tokie/data/*
+!bench/tokie/data/.gitkeep
+
 # Development files
 CLAUDE.md
 work.log
@@ -43,3 +47,6 @@ benchmark_results.json
 
 # Claude Code session state and agent worktrees
 .claude/
+
+# Cursor project skills and local agent state
+.cursor/

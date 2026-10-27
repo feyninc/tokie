@@ -9,3 +9,4 @@ pub use impls::{
     UnsupportedPattern, Voyage,
 };
 pub use span::Span;
+pub use walk::{mix_piece, pack_piece};

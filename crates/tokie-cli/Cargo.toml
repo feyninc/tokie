@@ -11,6 +11,6 @@ name = "tokie"
 path = "src/main.rs"
 
 [dependencies]
-tokie = { path = "../tokie", features = ["hf", "build"] }
+tokie = { path = "../tokie" }
 clap = { version = "4", features = ["derive"] }
 hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }

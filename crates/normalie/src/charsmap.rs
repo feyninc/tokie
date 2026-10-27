@@ -122,6 +122,86 @@ impl Charsmap {
         Ok(map)
     }
 
+    pub(crate) fn parts(&self) -> (&[u32], &str, &[(u32, u32)]) {
+        (&self.trie, &self.replacements, &self.bmp)
+    }
+
+    /// Assemble a map from a stored trie and BMP table.
+    ///
+    /// The ASCII cache and the `\r\n` answer come from the trie. The BMP rows
+    /// are stored as given.
+    pub(crate) fn from_parts(
+        trie: Vec<u32>,
+        replacements: String,
+        bmp: Vec<(u32, u32)>,
+    ) -> Result<Self, CharsmapError> {
+        if bmp.len() != 0x10000 {
+            return Err(CharsmapError::Truncated);
+        }
+        let mut map = Self {
+            trie,
+            replacements,
+            ascii: std::array::from_fn(|_| None),
+            bmp,
+            crlf: None,
+            fast_scan: true,
+        };
+        let mut fast_scan = true;
+        for cp in 0..128u32 {
+            let (start, end) = map.bmp[cp as usize];
+            if start == u32::MAX {
+                continue;
+            }
+            let start = start as usize;
+            let end = end as usize;
+            if start > end || end > map.replacements.len() {
+                return Err(CharsmapError::Truncated);
+            }
+            let norm = map
+                .replacements
+                .get(start..end)
+                .ok_or(CharsmapError::InvalidUtf8)?;
+            if (0x20..0x7F).contains(&(cp as u8)) {
+                fast_scan = false;
+            }
+            map.ascii[cp as usize] = Some(norm.to_string().into());
+        }
+        for (start, end) in &map.bmp[128..] {
+            if *start == u32::MAX {
+                continue;
+            }
+            if *start > *end || *end as usize > map.replacements.len() {
+                return Err(CharsmapError::Truncated);
+            }
+        }
+        if let Some(norm) = map.transform("\r\n")
+            && norm != "\r\n"
+        {
+            map.crlf = Some(norm.to_string().into());
+        }
+        map.fast_scan = fast_scan;
+        Ok(map)
+    }
+
+    pub(crate) fn split_blob(blob: &[u8]) -> Result<(Vec<u32>, String), CharsmapError> {
+        if blob.len() < 4 {
+            return Err(CharsmapError::Truncated);
+        }
+        let trie_bytes = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
+        let trie_end = 4usize.checked_add(trie_bytes).ok_or(CharsmapError::Truncated)?;
+        if trie_end > blob.len() || trie_bytes % 4 != 0 {
+            return Err(CharsmapError::Truncated);
+        }
+        let trie: Vec<u32> = blob[4..trie_end]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let replacements = std::str::from_utf8(&blob[trie_end..])
+            .map_err(|_| CharsmapError::InvalidUtf8)?
+            .to_string();
+        Ok((trie, replacements))
+    }
+
     #[inline]
     fn first_prefix_match(&self, key: &[u8]) -> Option<usize> {
         let mut node_pos = 0usize;
