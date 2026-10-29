@@ -51,6 +51,14 @@ impl Gpt2Walk<'_> {
     pub fn fill(&mut self, out: &mut [Span]) -> usize {
         self.inner.fill(out)
     }
+
+    /// Write the next piece boundaries into `out`.
+    ///
+    /// `out[0]` is the absolute start. Each later entry is the next piece's
+    /// exclusive end. `out` must hold `limit + 80` slots.
+    pub fn bounds(&mut self, out: &mut [u32], limit: usize) -> usize {
+        self.inner.bounds(out, limit)
+    }
 }
 
 impl Scheme for Gpt2 {
@@ -63,6 +71,7 @@ impl Scheme for Gpt2 {
     fn try_window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
         window::<ISA, false>(bytes, pos)
     }
+
 }
 
 #[inline]
@@ -306,6 +315,12 @@ fn advance_ws<const SINGLE_DIGITS: bool>(bytes: &[u8], scan: usize, token_start:
 /// A multibyte whitespace character occupies several whitespace bytes. The
 /// split belongs on its lead, not on its last byte. ASCII whitespace is
 /// handled in the kernel.
+///
+/// The bits match a walk of each whitespace lead. A character's width is
+/// how many continuation bits follow its lead, and the bit is set on the
+/// lead when the next character is not whitespace. Outlined so the walk
+/// stays out of the ASCII window.
+#[inline(never)]
 fn ws_multibyte_splits<const SINGLE_DIGITS: bool>(
     whitespace: u64,
     cont: u64,
@@ -313,29 +328,34 @@ fn ws_multibyte_splits<const SINGLE_DIGITS: bool>(
     bytes: &[u8],
     pos: usize,
 ) -> u64 {
-    let mut split = 0u64;
-    let mut leads = whitespace & !cont;
-    while leads != 0 {
-        let i = leads.trailing_zeros() as usize;
-        leads &= leads - 1;
-        let mut width = 1;
-        while i + width < 64 && cont & (1u64 << (i + width)) != 0 {
-            width += 1;
-        }
-        let next = i + width;
-        let next_is_ws = if next < 64 {
-            whitespace & (1u64 << next) != 0
-        } else {
-            byte_is_whitespace(bytes, pos + next)
-        };
-        let next_is_number = SINGLE_DIGITS
-            && if next < 64 {
-                digit & (1u64 << next) != 0
-            } else {
-                byte_is_number(bytes, pos + next)
-            };
+    let leads = whitespace & !cont;
+    let c1 = cont >> 1;
+    let c2 = cont >> 2;
+    let c3 = cont >> 3;
+    let w1 = leads & !c1;
+    let w2 = leads & c1 & !c2;
+    let w3 = leads & c1 & c2 & !c3;
+    let w4 = leads & c1 & c2 & c3;
+    let not_ws = !whitespace;
+    let mut split = (w1 & (not_ws >> 1))
+        | (w2 & (not_ws >> 2))
+        | (w3 & (not_ws >> 3))
+        | (w4 & (not_ws >> 4));
+    if SINGLE_DIGITS {
+        split &= !((w1 & (digit >> 1))
+            | (w2 & (digit >> 2))
+            | (w3 & (digit >> 3))
+            | (w4 & (digit >> 4)));
+    }
+    // A lead whose next byte sits past the window all look at `pos + 64`.
+    let edge = (w1 & (1u64 << 63)) | (w2 & (1u64 << 62)) | (w3 & (1u64 << 61)) | (w4 & (1u64 << 60));
+    if edge != 0 {
+        let next_is_ws = byte_is_whitespace(bytes, pos + 64);
+        let next_is_number = SINGLE_DIGITS && byte_is_number(bytes, pos + 64);
         if !next_is_ws && !next_is_number {
-            split |= 1u64 << i;
+            split |= edge;
+        } else {
+            split &= !edge;
         }
     }
     split
@@ -344,7 +364,7 @@ fn ws_multibyte_splits<const SINGLE_DIGITS: bool>(
 /// Fold non-ASCII characters into the class masks.
 ///
 /// Every in-window byte of a character gets that character's class, so the
-/// byte algebra treats the character as one run. Continuation bytes are
+/// masks treat the character as one run. Continuation bytes are
 /// returned separately and are never piece starts. The stop index is the
 /// first byte that cannot be classified, or 64 when the window is complete.
 fn absorb_non_ascii(bytes: &[u8], pos: usize, masks: &Masks) -> (u64, u64, u64, u64, u32) {
@@ -478,15 +498,7 @@ pub(crate) fn window<const ISA: u8, const SINGLE_DIGITS: bool>(
     }
     boundary &= !cont;
 
-    if boundary & 1 == 0 {
-        return None;
-    }
-    let complete = if finishes {
-        boundary.count_ones()
-    } else {
-        boundary.count_ones().saturating_sub(1)
-    };
-    if complete == 0 {
+    if boundary & 1 == 0 || (!finishes && boundary == 1) {
         return None;
     }
     Some(Window {
@@ -668,4 +680,58 @@ mod tests {
         assert_eq!(Gpt2::fill(text, &mut out), 1);
         assert_eq!(&text[out[0].start as usize..out[0].end as usize], "Hello");
     }
+
+    #[test]
+    fn bounds_match_fill() {
+        let mut samples = vec![
+            String::new(),
+            "Hello world".to_string(),
+            "it's a test\n".to_string(),
+            "123 456".to_string(),
+            "café naïve 東京".to_string(),
+            "a".repeat(80),
+            "Hello world! It's a test.\n\tDon't  stop.\n".repeat(40),
+        ];
+        samples.push("word ".repeat(300));
+        for text in samples {
+            let mut spans = vec![Span { start: 0, end: 0 }; text.len() + 1];
+            let n = {
+                let mut walk = Gpt2::walk(&text);
+                let mut at = 0;
+                let mut buf = [Span { start: 0, end: 0 }; 64];
+                loop {
+                    let k = walk.fill(&mut buf);
+                    if k == 0 {
+                        break;
+                    }
+                    spans[at..at + k].copy_from_slice(&buf[..k]);
+                    at += k;
+                }
+                at
+            };
+            for limit in [1usize, 7, 64, 256] {
+                let mut walk = Gpt2::walk(&text);
+                let mut buf = vec![0u32; limit + 80];
+                let mut got = Vec::new();
+                loop {
+                    let k = walk.bounds(&mut buf, limit);
+                    if k == 0 {
+                        break;
+                    }
+                    for i in 0..k {
+                        got.push(Span {
+                            start: buf[i],
+                            end: buf[i + 1],
+                        });
+                    }
+                    if k < limit {
+                        break;
+                    }
+                }
+                assert_eq!(got.len(), n, "limit {limit} text len {}", text.len());
+                assert_eq!(&got[..], &spans[..n], "limit {limit}");
+            }
+        }
+    }
+
 }

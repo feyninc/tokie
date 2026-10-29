@@ -9,6 +9,7 @@ pub use impls::{
     UnsupportedPattern, Voyage,
 };
 pub use span::Span;
+pub use walk::{mix_piece, pack_piece};
 
 /// The mask-based pretokenizers tokie runs today: [`mask::Mask`] over a
 /// per-scheme config, with piece and block callbacks, plus [`mask::Bert`]

@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "crates/normalie",
+    "crates/pretokie",
+    "crates/tokie",
+    "crates/tokie-cli",
+    "crates/tokie-python",
+]
 resolver = "2"
 
 # One optimization unit across crates: the hot loops call from tokie into

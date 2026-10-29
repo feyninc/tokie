@@ -1,11 +1,12 @@
 //! o200k split rules, and the siblings that share them.
 //!
-//! A letter run is case-structured: capitals stay together until a
-//! lowercase letter, and a capital after a lowercase letter starts a new
-//! piece (`camelCase` is `camel` and `Case`). [`O200k`] and [`Kimi`] glue
-//! a contraction onto that piece (`don't` stays whole). [`Nemotron`] leaves
+//! A letter run splits on case. Capitals stay together until a lowercase
+//! letter, and a capital after a lowercase letter starts a new piece.
+//! `camelCase` is `camel` and `Case`. [`O200k`] and [`Kimi`] keep a
+//! contraction on that piece, so `don't` stays whole. [`Nemotron`] leaves
 //! the contraction as its own piece. [`O200k`] and [`Kimi`] take numbers in
-//! groups of up to three. [`Nemotron`] takes each number character alone.
+//! groups of up to three. [`Nemotron`] takes each number character as its
+//! own piece.
 //! [`O200k`] and [`Nemotron`] keep a following run of newlines and slashes
 //! on punctuation. [`Kimi`] keeps newlines only, and a Han run is its own
 //! piece. Whitespace keeps a newline run through its last newline.
@@ -58,6 +59,14 @@ macro_rules! family {
             pub fn fill(&mut self, out: &mut [Span]) -> usize {
                 self.inner.fill(out)
             }
+
+            /// Write the next piece boundaries into `out`.
+            ///
+            /// `out[0]` is the absolute start. Each later entry is the next piece's
+            /// exclusive end. `out` must hold `limit + 80` slots.
+            pub fn bounds(&mut self, out: &mut [u32], limit: usize) -> usize {
+                self.inner.bounds(out, limit)
+            }
         }
 
         impl Scheme for $name {
@@ -85,8 +94,8 @@ family!(
     false
 );
 family!(
-    /// Nemotron pretokenizer. A contraction is its own piece, and each
-    /// number character stands alone.
+/// Nemotron pretokenizer. A contraction is its own piece. So is each
+/// number character.
     Nemotron,
     NemotronWalk,
     false,
@@ -1054,6 +1063,32 @@ unsafe fn extras_avx2(bytes: &[u8], pos: usize) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounds_match_fill() {
+        let samples = [
+            "",
+            "Hello world",
+            "it's a test\n",
+            "123 456789",
+            "café naïve 東京",
+            "camelCase don't",
+            "a/b\n\n",
+        ];
+        let long = "Hello world! It's a test.\n\tDon't  stop.\n".repeat(40);
+        let words = "word ".repeat(300);
+        for text in samples {
+            crate::walk::bounds_match_fill::<O200k>(text);
+            crate::walk::bounds_match_fill::<Nemotron>(text);
+            crate::walk::bounds_match_fill::<Kimi>(text);
+        }
+        for text in [&long, &words] {
+            crate::walk::bounds_match_fill::<O200k>(text);
+            crate::walk::bounds_match_fill::<Nemotron>(text);
+            crate::walk::bounds_match_fill::<Kimi>(text);
+        }
+    }
+
 
     fn pieces(text: &str, mut fill: impl FnMut(&mut [Span]) -> usize) -> Vec<String> {
         let mut buf = [Span { start: 0, end: 0 }; 32];
