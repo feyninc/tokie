@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# References and tokenizer files for bench/tokie.
+# References for bench/normalize.
 #
 # The bench Cargo.toml paths are siblings of this repo: ../gigatoken and
-# ../tokenizers-v1. From bench/tokie that is ../../../gigatoken.
+# ../tokenizers-v1. From bench/normalize that is ../../../gigatoken.
 
 set -euo pipefail
 
