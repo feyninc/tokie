@@ -1,8 +1,6 @@
 # Catsu Tokenizers - TODO
 
-This checklist belongs to the previous tokie, which shipped `.tkz` files. The rewrite loads `tokenizer.json`. Its open work is in [GOAL.md](GOAL.md). The boxes below are that older checklist, and they have not been re-run.
-
-Tokenizers used in catsu's models.json that were not yet supported in that tokie.
+Tokenizers used in catsu's models.json that are not yet supported in tokie.
 
 ## Not Available on HuggingFace (no tokenizer.json)
 

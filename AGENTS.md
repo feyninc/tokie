@@ -8,9 +8,9 @@ License is MIT OR Apache-2.0.
 
 | Path | Package | Role |
 | --- | --- | --- |
-| `crates/tokie` | `tokie` 0.2.0 | Tokenizer. Normalie rewrites the string, pretokie splits it, tokie emits ids. |
-| `crates/normalie` | `normalie` 0.1.0 | Normalizers used by tokie. |
-| `crates/pretokie` | `pretokie` 0.2.0 | Pretokenizers used by tokie. Splits text into pieces before the model encodes them. |
+| `crates/tokie` | `tokie` 0.1.4 | Tokenizer library. Encode, decode, and load from Hugging Face. |
+| `crates/normalie` | `normalie` 0.1.0 | Normalizers. tokie does not use it yet. |
+| `crates/pretokie` | `pretokie` 0.2.0 | Pretokenizers. The root holds the zero-sized cuts. `pretokie::mask` holds the mask-based pretokenizers tokie uses today. |
 | `crates/tokie-python` | `tokie-python` | PyO3 bindings. The Python module name is `tokie`. |
 | `crates/tokie-cli` | `tokie-cli` | `tokie` binary for building, verifying, and uploading tokenizers. |
 
@@ -18,11 +18,11 @@ The workspace members are `crates/normalie`, `crates/pretokie`, `crates/tokie`, 
 
 ## Pretokie on this branch
 
-This branch deleted the old `crates/pretokie/src` and `examples/`. Do not restore `PretokConfig`, `Mask<C>`, or `Gpt2::new`.
+The crate root holds the cuts described below. The mask-based pretokenizers (`Mask<C>`, the `*Config` types, `Bert`, `Regex`, `util`, and the dev-only `oracle`) live under `src/mask/` as `pretokie::mask`, and tokie calls only those. Do not move them back to the root. `tests/golden.rs` (feature `oracle`) checks `mask` against Hugging Face.
 
 Each pretokenizer lives in its own file under `src/impls/`. Each pretokenizer's oracle tests live in their own file under `crates/pretokie/tests/`. Do not share a test file across pretokenizers. `span.rs` holds `Span`. `src/walk/` is the shared walker. `mod.rs` is the kernel. `classify.rs` emits seven masks for a 64-byte window: ASCII letter, digit, space, newline, other whitespace, apostrophe, and non-ASCII. The kernel inlines the classifier and the scheme's window. It does not know the split rules. `Gpt2::count`, `Gpt2::count_upto`, and `Gpt2::walk` are the calls. A pretokenizer is a zero-sized type. Callers pass text that is already normalized. Design notes, when present, are in `notes/` and are gitignored.
 
-`cargo check -p pretokie` succeeds. `tokie` 0.2 depends on this pretokie and on normalie.
+`cargo check -p pretokie` succeeds. `tokie` uses `pretokie::mask` until it is rewritten onto these cuts.
 
 ## Commands
 
@@ -32,7 +32,7 @@ cargo test -p pretokie
 cargo test -p tokie
 ```
 
-Check or test one package. `tokie` 0.2 builds against this pretokie and normalie. Pretokie is 0.2.0. Normalie is 0.1.0.
+Check or test one package. Pretokie is 0.2.0. Normalie is 0.1.0.
 
 ## Commit messages
 

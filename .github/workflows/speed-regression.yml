@@ -7,48 +7,116 @@ on:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 env:
   CARGO_TERM_COLOR: always
-  # The bench manifest asks for fat LTO. CI turns that off so the job finishes.
-  CARGO_PROFILE_RELEASE_LTO: "false"
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
 jobs:
   benchmark:
-    name: GPT-2 encode speed
+    name: Encoding speed regression
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Fetch bench references and tokenizer files
-        run: bash .github/fetch-bench.sh
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-speed-${{ hashFiles('crates/tokie/examples/speed_regression.rs') }}
+          restore-keys: hf-speed-
 
-      - name: Download OpenWebText sample
+      - name: Cache enwik8 test data
+        uses: actions/cache@v4
+        with:
+          path: benches/data/enwik8
+          key: enwik8-100mb
+
+      - name: Download enwik8 test data
         run: |
           mkdir -p benches/data
-          if [ ! -f benches/data/owt_sample.txt ]; then
-            curl -sL "https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz" \
-              | gunzip -c 2>/dev/null | head -c 50000000 > benches/data/owt_sample.txt || true
+          if [ ! -f benches/data/enwik8 ]; then
+            curl -L "https://mattmahoney.net/dc/enwik8.zip" -o /tmp/enwik8.zip
+            unzip -o /tmp/enwik8.zip -d benches/data/
           fi
-          test "$(stat -c%s benches/data/owt_sample.txt)" -eq 50000000
 
-      - name: Time GPT-2
+      - name: Run speed benchmark (current)
         run: |
-          cargo run --manifest-path bench/tokie/Cargo.toml --release -- \
-            --file benches/data/owt_sample.txt \
-            --row gpt2 \
-            --reps 3 \
-            | tee benchmark_gpt2.txt
+          cargo run --example speed_regression --release --features hf \
+            > benchmark_current.json 2>benchmark_current.log
+          cat benchmark_current.log
+          echo "---"
+          cat benchmark_current.json
+
+      - name: Benchmark previous commit
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA=${{ github.event.pull_request.base.sha }}
+          else
+            BASE_SHA=$(git rev-parse HEAD~1)
+          fi
+          echo "Benchmarking base commit: $BASE_SHA"
+          git stash --include-untracked || true
+          git checkout "$BASE_SHA" -- . || git checkout --force "$BASE_SHA"
+          cargo run --example speed_regression --release --features hf \
+            > benchmark_base.json 2>benchmark_base.log || echo '{"results":[]}' > benchmark_base.json
+          cat benchmark_base.log
+          git checkout --force - || true
+          git stash pop || true
+
+      - name: Compare results
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys
+
+          try:
+              with open("benchmark_current.json") as f:
+                  current = json.load(f)
+              with open("benchmark_base.json") as f:
+                  base = json.load(f)
+          except (FileNotFoundError, json.JSONDecodeError) as e:
+              print(f"Skipping comparison: {e}")
+              sys.exit(0)
+
+          base_map = {r["model"]: r["mb_per_sec"] for r in base.get("results", [])}
+          curr_map = {r["model"]: r["mb_per_sec"] for r in current.get("results", [])}
+
+          print(f"{'Model':<30} {'Base MB/s':>10} {'Curr MB/s':>10} {'Change':>10}")
+          print("-" * 65)
+
+          regressions = []
+          for model in curr_map:
+              curr = curr_map[model]
+              prev = base_map.get(model, 0)
+              if prev > 0:
+                  pct = ((curr - prev) / prev) * 100
+                  marker = ""
+                  if pct < -10:
+                      marker = " REGRESSION"
+                      regressions.append((model, pct))
+                  elif pct > 10:
+                      marker = " IMPROVEMENT"
+                  print(f"{model:<30} {prev:>10.1f} {curr:>10.1f} {pct:>+9.1f}%{marker}")
+              else:
+                  print(f"{model:<30} {'N/A':>10} {curr:>10.1f} {'new':>10}")
+
+          if regressions:
+              print(f"\nWARNING: {len(regressions)} model(s) regressed >10%:")
+              for model, pct in regressions:
+                  print(f"  {model}: {pct:+.1f}%")
+              # Don't fail the build, just warn
+          else:
+              print("\nNo significant regressions detected.")
+          PYEOF
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: benchmark_gpt2.txt
+          path: benchmark_current.json

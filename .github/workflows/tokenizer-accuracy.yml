@@ -7,15 +7,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test-accuracy:
-    name: Test tokenizer ids
+    name: Test tokenizer accuracy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,8 +21,45 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Fetch bench references and tokenizer files
-        run: bash .github/fetch-bench.sh
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-${{ hashFiles('crates/tokie/tests/accuracy.rs') }}
+          restore-keys: hf-models-
 
-      - name: Run id oracles
-        run: cargo test --manifest-path bench/tokie/Cargo.toml --tests -- --test-threads=1
+      - name: Cache enwik8 test data
+        uses: actions/cache@v4
+        with:
+          path: benches/data/enwik8
+          key: enwik8-100mb
+
+      - name: Download enwik8 test data
+        run: |
+          mkdir -p benches/data
+          if [ ! -f benches/data/enwik8 ]; then
+            curl -L "https://mattmahoney.net/dc/enwik8.zip" -o /tmp/enwik8.zip
+            unzip -o /tmp/enwik8.zip -d benches/data/
+          fi
+
+      - name: Cache OWT test data
+        uses: actions/cache@v4
+        with:
+          path: benches/data/owt_sample.txt
+          key: owt-sample-50mb
+
+      - name: Download OWT test data
+        # Web text covers unicode that enwik8's XML-escaped dump never hits
+        # (typographic punctuation before newlines, No-category numerics,
+        # format chars, uppercase contractions). head closes the pipe early on
+        # purpose — only ~the first 50MB of the archive is fetched.
+        run: |
+          mkdir -p benches/data
+          if [ ! -f benches/data/owt_sample.txt ]; then
+            curl -sL "https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz" \
+              | gunzip -c 2>/dev/null | head -c 50000000 > benches/data/owt_sample.txt || true
+          fi
+          test "$(stat -c%s benches/data/owt_sample.txt)" -eq 50000000
+
+      - name: Run tokenizer accuracy tests
+        run: cargo test -p tokie --test accuracy --features build -- --ignored

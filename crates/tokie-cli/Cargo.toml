@@ -1,8 +1,8 @@
 [package]
 name = "tokie-cli"
-version = "0.2.0"
+version = "0.0.1"
 edition = "2024"
-description = "Encode and decode with a tokie tokenizer"
+description = "CLI for building, verifying, and uploading tokie tokenizers"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/chonkie-inc/tokie"
 
@@ -11,5 +11,6 @@ name = "tokie"
 path = "src/main.rs"
 
 [dependencies]
-tokie = { path = "../tokie" }
+tokie = { path = "../tokie", features = ["hf", "build"] }
 clap = { version = "4", features = ["derive"] }
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }

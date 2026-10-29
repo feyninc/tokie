@@ -1,19 +1,196 @@
 [package]
 name = "tokie"
-version = "0.2.0"
+version = "0.1.4"
 edition = "2024"
-description = "Fast tokenizer. Normalie rewrites the string. Pretokie splits it."
+description = "Blazingly fast tokenizer - 50x faster tokenization, 10x smaller model files, 100% accurate drop-in replacement for HuggingFace"
 license = "MIT OR Apache-2.0"
+readme = "../../README.md"
 repository = "https://github.com/chonkie-inc/tokie"
-keywords = ["tokenizer", "bpe", "wordpiece", "unigram", "nlp"]
-categories = ["text-processing"]
+documentation = "https://docs.rs/tokie"
+keywords = ["tokenizer", "bpe", "wordpiece", "nlp", "transformers"]
+categories = ["text-processing", "science"]
+
+[features]
+default = []
+hf = ["hf-hub"]
+build = ["hf", "dep:tokenizers", "dep:tiktoken-rs", "dep:ureq", "dep:zip", "dep:dirs-next"]
 
 [dependencies]
-aho-corasick = "1.1"
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
-memchr = "2.8"
-normalie = { path = "../normalie" }
-pretokie = { path = "../pretokie" }
-rustc-hash = "2"
-serde_json = "1"
-sha2 = "0.10"
+crc32fast = "1.4"
+daggrs = "0.1.1"
+foldhash = "0.1"
+smallvec = "1.13"
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"], optional = true }
+memchr = "2.7"
+chunk = "0.9"
+pretokie = { path = "../pretokie", version = "0.2.0", features = ["regex"] }
+rayon = "1.10"
+icu_normalizer = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-general-category = "1.0"
+unicode-segmentation = "1.12"
+base64 = "0.22"
+tokenizers = { version = "0.22", features = ["http"], optional = true }
+tiktoken-rs = { version = "0.6", optional = true }
+ureq = { version = "2", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+dirs-next = { version = "2", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "tokenize"
+harness = false
+
+[[bench]]
+name = "loading"
+harness = false
+
+[[example]]
+name = "from_pretrained"
+required-features = ["hf"]
+
+[[example]]
+name = "bench_unigram_throughput"
+required-features = ["hf"]
+
+[[example]]
+name = "test_gpt2"
+required-features = ["hf"]
+
+[[example]]
+name = "tiktoken_compat"
+required-features = ["hf"]
+
+[[example]]
+name = "test_llama4"
+required-features = ["build"]
+
+[[example]]
+name = "test_enwik8"
+required-features = ["build"]
+
+[[example]]
+name = "verify_embedding_models"
+required-features = ["build"]
+
+[[example]]
+name = "test_postprocessor"
+required-features = ["hf"]
+
+[[example]]
+name = "convert_and_verify"
+required-features = ["build"]
+
+[[example]]
+name = "regenerate_all_v11"
+required-features = ["hf"]
+
+[[example]]
+name = "basic_usage"
+required-features = ["hf"]
+
+[[example]]
+name = "padding_truncation"
+required-features = ["hf"]
+
+[[example]]
+name = "batch_processing"
+required-features = ["hf"]
+
+[[example]]
+name = "cross_encoder"
+required-features = ["hf"]
+
+[[example]]
+name = "diagnose_failures"
+required-features = ["build"]
+
+[[example]]
+name = "speed_regression"
+required-features = ["hf"]
+
+[[example]]
+name = "regenerate_from_json"
+required-features = ["hf"]
+
+[[example]]
+name = "bench_vs_hf"
+required-features = ["build"]
+
+[[example]]
+name = "owt_compare"
+required-features = ["build"]
+
+[[example]]
+name = "check_models"
+required-features = ["build"]
+
+[[example]]
+name = "verify_precompiled_charsmap"
+required-features = ["build"]
+
+[[example]]
+name = "regenerate_precompiled_v12"
+required-features = ["hf"]
+
+[[example]]
+name = "x1_miss"
+required-features = ["hf"]
+
+[[example]]
+name = "hf_diff"
+required-features = ["build"]
+
+[[example]]
+name = "bench_files"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_files"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_glue_costs"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_hotpath"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_piece_costs"
+required-features = ["hf"]
+
+[[example]]
+name = "profile_spawn_cost"
+required-features = ["hf"]
+
+[[example]]
+name = "rank_merge_bench"
+required-features = ["hf"]
+
+[[example]]
+name = "rank_merge_diff"
+required-features = ["hf"]
+
+[[example]]
+name = "w3_simple"
+required-features = ["hf"]
+
+[[example]]
+name = "perf_encode"
+required-features = ["hf"]
+
+[[example]]
+name = "w4_split_audit"
+required-features = ["hf"]
+
+[[example]]
+name = "w4_unit_bench"
+required-features = ["hf"]

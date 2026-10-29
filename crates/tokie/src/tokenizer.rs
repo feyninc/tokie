@@ -1,2371 +1,2887 @@
-//! A loaded `tokenizer.json`. Encode appends ids. It does not clear them.
+//! High-level Tokenizer that combines pre-tokenization with BPE encoding.
 
-use crate::bpe::{Pair, merge_ids};
-use crate::cache::{Cache, Prep, ProbeView, mix, pack, pack_bounds, pack_spans};
-use crate::cut::Cut;
-use crate::norm::Norm;
-use crate::unigram::Lattice;
-use crate::wordpiece::wordpiece;
-use rustc_hash::FxHashMap;
-use serde_json::Value;
-use std::fs;
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::path::Path;
-use std::sync::{Arc, mpsc};
+use std::sync::OnceLock;
 use std::thread;
 
-/// Whether [`Tokenizer::decode`] writes special tokens.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Specials {
-    /// Write every id.
-    Keep,
-    /// Omit ids the file marks special.
-    Skip,
+use foldhash::HashMap as FoldHashMap;
+
+
+use daggrs::{DoubleArrayAhoCorasick, MatchKind, Trie};
+use rayon::prelude::*;
+
+use crate::encoder::{Encoder, EncoderIter, EncoderType, WorkerCaches};
+
+/// Byte-length of a batch element: lets the work-stealing scaffold serve
+/// both `&str` batches (Python-boundary path) and `&[u8]` document slices
+/// (byte-source file path).
+trait ByteLen {
+    fn byte_len(&self) -> usize;
+    /// The document as text. Bytes are validated once (one SIMD pass;
+    /// `str::from_utf8` beats `from_utf8_lossy`'s chunk walker on valid
+    /// input), and invalid UTF-8 becomes U+FFFD so arbitrary bytes can never
+    /// panic.
+    fn text(&self) -> Cow<'_, str>;
+}
+impl ByteLen for str {
+    #[inline]
+    fn byte_len(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    fn text(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self)
+    }
+}
+impl ByteLen for [u8] {
+    #[inline]
+    fn text(&self) -> Cow<'_, str> {
+        match std::str::from_utf8(self) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => String::from_utf8_lossy(self),
+        }
+    }
+    #[inline]
+    fn byte_len(&self) -> usize {
+        self.len()
+    }
 }
 
-/// A load, encode, or decode failure.
-#[derive(Debug)]
-pub struct Error {
-    message: String,
+/// Split `texts` into up to `parts` contiguous runs of roughly equal total
+/// bytes. Count-based chunking lets one oversized document serialize a whole
+/// thread; byte-balancing keeps workers evenly loaded.
+fn byte_balanced_chunks<'a, 'b, T: ByteLen + ?Sized>(
+    texts: &'b [&'a T],
+    parts: usize,
+) -> Vec<&'b [&'a T]> {
+    let total: usize = texts.iter().map(|t| t.byte_len()).sum();
+    let target = total / parts + 1;
+    let mut chunks = Vec::with_capacity(parts);
+    let mut start = 0;
+    let mut acc = 0usize;
+    for (i, t) in texts.iter().enumerate() {
+        acc += t.byte_len();
+        if acc >= target && chunks.len() + 1 < parts {
+            chunks.push(&texts[start..=i]);
+            start = i + 1;
+            acc = 0;
+        }
+    }
+    if start < texts.len() {
+        chunks.push(&texts[start..]);
+    }
+    chunks
+}
+/// Split raw file buffers into document byte-slices on `separator`,
+/// dropping empty documents (Python-`if d`-filter semantics). Documents
+/// never span files; an empty separator means one document per file.
+/// UTF-8 validation is deliberately NOT done here — the encode workers
+/// validate per document in parallel.
+fn split_file_docs<'a, B: AsRef<[u8]>>(buffers: &'a [B], separator: &[u8]) -> Vec<&'a [u8]> {
+    let mut docs: Vec<&'a [u8]> = Vec::new();
+    for buf in buffers {
+        let buf = buf.as_ref();
+        if separator.is_empty() {
+            if !buf.is_empty() {
+                docs.push(buf);
+            }
+            continue;
+        }
+        let mut start = 0usize;
+        for pos in memchr::memmem::find_iter(buf, separator) {
+            if pos > start {
+                docs.push(&buf[start..pos]);
+            }
+            start = pos + separator.len();
+        }
+        if start < buf.len() {
+            docs.push(&buf[start..]);
+        }
+    }
+    docs
 }
 
-impl Error {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
+/// File contents for the byte-source bulk path: small files are read
+/// into memory, large files are memory-mapped read-only. Mapping a
+/// page-cache-warm corpus costs microseconds where `fs::read` pays an
+/// allocation, a full copy, and a free — all inside the caller's timed
+/// region. Standard mmap caveat: truncating the file while it is mapped
+/// is undefined (SIGBUS), like every mmap-based reader.
+enum FileBytes {
+    Owned(Vec<u8>),
+    #[cfg(unix)]
+    Mapped(MmapFile),
+}
+
+impl AsRef<[u8]> for FileBytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            FileBytes::Owned(v) => v,
+            #[cfg(unix)]
+            FileBytes::Mapped(m) => m.as_slice(),
         }
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
+/// Minimal read-only `mmap` wrapper (unmapped on drop).
+#[cfg(unix)]
+struct MmapFile {
+    ptr: *mut libc::c_void,
+    len: usize,
 }
 
-impl std::error::Error for Error {}
+// SAFETY: the mapping is immutable (PROT_READ, MAP_PRIVATE) and owned.
+#[cfg(unix)]
+unsafe impl Send for MmapFile {}
+#[cfg(unix)]
+unsafe impl Sync for MmapFile {}
 
-impl From<String> for Error {
-    fn from(message: String) -> Self {
-        Self { message }
-    }
-}
-
-impl From<&str> for Error {
-    fn from(message: &str) -> Self {
-        Self {
-            message: message.to_string(),
+#[cfg(unix)]
+impl MmapFile {
+    fn map(file: &std::fs::File, len: usize) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: fd is valid for the duration of the call; a MAP_FAILED
+        // result is checked before the pointer is used.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
         }
+        Ok(Self { ptr, len })
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr..ptr+len is a live PROT_READ mapping owned by self.
+        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
     }
 }
 
-const GPT2: &str = r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
-const CL100K: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-const VOYAGE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-const QWEN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-const O200K: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-const NEMOTRON: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-const KIMI: &str = r"[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\\r\\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
-
-struct Added {
-    content: String,
-    id: u32,
-    /// ASCII needles search through this. Built once so a line does not
-    /// reconstruct the matcher.
-    finder: Option<memchr::memmem::Finder<'static>>,
+#[cfg(unix)]
+impl Drop for MmapFile {
+    fn drop(&mut self) {
+        // SAFETY: ptr/len came from a successful mmap and are unmapped once.
+        unsafe { libc::munmap(self.ptr, self.len) };
+    }
 }
 
-/// Added-token search for one normalization flag.
+/// Touch every page of a fresh mapping from all cores. Serial demand
+/// paging during the separator scan costs ~15ms on a warm 191MB corpus;
+/// faulting in parallel first cuts that to ~2ms.
+#[cfg(unix)]
+fn prefault(slice: &[u8]) {
+    const STRIDE: usize = 4096;
+    let cpus = num_cpus();
+    if cpus <= 1 || slice.len() < (4 << 20) {
+        return;
+    }
+    let chunk = slice.len().div_ceil(cpus).next_multiple_of(STRIDE);
+    thread::scope(|s| {
+        for part in slice.chunks(chunk) {
+            s.spawn(move || {
+                let mut acc = 0u8;
+                let mut i = 0;
+                while i < part.len() {
+                    acc ^= part[i];
+                    i += STRIDE;
+                }
+                std::hint::black_box(acc);
+            });
+        }
+    });
+}
+
+/// Open one corpus file as [`FileBytes`], mmap-ing above a small
+/// threshold on unix.
+fn read_file_bytes(path: &Path) -> std::io::Result<FileBytes> {
+    #[cfg(unix)]
+    {
+        const MMAP_MIN: u64 = 1 << 20;
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        if len >= MMAP_MIN {
+            let map = MmapFile::map(&file, len as usize)?;
+            prefault(map.as_slice());
+            return Ok(FileBytes::Mapped(map));
+        }
+        drop(file);
+    }
+    Ok(FileBytes::Owned(std::fs::read(path)?))
+}
+
+use crate::decoder::{Decoder, DecoderType};
+use crate::hf::{self, JsonLoadError};
+use crate::normalizer::Normalizer;
+use crate::padding::{Encoding, PaddingParams, TruncationParams, pad_batch, pad_encoding, truncate_ids, truncate_pair};
+use crate::postprocessor::PostProcessor;
+use crate::pretok::{PretokType, Pretokenizer};
+use crate::types::TokenId;
+
+/// Backward-compatible alias for [`Encoding`].
+pub type EncodingPair = Encoding;
+
+/// One added-token entry with its HuggingFace matching flags.
 ///
-/// One ASCII needle stays on `memchr`. A set of needles is one automaton,
-/// so a file with hundreds of specials is one pass instead of one pass each.
-enum Needles {
-    Empty,
-    Single(Added),
-    Multi {
-        ac: aho_corasick::AhoCorasick,
-        ids: Vec<u32>,
-        /// A byte that occurs in every pattern. The haystack cannot match
-        /// when this byte is absent.
-        required: u8,
-        /// `false` when the patterns share no single byte.
-        use_required: bool,
-    },
+/// HF's `AddedVocabulary` honors per-token flags when scanning for added
+/// tokens (`tokenizers/src/tokenizer/added_vocabulary.rs`):
+/// - `lstrip`/`rstrip`: the match extends over adjacent whitespace, which is
+///   consumed (e.g. roberta's `<mask>` has `lstrip` and swallows the space
+///   before it).
+/// - `normalized`: the token is matched *after* normalization, against the
+///   normalizer-transformed pattern (voyage-2's `</s>` matches as `▁</s>`).
+///   Non-normalized tokens are matched on the raw input first.
+/// - `single_word`: the match is dropped when adjacent to a word character.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddedTokenSpec {
+    pub id: TokenId,
+    pub bytes: Vec<u8>,
+    pub special: bool,
+    pub lstrip: bool,
+    pub rstrip: bool,
+    pub normalized: bool,
+    pub single_word: bool,
 }
 
-enum Kind {
-    Bpe {
-        /// Vocab id of each raw byte after the GPT-2 byte map. `u32::MAX` is missing.
-        byte_ids: [u32; 256],
-        pairs: FxHashMap<(u32, u32), Pair>,
-    },
-    WordPiece {
-        vocab: FxHashMap<String, u32>,
-        unk: u32,
-        prefix: String,
-        max_chars: usize,
-    },
-    Unigram {
-        lattice: Lattice,
-    },
-    /// SentencePiece BPE. Symbols are characters, and a missing character
-    /// becomes one `<0xHH>` id per byte.
-    Spm {
-        chars: FxHashMap<char, u32>,
-        bytes: [u32; 256],
-        pairs: FxHashMap<(u32, u32), Pair>,
-    },
+impl AddedTokenSpec {
+    /// A plain added token with all flags off (pre-flag behavior).
+    pub fn plain(id: TokenId, bytes: Vec<u8>) -> Self {
+        Self { id, bytes, special: false, lstrip: false, rstrip: false, normalized: false, single_word: false }
+    }
 }
 
-struct Scratch {
-    a: String,
-    syms: Vec<u32>,
-    marked: String,
-    piece: Vec<u32>,
-    raw_parts: Vec<Part>,
-    norm_parts: Vec<Part>,
+/// Ids and byte offsets built up by `Tokenizer::encode_raw_with_offsets`.
+#[derive(Default)]
+struct OffsetAcc {
+    ids: Vec<TokenId>,
+    offsets: Vec<(usize, usize)>,
+    /// Where the current text starts in the normalized text.
+    base: usize,
 }
 
-impl Scratch {
-    fn new() -> Self {
-        Self {
-            a: String::new(),
-            syms: Vec::new(),
-            marked: String::new(),
-            piece: Vec::new(),
-            raw_parts: Vec::new(),
-            norm_parts: Vec::new(),
+impl OffsetAcc {
+    fn push_added(&mut self, id: TokenId, len: usize) {
+        self.ids.push(id);
+        self.offsets.push((self.base, self.base + len));
+        self.base += len;
+    }
+}
+
+/// Total bytes from which a batch of small documents goes to the
+/// [`Tokenizer::steal_batches`] workers (about 30 us of one thread's work;
+/// a rayon dispatch costs a few).
+const BATCH_WORKERS_MIN_BYTES: usize = 16 << 10;
+
+/// Whether a batch goes to the [`Tokenizer::steal_batches`] workers. A
+/// batch with no more documents than CPUs and a large one is encoded one by
+/// one instead, so the large document keeps its own parallel path (a
+/// worker encodes its documents sequentially). A tiny batch stays on the
+/// caller.
+fn use_workers<T: ByteLen + ?Sized>(texts: &[&T]) -> bool {
+    let cpus = num_cpus();
+    if cpus == 1 || texts.len() < 2 {
+        return false;
+    }
+    if texts.len() > cpus {
+        return true;
+    }
+    let mut total = 0;
+    for t in texts {
+        let n = t.byte_len();
+        if n >= Tokenizer::PARALLEL_CHUNK_THRESHOLD {
+            return false;
         }
+        total += n;
     }
+    total >= BATCH_WORKERS_MIN_BYTES
 }
 
-/// One decoded piece. `at == u32::MAX` means the id is not in the vocab.
-#[derive(Clone, Copy)]
-struct Slice {
-    at: u32,
-    len: u32,
-}
+/// Id-count estimate above which [`Tokenizer::encode_docs_flat`] prefaults
+/// its output and concatenates in parallel (16 MiB of ids).
+const LARGE_FLAT_IDS: usize = 1 << 22;
 
-/// Id to bytes, built at load. `encode` does not read it.
-struct Vocab {
-    arena: Vec<u8>,
-    /// Bytes for this id when it is the first id `decode` writes.
-    lead: Vec<Slice>,
-    /// Bytes for this id when another id was already written.
-    next: Vec<Slice>,
-    tokens: Vec<Option<String>>,
-    ids: FxHashMap<String, u32>,
-    special: Vec<bool>,
-    /// Drop one leading space after the slices are joined. Llama's strip does this.
-    strip_space: bool,
-}
-
-/// Tables a forked tokenizer shares. The cache stays on each [`Tokenizer`].
-struct Tables {
-    steps: Vec<Step>,
-    raw_added: Needles,
-    norm_added: Needles,
-    /// The strings `raw_added` was built from. `save` writes these, not the automaton.
-    raw_rows: Vec<(String, u32)>,
-    norm_rows: Vec<(String, u32)>,
-    kind: Kind,
-    /// Specials the single-sequence template adds around the encoded ids.
-    post: Post,
-    vocab: Vocab,
-}
-
-struct Worker {
-    tx: mpsc::Sender<Job>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-enum Job {
-    Batch(Vec<String>, mpsc::Sender<Chunk>),
-    Stop,
-}
-
-struct Chunk {
-    ids: Vec<u32>,
-    ends: Vec<usize>,
-    error: Option<String>,
-}
-
-struct Pool {
-    workers: Vec<Worker>,
-}
-
-impl Pool {
-    fn new() -> Self {
-        Self { workers: Vec::new() }
+/// Cut `bytes` into about `parts` chunks for [`Tokenizer::encode_parallel_into`]
+/// that encode exactly as the whole text does.
+///
+/// A cut goes before a space between two ASCII letters (`a b` -> `a`, ` b`)
+/// or before a newline that follows an ASCII letter or digit. Every built-in
+/// pretokenizer ends a piece there, and no pretokenizer model's normalizer
+/// joins characters across it. An arbitrary cut is not safe: a run of spaces
+/// or newlines is one piece (or two) whose tokens depend on its length. Text
+/// with no such point (CJK without spaces, say) stays in one chunk.
+fn parallel_cuts(bytes: &[u8], parts: usize) -> Vec<&[u8]> {
+    let target = (bytes.len() / parts.max(1)).max(1);
+    let mut chunks = Vec::with_capacity(parts);
+    let mut start = 0;
+    while bytes.len() - start > target {
+        let from = start + target;
+        let safe = |i: usize| match bytes[i] {
+            b' ' => bytes[i - 1].is_ascii_alphabetic() && bytes[i + 1].is_ascii_alphabetic(),
+            _ => bytes[i - 1].is_ascii_alphanumeric(),
+        };
+        let cut = memchr::memchr2_iter(b' ', b'\n', &bytes[from..bytes.len() - 1]).map(|i| from + i).find(|&i| safe(i));
+        let Some(cut) = cut else { break };
+        chunks.push(&bytes[start..cut]);
+        start = cut;
     }
+    chunks.push(&bytes[start..]);
+    chunks
+}
 
-    fn stop(&mut self) {
-        for worker in self.workers.drain(..) {
-            let _ = worker.tx.send(Job::Stop);
-            if let Some(thread) = worker.thread {
-                let _ = thread.join();
+/// Split `text` at added-token matches, honoring per-token flags.
+///
+/// Port of HF's `AddedVocabulary::find_matches`: the DAAC yields
+/// leftmost-longest matches; `single_word` drops matches adjacent to word
+/// characters, `lstrip`/`rstrip` extend the match over neighboring
+/// whitespace (which is consumed — the emitted token is just the id).
+/// Returns `(Some(spec_index), byte_range)` for added tokens and
+/// `(None, byte_range)` for the text in between, covering all of `text`.
+fn split_on_added(
+    text: &str,
+    matcher: &DoubleArrayAhoCorasick,
+    specs: &[AddedTokenSpec],
+) -> Vec<(Option<usize>, std::ops::Range<usize>)> {
+    let bytes = text.as_bytes();
+    let mut splits = Vec::new();
+    let mut pos = 0usize;
+
+    for m in matcher.find_iter(bytes) {
+        let spec = &specs[m.pattern_id as usize];
+        let mut start = m.start;
+        let mut stop = m.end;
+
+        if spec.single_word {
+            let start_ok = start == 0
+                || !text[..start].chars().next_back().is_some_and(is_word_char);
+            let stop_ok = stop == text.len()
+                || !text[stop..].chars().next().is_some_and(is_word_char);
+            if !(start_ok && stop_ok) {
+                continue;
             }
         }
+        if spec.lstrip {
+            // Leftmost byte of the whitespace run ending at `start`, clamped
+            // so a previous match's consumed whitespace isn't re-consumed.
+            let ws_start = text[..start]
+                .char_indices()
+                .rev()
+                .take_while(|(_, c)| c.is_whitespace())
+                .last()
+                .map_or(start, |(i, _)| i);
+            start = ws_start.max(pos);
+        }
+        if spec.rstrip {
+            let ws_len = text[stop..]
+                .char_indices()
+                .take_while(|(_, c)| c.is_whitespace())
+                .last()
+                .map_or(0, |(i, c)| i + c.len_utf8());
+            stop += ws_len;
+        }
+
+        if pos < start {
+            splits.push((None, pos..start));
+        }
+        splits.push((Some(m.pattern_id as usize), start..stop));
+        pos = stop;
+    }
+
+    if pos < text.len() {
+        splits.push((None, pos..text.len()));
+    }
+    splits
+}
+
+/// The distinct first bytes of an added-token matcher's patterns. A match
+/// can only start at one of them, so a text containing none of them has no
+/// match: the DAAC scan (one automaton step per byte, no prefilter) and the
+/// split vectors are skipped. Most vocabularies need one or two bytes
+/// (`<` for `<|endoftext|>`/Llama-3 reserved tokens, `[` for BERT), which
+/// `memchr` checks at SIMD speed.
+struct FirstBytes {
+    set: [bool; 256],
+    few: [u8; 3],
+    n: usize,
+    /// Second bytes of the patterns, and whether every pattern has one.
+    /// With a single shared first byte (`<` of `<|...|>`, `[` of BERT's
+    /// `[CLS]`) the scan checks the byte after each occurrence too, so
+    /// code with plain `<` / `[` still skips the matcher.
+    second: [bool; 256],
+    all_two: bool,
+}
+
+impl Default for FirstBytes {
+    fn default() -> Self {
+        Self { set: [false; 256], few: [0; 3], n: 0, second: [false; 256], all_two: true }
     }
 }
 
-impl Drop for Pool {
-    fn drop(&mut self) {
-        self.stop();
+impl FirstBytes {
+    fn add(&mut self, pattern: &[u8]) {
+        let b = pattern[0];
+        if !self.set[b as usize] {
+            self.set[b as usize] = true;
+            if self.n < 3 {
+                self.few[self.n] = b;
+            }
+            self.n += 1;
+        }
+        match pattern.get(1) {
+            Some(&b1) => self.second[b1 as usize] = true,
+            None => self.all_two = false,
+        }
+    }
+
+    /// Whether any pattern could start somewhere in `hay`.
+    #[inline]
+    fn may_occur(&self, hay: &[u8]) -> bool {
+        match self.n {
+            0 => false,
+            1 if self.all_two => {
+                // A match starts with the first byte followed by one of the
+                // patterns' second bytes.
+                let mut from = 0;
+                while let Some(i) = memchr::memchr(self.few[0], &hay[from..]) {
+                    let j = from + i;
+                    if hay.get(j + 1).is_some_and(|&b| self.second[b as usize]) {
+                        return true;
+                    }
+                    from = j + 1;
+                }
+                false
+            }
+            1 => memchr::memchr(self.few[0], hay).is_some(),
+            2 => memchr::memchr2(self.few[0], self.few[1], hay).is_some(),
+            3 => memchr::memchr3(self.few[0], self.few[1], self.few[2], hay).is_some(),
+            _ => hay.iter().any(|&b| self.set[b as usize]),
+        }
     }
 }
 
-/// One tokenizer. The cache and the scratch stay with it. The tables are shared.
+/// Shortest text that Backtracking/Simple encode through the
+/// pretokenizer's block drain and [`PretokenCache::encode_block`] (keys,
+/// then a paired probe with fixed-width emit) instead of one closure call
+/// per piece. Shorter ones (added-token segments, mostly) take the
+/// per-piece walk, whose setup is cheaper.
+const BLOCK_MIN_LEN: usize = 64;
+
+/// Approximation of the regex `\w` class HF uses for `single_word`
+/// boundaries: alphanumerics plus underscore.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Cached number of logical CPUs this process may run on.
 ///
-/// `cut`, `prefix_space`, and `mark` are copied here so a line does not chase
-/// the `Arc` before the piece loop. `fork` copies them again.
+/// std's `available_parallelism` respects the affinity mask on Linux but not
+/// on Windows, where it counts every CPU: a process pinned to 8 of 24 would
+/// run 24 workers on 8 cores. On rayon that oversubscription costs about half
+/// the batch throughput (idle workers spin for work on the cores the busy
+/// ones need), so the mask is counted here.
+pub(crate) fn num_cpus() -> usize {
+    if FORKED_AFTER_POOL.load(std::sync::atomic::Ordering::Relaxed) {
+        return 1;
+    }
+    static CPUS: OnceLock<usize> = OnceLock::new();
+    *CPUS.get_or_init(|| {
+        let n = thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+        affinity_cpus().map_or(n, |a| a.clamp(1, n))
+    })
+}
+
+/// CPUs in the process affinity mask (Windows; elsewhere `None`, since
+/// `available_parallelism` already accounts for it).
+fn affinity_cpus() -> Option<usize> {
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn GetProcessAffinityMask(process: *mut core::ffi::c_void, process_mask: *mut usize, system_mask: *mut usize) -> i32;
+        }
+        let (mut process, mut system) = (0usize, 0usize);
+        // SAFETY: the pseudo-handle of the current process is always valid,
+        // and both out-pointers point at live locals.
+        let ok = unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) };
+        // A process spanning several processor groups reports 0 here.
+        (ok != 0 && process != 0).then(|| process.count_ones() as usize)
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+/// Set in a child forked after this process put work on rayon's pool. The
+/// child inherits the pool's state but not its threads, so a rayon call would
+/// wait forever (a PyTorch DataLoader forks its workers on Linux); such a
+/// child does everything on the calling thread instead, as HF tokenizers
+/// does. Every parallel path is gated on [`num_cpus`] being over 1.
+static FORKED_AFTER_POOL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// tokie's thread pool: persistent workers (spawning and joining 24 threads
+/// per call cost ~0.5 ms on Windows), one per CPU the process may run on.
+/// tokie's own pool rather than rayon's global one, so it never competes with
+/// an application's rayon work or inherits a pool sized for the whole
+/// machine. Getting it arms [`FORKED_AFTER_POOL`] for any later fork.
+pub(crate) fn pool() -> &'static rayon::ThreadPool {
+    // emscripten has no fork (and no `pthread_atfork`).
+    #[cfg(all(unix, not(target_os = "emscripten")))]
+    {
+        static AT_FORK: std::sync::Once = std::sync::Once::new();
+        unsafe extern "C" fn child() {
+            FORKED_AFTER_POOL.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // SAFETY: the handler only stores to an atomic, which is
+        // async-signal-safe.
+        AT_FORK.call_once(|| unsafe {
+            libc::pthread_atfork(None, None, Some(child));
+        });
+    }
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_cpus())
+            .thread_name(|i| format!("tokie-{i}"))
+            .build()
+            .expect("tokie thread pool")
+    })
+}
+
+/// High-level tokenizer combining pre-tokenization, encoding, and decoding.
+///
+/// # Example
+/// ```ignore
+/// use tokie::Tokenizer;
+///
+/// let tokenizer = Tokenizer::from_json("tokenizer.json")?;
+/// let enc = tokenizer.encode("Hello, world!", false);
+/// let text = tokenizer.decode(&enc.ids);
+/// ```
 pub struct Tokenizer {
-    cache: Cache,
-    scratch: Scratch,
-    cut: Cut,
-    prefix_space: bool,
-    mark: bool,
-    /// SHA-256 of the `tokenizer.json` this file was built from. Zeros when that
-    /// source was not a json file.
-    sha: [u8; 32],
-    /// Piece list written by `save`. Encode updates `cache` and leaves this list.
-    piece_seed: Arc<Vec<(Vec<u8>, Vec<u32>)>>,
-    tables: Arc<Tables>,
-    threads: usize,
-    pool: Pool,
+    encoder: Encoder,
+    decoder: Decoder,
+    pretokenizer: Option<Pretokenizer>,
+    pretokenizer_type: PretokType,
+    normalizer: Normalizer,
+    post_processor: PostProcessor,
+    /// Persisted in .tkz format.
+    pad_token_id: Option<TokenId>,
+    /// Runtime config, not serialized.
+    padding: Option<PaddingParams>,
+    /// Runtime config, not serialized.
+    truncation: Option<TruncationParams>,
+    reverse_vocab: OnceLock<FoldHashMap<String, TokenId>>,
+    /// DAAC matcher for non-normalized added tokens, matched on the raw
+    /// input BEFORE normalization/pretokenization, like HF's `split_trie`.
+    /// Pattern values index into `added_tokens_raw`.
+    raw_added_matcher: Option<DoubleArrayAhoCorasick>,
+    /// DAAC matcher for `normalized: true` added tokens, matched on each
+    /// normalized segment like HF's `split_normalized_trie`. Patterns are the
+    /// normalizer-transformed token contents; values index `added_tokens_raw`.
+    norm_added_matcher: Option<DoubleArrayAhoCorasick>,
+    /// First bytes of the `raw_added_matcher` / `norm_added_matcher`
+    /// patterns (scan prefilter).
+    raw_added_first: FirstBytes,
+    norm_added_first: FirstBytes,
+    /// Special token metadata: maps token string -> token ID.
+    /// Populated from the `added_tokens` array in tokenizer.json where `special: true`.
+    special_tokens: Vec<(String, TokenId)>,
+    /// Added-token list backing the matchers, kept for serialization
+    /// (.tkz v13+ stores added tokens in the file).
+    added_tokens_raw: Vec<AddedTokenSpec>,
+    /// True when this tokenizer was loaded from a .tkz that carries the
+    /// added-tokens section — loaders can skip the tokenizer.json fetch.
+    added_tokens_serialized: bool,
+    /// Process-unique id tagging pooled pretoken-cache contents (see
+    /// `crate::pool`).
+    cache_generation: u64,
 }
 
 impl Tokenizer {
-    /// Read a `.tokie` file or a `tokenizer.json`.
+    pub fn new(
+        encoder: Encoder,
+        decoder: Decoder,
+        pretokenizer_type: PretokType,
+        normalizer: Normalizer,
+        post_processor: PostProcessor,
+    ) -> Self {
+        let pretokenizer = pretokenizer_type.to_pretokenizer();
+        Self {
+            encoder,
+            decoder,
+            pretokenizer,
+            pretokenizer_type,
+            normalizer,
+            post_processor,
+            pad_token_id: None,
+            padding: None,
+            truncation: None,
+            reverse_vocab: OnceLock::new(),
+            raw_added_matcher: None,
+            norm_added_matcher: None,
+            raw_added_first: FirstBytes::default(),
+            norm_added_first: FirstBytes::default(),
+            special_tokens: Vec::new(),
+            added_tokens_raw: Vec::new(),
+            added_tokens_serialized: false,
+            cache_generation: crate::pool::next_generation(),
+        }
+    }
+
+    /// Byte-balanced work-stealing scaffold for batch calls: split `texts`
+    /// into fine-grained chunks, run one worker per CPU with a leased
+    /// long-lived pretoken cache, workers claim chunks as they finish
+    /// (fast P-cores keep working instead of idling on the slowest
+    /// E-core's tail), and return per-chunk results in input order.
     ///
-    /// A file that starts with `TOKI` and is not this format is refused.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let bytes = fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        Self::from_bytes(&bytes)
+    /// Workers are tasks on rayon's persistent pool: spawning and joining
+    /// fresh threads cost ~0.5 ms per call for 24 of them on Windows, about
+    /// what a 1 MiB batch takes to encode.
+    fn steal_batches<'a, 'b, T, R, F>(&self, texts: &'b [&'a T], work: F) -> Vec<R>
+    where
+        T: ByteLen + ?Sized + Sync,
+        R: Send,
+        F: Fn(&'b [&'a T], &mut WorkerCaches) -> R + Sync,
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cpus = num_cpus();
+        // Bytes are a rough proxy for cost (CJK documents vary a lot), so
+        // many small chunks keep the workers busy to the end.
+        let chunks = byte_balanced_chunks(texts, cpus * 16);
+        let next = AtomicUsize::new(0);
+        let mut results: Vec<Option<R>> = Vec::new();
+        results.resize_with(chunks.len(), || None);
+        let generation = self.cache_generation;
+        let worker = || {
+            let mut lease = crate::pool::CacheLease::checkout(generation);
+            let mut out: Vec<(usize, R)> = Vec::new();
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= chunks.len() {
+                    break;
+                }
+                out.push((i, work(chunks[i], lease.caches())));
+            }
+            out
+        };
+        let workers = cpus.min(chunks.len());
+        let outs: Vec<Vec<(usize, R)>> = if workers <= 1 {
+            vec![worker()]
+        } else {
+            pool().install(|| (0..workers).into_par_iter().with_max_len(1).map(|_| worker()).collect())
+        };
+        for (i, r) in outs.into_iter().flatten() {
+            results[i] = Some(r);
+        }
+        results.into_iter().map(|r| r.unwrap()).collect()
     }
 
-    /// Parse a `tokenizer.json`.
-    pub fn json(text: &str) -> Result<Self, Error> {
-        let mut tok = Self::parse_json(text)?;
-        tok.sha = crate::file::sha256(text.as_bytes());
-        Ok(tok)
+    /// Set added tokens. Non-normalized tokens are matched on the raw input
+    /// before pretokenization; `normalized: true` tokens are matched on each
+    /// normalized segment against their normalizer-transformed pattern, both
+    /// like HuggingFace. Call this after the normalizer is in place — the
+    /// normalized patterns are computed with `self.normalizer`.
+    pub fn set_added_tokens(&mut self, tokens: &[AddedTokenSpec]) {
+        if tokens.is_empty() {
+            return;
+        }
+        self.added_tokens_raw = tokens.to_vec();
+        self.decoder.set_added(tokens.iter().map(|t| (t.id, &t.bytes[..], t.special)));
+        let mut raw_trie = Trie::new();
+        let mut norm_trie = Trie::new();
+        let (mut raw_count, mut norm_count) = (0usize, 0usize);
+        let (mut raw_first, mut norm_first) = (FirstBytes::default(), FirstBytes::default());
+        for (idx, tok) in tokens.iter().enumerate() {
+            if tok.bytes.is_empty() {
+                continue;
+            }
+            // Skip single-byte tokens that plain encoding already maps to
+            // the same id — matching them in the DAAC would add overhead
+            // with no benefit. Single-byte tokens that encode differently
+            // (out-of-vocab remaps) must stay in the matcher.
+            if tok.bytes.len() == 1 && self.encoder.encode(&tok.bytes) == [tok.id] {
+                continue;
+            }
+            if tok.normalized {
+                // HF builds the normalized trie from normalizer(content).
+                // Non-UTF-8 contents can't be normalized; match them raw.
+                match std::str::from_utf8(&tok.bytes) {
+                    Ok(s) => {
+                        let pattern = self.normalizer.normalize(s);
+                        if !pattern.is_empty() {
+                            norm_trie.add(pattern.as_ref().as_bytes(), idx as u32);
+                            norm_first.add(pattern.as_ref().as_bytes());
+                            norm_count += 1;
+                        }
+                    }
+                    Err(_) => {
+                        raw_trie.add(&tok.bytes, idx as u32);
+                        raw_first.add(&tok.bytes);
+                        raw_count += 1;
+                    }
+                }
+            } else {
+                raw_trie.add(&tok.bytes, idx as u32);
+                raw_first.add(&tok.bytes);
+                raw_count += 1;
+            }
+        }
+        self.raw_added_first = raw_first;
+        self.norm_added_first = norm_first;
+        self.raw_added_matcher = (raw_count > 0).then(|| {
+            raw_trie.build(MatchKind::LeftmostLongest);
+            raw_trie.compile()
+        });
+        self.norm_added_matcher = (norm_count > 0).then(|| {
+            norm_trie.build(MatchKind::LeftmostLongest);
+            norm_trie.compile()
+        });
     }
 
-    fn parse_json(text: &str) -> Result<Self, Error> {
-        let value: Value = serde_json::from_str(text).map_err(|err| format!("json: {err}"))?;
-        let root = value.as_object().ok_or("tokenizer.json is not an object")?;
-        let steps = norms_of(root.get("normalizer"))?;
-        let (cut, prefix_space, mark) = cut_of(root.get("pre_tokenizer"))?;
-        let (raw_added, norm_added, raw_rows, norm_rows) = added_of(root.get("added_tokens"))?;
-        let post = post_of(root.get("post_processor"))?;
-        let model = root.get("model").and_then(|v| v.as_object()).ok_or("missing model")?;
-        let kind = kind_of(model)?;
-        let vocab = vocab_of(model, root.get("added_tokens"), root.get("decoder"), &kind)?;
-        Ok(Self {
-            cache: Cache::new(),
-            scratch: Scratch::new(),
-            cut,
-            prefix_space,
-            mark,
-            sha: [0; 32],
-            piece_seed: Arc::new(Vec::new()),
-            tables: Arc::new(Tables {
-                steps,
-                raw_added,
-                norm_added,
-                raw_rows,
-                norm_rows,
-                kind,
-                post,
-                vocab,
-            }),
-            threads: default_threads(),
-            pool: Pool::new(),
+    /// The added-token list backing the matchers.
+    pub fn added_tokens_raw(&self) -> &[AddedTokenSpec] {
+        &self.added_tokens_raw
+    }
+
+    /// Whether this tokenizer came from a .tkz that stores added tokens (v13+).
+    pub fn added_tokens_serialized(&self) -> bool {
+        self.added_tokens_serialized
+    }
+
+    pub(crate) fn mark_added_tokens_serialized(&mut self) {
+        self.added_tokens_serialized = true;
+    }
+
+    /// Set special token metadata (token string -> ID mapping).
+    pub fn set_special_tokens(&mut self, tokens: Vec<(String, TokenId)>) {
+        self.special_tokens = tokens;
+    }
+
+    /// Get special token metadata as (token_string, token_id) pairs.
+    pub fn special_tokens(&self) -> &[(String, TokenId)] {
+        &self.special_tokens
+    }
+
+    pub fn pretokenizer_type(&self) -> PretokType { self.pretokenizer_type }
+    pub fn normalizer(&self) -> &Normalizer { &self.normalizer }
+    pub fn post_processor(&self) -> &PostProcessor { &self.post_processor }
+    pub fn encoder_type(&self) -> EncoderType { self.encoder.encoder_type() }
+    pub fn decoder_type(&self) -> DecoderType { self.decoder.decoder_type() }
+    pub fn encoder(&self) -> &Encoder { &self.encoder }
+    pub fn decoder(&self) -> &Decoder { &self.decoder }
+    pub fn pretokenizer(&self) -> Option<&Pretokenizer> { self.pretokenizer.as_ref() }
+    pub fn set_pretokenizer(&mut self, pretok: Option<Pretokenizer>) { self.pretokenizer = pretok; }
+    pub fn vocab_size(&self) -> usize { self.decoder.vocab_size() }
+    pub fn pad_token_id(&self) -> Option<TokenId> { self.pad_token_id }
+    pub fn padding(&self) -> Option<&PaddingParams> { self.padding.as_ref() }
+    pub fn truncation(&self) -> Option<&TruncationParams> { self.truncation.as_ref() }
+
+    /// Number of special tokens added for a single sequence.
+    pub fn num_special_tokens_to_add(&self, is_pair: bool) -> usize {
+        if is_pair {
+            self.post_processor.num_special_tokens_pair()
+        } else {
+            self.post_processor.num_special_tokens_single()
+        }
+    }
+
+    /// Minimum text size (in bytes) to trigger chunked parallel encoding
+    /// on standalone (non-batch) calls.
+    ///
+    /// Phase-1 measurement (profile_spawn_cost, M3): a `thread::scope`
+    /// spawn+join of 8 workers costs ~100us, while the fused cache-first
+    /// sequential loop runs ~300 MB/s — so parallel chunking only breaks
+    /// even near `100us * 300MB/s * 8/7 ~ 34KB` even with warm worker
+    /// caches. 64 KiB adds margin for spawn-cost variance; below it the
+    /// old 10 KB threshold made 10-50KB documents ~2x SLOWER than the
+    /// sequential loop (140 vs 267 MB/s on OWT).
+    const PARALLEL_CHUNK_THRESHOLD: usize = 64 * 1024;
+
+    // --- Loading ---
+
+    /// Load from a HuggingFace tokenizer.json file.
+    pub fn from_json(path: impl AsRef<Path>) -> Result<Self, JsonLoadError> {
+        hf::from_json(path)
+    }
+
+    /// Load from a HuggingFace tokenizer.json with a specific encoder type.
+    pub fn from_json_with_encoder(
+        path: impl AsRef<Path>,
+        encoder_type: EncoderType,
+    ) -> Result<Self, JsonLoadError> {
+        hf::from_json_with_encoder(path, encoder_type)
+    }
+
+    // --- Configuration ---
+
+    pub fn enable_padding(&mut self, params: PaddingParams) -> &mut Self {
+        self.padding = Some(params);
+        self
+    }
+
+    pub fn enable_truncation(&mut self, params: TruncationParams) -> &mut Self {
+        self.truncation = Some(params);
+        self
+    }
+
+    pub fn no_padding(&mut self) -> &mut Self {
+        self.padding = None;
+        self
+    }
+
+    pub fn no_truncation(&mut self) -> &mut Self {
+        self.truncation = None;
+        self
+    }
+
+    pub fn set_pad_token_id(&mut self, id: TokenId) -> &mut Self {
+        self.pad_token_id = Some(id);
+        self
+    }
+
+    // --- Vocabulary access ---
+
+    /// Get the token string for a given token ID.
+    /// Returns lossy UTF-8 for byte-level tokens that aren't valid UTF-8.
+    pub fn id_to_token(&self, id: TokenId) -> Option<Cow<'_, str>> {
+        if (id as usize) >= self.decoder.len_with_added() {
+            return None;
+        }
+        // An empty entry is an id no token has (a vocab hole, or a gap
+        // between added ids).
+        let bytes = self.decoder.token_to_bytes(id);
+        (!bytes.is_empty()).then(|| String::from_utf8_lossy(bytes))
+    }
+
+    /// Look up a token string and return its token ID (O(1) after first call).
+    pub fn token_to_id(&self, token: &str) -> Option<TokenId> {
+        self.reverse_vocab().get(token).copied()
+    }
+
+    /// Get the full vocabulary as a map from token strings to token IDs.
+    pub fn get_vocab(&self) -> std::collections::HashMap<String, TokenId> {
+        self.reverse_vocab().iter().map(|(k, &v)| (k.clone(), v)).collect()
+    }
+
+    /// Get the byte sequence for a token.
+    pub fn token_to_bytes(&self, token: TokenId) -> &[u8] {
+        self.decoder.token_to_bytes(token)
+    }
+
+    fn reverse_vocab(&self) -> &FoldHashMap<String, TokenId> {
+        self.reverse_vocab.get_or_init(|| {
+            let n = self.decoder.len_with_added();
+            let mut map = FoldHashMap::with_capacity_and_hasher(n, Default::default());
+            for id in 0..n {
+                let bytes = self.decoder.token_to_bytes(id as TokenId);
+                if bytes.is_empty() {
+                    continue;
+                }
+                let s = match std::str::from_utf8(bytes) {
+                    Ok(s) => s.to_owned(),
+                    Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+                };
+                map.insert(s, id as TokenId);
+            }
+            map
         })
     }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() >= 8 && &bytes[..8] == b"TOKIE\x89\r\n" {
-            return from_image(crate::file::decode(bytes)?);
-        }
-        if bytes.len() >= 4 && &bytes[..4] == b"TOKI" {
-            return Err(Error::new("old .tkz files are not loaded"));
-        }
-        let text = std::str::from_utf8(bytes).map_err(|_| "tokenizer file is not utf-8")?;
-        Self::json(text)
-    }
+    // --- Encoding ---
 
-    /// Write this tokenizer as a `.tokie` file.
+    /// Encode text into an [`Encoding`] with token IDs, attention mask, and type IDs.
     ///
-    /// The piece blob is the list this tokenizer was loaded or preloaded with.
-    /// Ids learned by `encode` stay in the cache and are not written.
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), Error> {
-        let bytes = crate::file::encode(&self.image())?;
-        let path = path.as_ref();
-        let mut tmp_name = path.as_os_str().to_owned();
-        tmp_name.push(".tmp");
-        let tmp = Path::new(&tmp_name);
-        fs::write(tmp, &bytes).map_err(|err| format!("write {}: {err}", tmp.display()))?;
-        let file = fs::File::open(tmp).map_err(|err| format!("open {}: {err}", tmp.display()))?;
-        file.sync_all()
-            .map_err(|err| format!("sync {}: {err}", tmp.display()))?;
-        fs::rename(tmp, path).map_err(|err| format!("rename {}: {err}", path.display()))?;
-        Ok(())
+    /// # Example
+    /// ```ignore
+    /// let enc = tokenizer.encode("Hello, world!", true);
+    /// println!("{:?}", enc.ids);
+    /// ```
+    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Encoding {
+        self.encode_inner(text, add_special_tokens, None)
     }
 
-    /// Encode `piece` and keep the ids in the piece list `save` writes.
-    #[doc(hidden)]
-    pub fn preload_piece(&mut self, piece: &str) {
-        if piece.is_empty() {
-            return;
-        }
-        self.scratch.piece.clear();
-        if self.encode_piece(piece).is_err() {
-            return;
-        }
-        let encoded = std::mem::take(&mut self.scratch.piece);
-        self.cache.insert(piece.as_bytes(), &encoded);
-        Arc::make_mut(&mut self.piece_seed).push((piece.as_bytes().to_vec(), encoded));
+    /// Encode to bare token ids (truncation + special tokens applied, no
+    /// Encoding struct, no attention/type-id buffers). The low-latency path
+    /// for callers that only consume ids.
+    pub fn encode_ids(&self, text: &str, add_special_tokens: bool) -> Vec<TokenId> {
+        self.encode_ids_ctx(text, add_special_tokens, None)
     }
 
-    fn image(&self) -> crate::file::Image {
-        use crate::file::{CharsmapRec, Image, Model, SlotRec, StepRec};
-        let tables = &self.tables;
-        let model;
-        let mut unk = 0u32;
-        let mut max_chars = 0u32;
-        let mut prefix = String::new();
-        let mut unk_score = 0.0;
-        let mut pairs = Vec::new();
-        let mut byte_ids = None;
-        let mut spm_bytes = None;
-        let mut spm_chars = Vec::new();
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        let mut wp = Vec::new();
-        match &tables.kind {
-            Kind::Bpe {
-                byte_ids: ids,
-                pairs: map,
-            } => {
-                model = Model::Bpe;
-                byte_ids = Some(*ids);
-                pairs = map
-                    .iter()
-                    .map(|(&(left, right), pair)| (left, right, pair.rank, pair.id))
-                    .collect();
-            }
-            Kind::WordPiece {
-                vocab,
-                unk: unk_id,
-                prefix: pre,
-                max_chars: max,
-            } => {
-                model = Model::WordPiece;
-                unk = *unk_id;
-                max_chars = *max as u32;
-                prefix = pre.clone();
-                wp = vocab.iter().map(|(token, id)| (token.clone(), *id)).collect();
-            }
-            Kind::Unigram { lattice } => {
-                model = Model::Unigram;
-                unk = lattice.unk();
-                unk_score = lattice.unk_score();
-                nodes = lattice.nodes().collect();
-                edges = lattice.edges().collect();
-            }
-            Kind::Spm {
-                chars,
-                bytes,
-                pairs: map,
-            } => {
-                model = Model::Spm;
-                spm_bytes = Some(*bytes);
-                spm_chars = chars.iter().map(|(&ch, &id)| (ch as u32, id)).collect();
-                pairs = map
-                    .iter()
-                    .map(|(&(left, right), pair)| (left, right, pair.rank, pair.id))
-                    .collect();
-            }
-        }
-        let mut steps = Vec::new();
-        let mut literals = Vec::new();
-        let mut charsmaps = Vec::new();
-        for step in &tables.steps {
-            match step {
-                Step::Norm(norm) => steps.push(StepRec::Norm(*norm)),
-                Step::Compiled { map, blob } => {
-                    let index = u16::try_from(charsmaps.len()).expect("at most four charsmaps");
-                    let (_, _, bmp) = map.parts();
-                    charsmaps.push(CharsmapRec {
-                        blob: blob.clone(),
-                        bmp: bmp.to_vec(),
-                    });
-                    steps.push(StepRec::Compiled(index));
-                }
-                Step::Literal { from, to } => {
-                    let index = u16::try_from(literals.len()).expect("literal index fits u16");
-                    literals.push((from.clone(), to.clone()));
-                    steps.push(StepRec::Literal(index));
-                }
-            }
-        }
-        let vocab = &tables.vocab;
-        let mut slots = Vec::with_capacity(vocab.lead.len());
-        for i in 0..vocab.lead.len() {
-            slots.push(SlotRec {
-                lead_at: vocab.lead[i].at,
-                lead_len: vocab.lead[i].len,
-                next_at: vocab.next[i].at,
-                next_len: vocab.next[i].len,
-                token: vocab.tokens[i].clone(),
-                special: vocab.special[i],
-            });
-        }
-        Image {
-            sha: self.sha,
-            model,
-            cut: self.cut,
-            prefix_space: self.prefix_space,
-            mark: self.mark,
-            strip_space: vocab.strip_space,
-            unk,
-            max_chars,
-            vocab_len: slots.len() as u32,
-            prefix,
-            unk_score,
-            steps,
-            literals,
-            charsmaps,
-            arena: vocab.arena.clone(),
-            slots,
-            pairs,
-            byte_ids,
-            spm_bytes,
-            spm_chars,
-            nodes,
-            edges,
-            added_raw: tables.raw_rows.clone(),
-            added_norm: tables.norm_rows.clone(),
-            post_prefix: tables.post.prefix.clone(),
-            post_suffix: tables.post.suffix.clone(),
-            wp,
-            pieces: (*self.piece_seed).clone(),
-        }
-    }
-
-    /// Download a tokenizer for a Hub repo.
-    ///
-    /// The repo's `.tokie` file is opened, whatever its name. A repo with no
-    /// `.tokie` file is parsed from `tokenizer.json`. The file stays in the Hub
-    /// cache. A later call with the same repo reads that copy.
-    pub fn pretrained(repo: &str) -> Result<Self, Error> {
-        let api = hf_hub::api::sync::Api::new().map_err(|err| Error::new(format!("hub: {err}")))?;
-        let model = api.model(repo.to_string());
-        let info = model.info().map_err(|err| Error::new(format!("hub: {err}")))?;
-        let mut tokie_files: Vec<&str> = info
-            .siblings
-            .iter()
-            .map(|file| file.rfilename.as_str())
-            .filter(|name| name.ends_with(".tokie"))
-            .collect();
-        tokie_files.sort_unstable();
-        match tokie_files.as_slice() {
-            [name] => {
-                let path = model.get(name).map_err(|err| Error::new(format!("hub: {err}")))?;
-                Self::open(path)
-            }
-            [] => {
-                let path = model
-                    .get("tokenizer.json")
-                    .map_err(|err| Error::new(format!("hub: {err}")))?;
-                let text = fs::read_to_string(&path)
-                    .map_err(|err| format!("read {}: {err}", path.display()))?;
-                Self::json(&text)
-            }
-            names => Err(Error::new(format!(
-                "hub: {repo} has several .tokie files: {}",
-                names.join(", ")
-            ))),
-        }
-    }
-
-    /// `(filled slots, capacity, table address)` after the encodes so far.
-    #[doc(hidden)]
-    pub fn cache_stats(&self) -> (usize, usize, usize) {
-        self.cache.occupancy()
-    }
-
-    /// Append the ids for `text`. A special token listed in the file is
-    /// emitted when it occurs in the text. [`Self::wrap`] applies the template.
-    #[inline]
-    pub fn encode(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), Error> {
-        // No rewrite and no special in the text: one segment. The general
-        // path also searches, then builds a part list around misses.
-        let plain = self.tables.steps.is_empty() && !self.prefix_space;
-        if plain && !contains_added(text, &self.tables.raw_added, &self.tables.norm_added) {
-            ids.reserve(text.len() / 4 + 8);
-            return self.encode_segment(text, ids).map_err(Error::from);
-        }
-        self.encode_general(text, ids).map_err(Error::from)
-    }
-
-    /// [`Self::encode`], then the single-sequence template.
-    ///
-    /// A ByteLevel post-processor adds nothing, so those ids match
-    /// [`Self::encode`]. BERT uncased is `[CLS]`, the ids, `[SEP]`.
-    pub fn wrap(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), Error> {
-        let prefix = self.tables.post.prefix.clone();
-        let suffix = self.tables.post.suffix.clone();
-        let at = ids.len();
-        self.encode(text, ids)?;
-        if !prefix.is_empty() {
-            ids.splice(at..at, prefix);
-        }
-        ids.extend_from_slice(&suffix);
-        Ok(())
-    }
-
-    /// Append the text for `ids`. `Keep` writes every id. `Skip` omits specials.
-    pub fn decode(&self, ids: &[u32], text: &mut String, specials: Specials) -> Result<(), Error> {
-        let vocab = &self.tables.vocab;
-        let mut bytes: Vec<u8> = Vec::new();
-        let mut emitted = false;
-        for &id in ids {
-            let index = id as usize;
-            let slice = vocab.lead.get(index).ok_or_else(|| Error::new(format!("unknown id {id}")))?;
-            if slice.at == u32::MAX {
-                return Err(Error::new(format!("unknown id {id}")));
-            }
-            if specials == Specials::Skip && vocab.special.get(index).copied().unwrap_or(false) {
-                continue;
-            }
-            let slice = if emitted { &vocab.next[index] } else { slice };
-            let start = slice.at as usize;
-            bytes.extend_from_slice(&vocab.arena[start..start + slice.len as usize]);
-            emitted = true;
-        }
-        let view = if vocab.strip_space && bytes.first() == Some(&b' ') {
-            &bytes[1..]
-        } else {
-            bytes.as_slice()
-        };
-        text.push_str(&String::from_utf8_lossy(view));
-        Ok(())
-    }
-
-    /// The vocab string for `id`.
-    pub fn token(&self, id: u32) -> Option<&str> {
-        self.tables.vocab.tokens.get(id as usize)?.as_deref()
-    }
-
-    /// The id for a vocab string.
-    pub fn id(&self, token: &str) -> Option<u32> {
-        self.tables.vocab.ids.get(token).copied()
-    }
-
-    /// How many workers [`Self::batch`] uses. `1` stays on the calling thread.
-    pub fn threads(&mut self, n: usize) {
-        let n = n.max(1);
-        if n != self.threads {
-            self.pool.stop();
-            self.threads = n;
-        }
-    }
-
-    /// A tokenizer with these tables and a copy of the loaded piece cache.
-    ///
-    /// Ids learned after load stay on this tokenizer. The copy starts from the
-    /// piece list `save` writes.
-    pub fn fork(&self) -> Self {
-        Self {
-            cache: self.cache.duplicate(),
-            scratch: Scratch::new(),
-            cut: self.cut,
-            prefix_space: self.prefix_space,
-            mark: self.mark,
-            sha: self.sha,
-            piece_seed: Arc::clone(&self.piece_seed),
-            tables: Arc::clone(&self.tables),
-            threads: 1,
-            pool: Pool::new(),
-        }
-    }
-
-    /// Append the ids for each text, in order. `ends[i]` is `ids.len()` after text `i`.
-    ///
-    /// On error, `ids` and `ends` hold the texts that finished.
-    pub fn batch(&mut self, texts: &[&str], ids: &mut Vec<u32>, ends: &mut Vec<usize>) -> Result<(), Error> {
-        if texts.is_empty() {
-            return Ok(());
-        }
-        let workers = self.threads.max(1);
-        if workers == 1 || texts.len() == 1 {
-            return self.batch_here(texts, ids, ends);
-        }
-        self.start_workers(workers);
-        let ranges = chunk_ranges(texts.len(), self.pool.workers.len());
-        let mut replies = Vec::with_capacity(ranges.len());
-        for (worker, (start, end)) in self.pool.workers.iter().zip(ranges) {
-            let (tx, rx) = mpsc::channel();
-            let owned: Vec<String> = texts[start..end].iter().map(|text| (*text).to_string()).collect();
-            worker
-                .tx
-                .send(Job::Batch(owned, tx))
-                .map_err(|_| Error::new("batch worker stopped"))?;
-            replies.push(rx);
-        }
-        for rx in replies {
-            let chunk = rx.recv().map_err(|_| Error::new("batch worker stopped"))?;
-            let base = ids.len();
-            ids.extend_from_slice(&chunk.ids);
-            for end in chunk.ends {
-                ends.push(base + end);
-            }
-            if let Some(error) = chunk.error {
-                return Err(Error::new(error));
-            }
-        }
-        Ok(())
-    }
-
-    fn batch_here(&mut self, texts: &[&str], ids: &mut Vec<u32>, ends: &mut Vec<usize>) -> Result<(), Error> {
-        for text in texts {
-            self.encode(text, ids)?;
-            ends.push(ids.len());
-        }
-        Ok(())
-    }
-
-    fn start_workers(&mut self, n: usize) {
-        if self.pool.workers.len() == n {
-            return;
-        }
-        self.pool.stop();
-        for _ in 0..n {
-            let tokenizer = self.fork();
-            let (tx, rx) = mpsc::channel();
-            let thread = thread::spawn(move || serve(tokenizer, rx));
-            self.pool.workers.push(Worker {
-                tx,
-                thread: Some(thread),
-            });
-        }
-    }
-
-    fn encode_general(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), String> {
-        ids.reserve(text.len() / 4 + 8);
-        let mut parts = std::mem::take(&mut self.scratch.raw_parts);
-        split_added(text, &self.tables.raw_added, &mut parts);
-        for i in 0..parts.len() {
-            match parts[i] {
-                Part::Id(id) => ids.push(id),
-                Part::Text(start, end) => self.encode_raw(&text[start..end], ids)?,
-            }
-        }
-        self.scratch.raw_parts = parts;
-        Ok(())
-    }
-
-    fn encode_raw(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), String> {
-        let owned = self.rewrite(text);
-        let segment = owned.as_deref().unwrap_or(text);
-        let mut parts = std::mem::take(&mut self.scratch.norm_parts);
-        split_added(segment, &self.tables.norm_added, &mut parts);
-        for i in 0..parts.len() {
-            match parts[i] {
-                Part::Id(id) => ids.push(id),
-                Part::Text(start, end) => self.encode_segment(&segment[start..end], ids)?,
-            }
-        }
-        self.scratch.norm_parts = parts;
-        Ok(())
-    }
-
-    /// Run the normalizer steps in file order. `None` means every step left
-    /// the text alone.
-    fn rewrite(&mut self, text: &str) -> Option<String> {
-        if self.tables.steps.is_empty() {
-            return None;
-        }
-        let steps = &self.tables.steps;
-        let scratch = &mut self.scratch;
-        let mut cur = String::new();
-        let mut src_is_cur = false;
-        let mut changed = false;
-        for step in steps {
-            let src = if src_is_cur { cur.as_str() } else { text };
-            scratch.a.clear();
-            let wrote = match step {
-                Step::Norm(norm) => norm.write(src, true, &mut scratch.a),
-                Step::Compiled { map, .. } => map.write(src, true, &mut scratch.a),
-                Step::Literal { from, to } => literal_replace(src, from, to, &mut scratch.a),
-            };
-            if wrote {
-                std::mem::swap(&mut cur, &mut scratch.a);
-                src_is_cur = true;
-                changed = true;
-            }
-        }
-        changed.then_some(cur)
-    }
-
-    #[inline]
-    fn encode_segment(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), String> {
-        if self.cache.crc() {
-            self.encode_cut::<true>(text, ids)
-        } else {
-            self.encode_cut::<false>(text, ids)
-        }
-    }
-
-    #[inline]
-    fn encode_cut<const CRC: bool>(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), String> {
-        let prefix_space = self.prefix_space;
-        let mark = self.mark;
-        let cut = self.cut;
-        let owned = if prefix_space && !text.is_empty() && !text.starts_with(' ') {
-            let mut prefixed = String::with_capacity(text.len() + 1);
-            prefixed.push(' ');
-            prefixed.push_str(text);
-            Some(prefixed)
-        } else {
-            None
-        };
-        let view = owned.as_deref().unwrap_or(text);
-        let marked = if mark {
-            Some(mark_words(view))
-        } else {
-            None
-        };
-        let view = marked.as_deref().unwrap_or(view);
-        match cut {
-            Cut::None => {
-                if view.is_empty() {
-                    return Ok(());
-                }
-                let batch = [pretokie::Span {
-                    start: 0,
-                    end: u32::try_from(view.len()).expect("text is longer than 4 GiB"),
-                }];
-                let mut prep = [Prep { key: 0, hash: 0 }; 80];
-                let piece = view.as_bytes();
-                let key = pack(piece).unwrap_or(0);
-                let hash = if key == 0 { 0 } else { mix::<CRC>(key) };
-                prep[0] = Prep { key, hash };
-                self.emit_chunk::<CRC>(&prep, &batch, view, ids)
-            }
-            Cut::Gpt2 => {
-                let mut walk = pretokie::Gpt2::walk(view);
-                self.drive_bounds::<CRC>(|buf, limit| walk.bounds(buf, limit), view, ids)
-            }
-            Cut::SmolLM => {
-                let mut walk = pretokie::SmolLM::walk(view);
-                self.drive_bounds::<CRC>(|buf, limit| walk.bounds(buf, limit), view, ids)
-            }
-            Cut::Cl100k => {
-                let mut walk = pretokie::Cl100k::walk(view);
-                self.drive_bounds::<CRC>(|buf, limit| walk.bounds(buf, limit), view, ids)
-            }
-            Cut::Olmo => {
-                let mut walk = pretokie::Olmo::walk(view);
-                self.drive_bounds::<CRC>(|buf, limit| walk.bounds(buf, limit), view, ids)
-            }
-            Cut::Voyage => {
-                let mut walk = pretokie::Voyage::walk(view);
-                self.drive_bounds::<CRC>(|buf, limit| walk.bounds(buf, limit), view, ids)
-            }
-            Cut::Qwen => {
-                let mut walk = pretokie::Qwen::walk(view);
-                self.drive_bounds::<CRC>(|buf, limit| walk.bounds(buf, limit), view, ids)
-            }
-            Cut::O200k => {
-                let mut walk = pretokie::O200k::walk(view);
-                self.drive_bounds::<CRC>(|buf, limit| walk.bounds(buf, limit), view, ids)
-            }
-            Cut::Nemotron => {
-                let mut walk = pretokie::Nemotron::walk(view);
-                self.drive_bounds::<CRC>(|buf, limit| walk.bounds(buf, limit), view, ids)
-            }
-            Cut::Kimi => {
-                let mut walk = pretokie::Kimi::walk(view);
-                self.drive_bounds::<CRC>(|buf, limit| walk.bounds(buf, limit), view, ids)
-            }
-            Cut::DeepSeek => {
-                let mut walk = pretokie::DeepSeek::walk(view);
-                self.drive_bounds::<CRC>(|buf, limit| walk.bounds(buf, limit), view, ids)
-            }
-            Cut::Bert => {
-                let mut walk = pretokie::Bert::walk(view);
-                self.drive::<CRC>(|out| walk.fill(out), view, ids)
-            }
-            Cut::T5 => {
-                let mut walk = pretokie::T5::walk(view);
-                self.drive::<CRC>(|out| walk.fill(out), view, ids)
-            }
-        }
-    }
-
-    /// Fill a batch, pack and prefetch it, then probe before the next fill.
-    /// The rest of a 256-piece pack covers the prefetch, and the probe runs
-    /// while those lines are still in cache.
-    #[inline(never)]
-    fn drive<const CRC: bool>(
-        &mut self,
-        mut fill: impl FnMut(&mut [pretokie::Span]) -> usize,
-        view: &str,
-        ids: &mut Vec<u32>,
-    ) -> Result<(), String> {
-        let bytes = view.as_bytes();
-        let mut spans = [std::mem::MaybeUninit::<pretokie::Span>::uninit(); 256];
-        let spans = unsafe {
-            std::slice::from_raw_parts_mut(spans.as_mut_ptr().cast::<pretokie::Span>(), spans.len())
-        };
-        let mut prep = [std::mem::MaybeUninit::<Prep>::uninit(); 272];
-        loop {
-            let n = fill(spans);
-            if n == 0 {
-                break;
-            }
-            let ready = unsafe {
-                std::slice::from_raw_parts_mut(prep.as_mut_ptr().cast::<Prep>(), n + 16)
-            };
-            pack_spans::<CRC>(bytes, &spans[..n], ready, self.cache.view());
-            self.emit_chunk::<CRC>(ready, &spans[..n], view, ids)?;
-            if n < spans.len() {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-/// Fill boundaries, pack them, then probe. The walker stores offsets
-/// only. This pack reads the bytes between those offsets.
-    #[inline(never)]
-    fn drive_bounds<const CRC: bool>(
-        &mut self,
-        mut pull: impl FnMut(&mut [u32], usize) -> usize,
-        view: &str,
-        ids: &mut Vec<u32>,
-    ) -> Result<(), String> {
-        let bytes = view.as_bytes();
-        let mut bounds = [std::mem::MaybeUninit::<u32>::uninit(); 336];
-        let bounds = unsafe {
-            std::slice::from_raw_parts_mut(bounds.as_mut_ptr().cast::<u32>(), bounds.len())
-        };
-        let mut prep = [std::mem::MaybeUninit::<Prep>::uninit(); 272];
-        loop {
-            let n = pull(bounds, 256);
-            if n == 0 {
-                break;
-            }
-            let ready = unsafe {
-                std::slice::from_raw_parts_mut(prep.as_mut_ptr().cast::<Prep>(), n + 16)
-            };
-            pack_bounds::<CRC>(bytes, bounds, n, ready, self.cache.view());
-            self.emit_bounds::<CRC>(ready, bounds.as_ptr(), n, view, ids)?;
-            if n < 256 {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn emit_bounds<const CRC: bool>(
-        &mut self,
-        prep: &[Prep],
-        bounds: *const u32,
-        n: usize,
+    /// [`Self::encode_ids`] with an optional per-thread pretoken cache
+    /// (batch hot path).
+    fn encode_ids_ctx(
+        &self,
         text: &str,
-        ids: &mut Vec<u32>,
-    ) -> Result<(), String> {
-        if n == 0 {
-            return Ok(());
+        add_special_tokens: bool,
+        cache: Option<&mut WorkerCaches>,
+    ) -> Vec<TokenId> {
+        let mut tokens = self.encode_raw_ctx(text, cache);
+        if let Some(ref trunc) = self.truncation {
+            let special = if add_special_tokens {
+                self.post_processor.num_special_tokens_single()
+            } else {
+                0
+            };
+            let max_content = trunc.max_length.saturating_sub(special);
+            truncate_ids(&mut tokens, max_content, trunc.direction);
         }
-        const DISTANCE: usize = 16;
-        debug_assert!(prep.len() >= n + DISTANCE);
-        ids.reserve(4 * n);
-        let mut w = ids.len();
-        let mut dst = ids.as_mut_ptr();
-        let mut table = self.cache.view();
-        let prep = prep.as_ptr();
-        let mut i = 0;
-        while i < n {
-            let (done, wrote) = emit_fast(unsafe { prep.add(i) }, n - i, dst, w, table);
-            w = wrote;
-            i += done;
-            if i == n {
-                break;
-            }
-            unsafe { ids.set_len(w) };
-            let start = unsafe { *bounds.add(i) } as usize;
-            let end = unsafe { *bounds.add(i + 1) } as usize;
-            let piece = unsafe { text.get_unchecked(start..end) };
-            self.recover::<CRC>(piece, ids)?;
-            w = ids.len();
-            i += 1;
-            if i == n {
-                break;
-            }
-            ids.reserve(4 * (n - i));
-            dst = ids.as_mut_ptr();
-            table = self.cache.view();
+        if add_special_tokens {
+            self.post_processor.process(&tokens)
+        } else {
+            tokens
         }
-        unsafe { ids.set_len(w) };
-        Ok(())
     }
 
-    /// Home-pair hits write straight into `ids`. Anything else goes to
-    /// [`Self::recover`].
-    #[inline(always)]
-    fn emit_chunk<const CRC: bool>(
-        &mut self,
-        prep: &[Prep],
-        batch: &[pretokie::Span],
+    /// Encode with an optional per-thread pretoken cache (batch hot path).
+    fn encode_inner(
+        &self,
         text: &str,
-        ids: &mut Vec<u32>,
-    ) -> Result<(), String> {
-        let n = batch.len();
-        if n == 0 {
-            return Ok(());
+        add_special_tokens: bool,
+        cache: Option<&mut WorkerCaches>,
+    ) -> Encoding {
+        let mut tokens = self.encode_raw_ctx(text, cache);
+
+        if let Some(ref trunc) = self.truncation {
+            let special = if add_special_tokens {
+                self.post_processor.num_special_tokens_single()
+            } else {
+                0
+            };
+            let max_content = trunc.max_length.saturating_sub(special);
+            truncate_ids(&mut tokens, max_content, trunc.direction);
         }
-        const DISTANCE: usize = 16;
-        debug_assert!(prep.len() >= n + DISTANCE);
-        ids.reserve(4 * n);
-        let mut w = ids.len();
-        let mut dst = ids.as_mut_ptr();
-        let mut table = self.cache.view();
-        let prep = prep.as_ptr();
-        for i in 0..DISTANCE.min(n) {
-            table.prefetch::<true>(unsafe { (*prep.add(i)).hash });
-        }
-        for i in 0..n {
-            let ahead = unsafe { *prep.add(i + DISTANCE) };
-            table.prefetch::<true>(ahead.hash);
-            let item = unsafe { *prep.add(i) };
-            let (val, ext, found) = table.probe_pair(item.key, item.hash);
-            let fast = found & ((val & 0x80) == 0) & (item.key != 0);
-            let ab = pack_pair(val);
-            unsafe {
-                let p = dst.add(w);
-                (p as *mut u64).write_unaligned(ab);
-                (p.add(2) as *mut u64).write_unaligned(ext);
-            }
-            w += if fast { (val & 0x7f) as usize } else { 0 };
-            if !fast {
-                unsafe { ids.set_len(w) };
-                let span = unsafe { *batch.as_ptr().add(i) };
-                let piece = unsafe { text.get_unchecked(span.start as usize..span.end as usize) };
-                self.recover::<CRC>(piece, ids)?;
-                w = ids.len();
-                ids.reserve(4 * (n - i - 1));
-                dst = ids.as_mut_ptr();
-                table = self.cache.view();
+
+        let ids = if add_special_tokens {
+            self.post_processor.process(&tokens)
+        } else {
+            tokens
+        };
+
+        let mut encoding = Encoding::from_ids(ids);
+
+        if let Some(ref pad) = self.padding {
+            if let crate::padding::PaddingStrategy::Fixed(n) = pad.strategy {
+                pad_encoding(&mut encoding, n, pad);
             }
         }
-        unsafe { ids.set_len(w) };
-        Ok(())
+
+        encoding
     }
 
-    #[cold]
-    #[inline(never)]
-    fn recover<const CRC: bool>(&mut self, piece: &str, ids: &mut Vec<u32>) -> Result<(), String> {
-        if piece.is_empty() {
-            return Ok(());
-        }
-        if self.cache.probe::<CRC>(piece.as_bytes(), ids) {
-            return Ok(());
-        }
-        self.scratch.piece.clear();
-        self.encode_piece(piece)?;
-        let encoded = std::mem::take(&mut self.scratch.piece);
-        self.cache.insert(piece.as_bytes(), &encoded);
-        ids.extend_from_slice(&encoded);
-        Ok(())
-    }
+    /// Encode text with byte offsets for each token.
+    ///
+    /// Returns an [`Encoding`] with `offsets` populated — each entry is a `(start, end)`
+    /// byte range in the (normalized) input text corresponding to that token.
+    ///
+    /// Special tokens (CLS, SEP, BOS) get offset `(0, 0)`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let enc = tokenizer.encode_with_offsets("Hello, world!", true);
+    /// for (id, (start, end)) in enc.ids.iter().zip(&enc.offsets) {
+    ///     println!("token {} -> bytes {}..{}", id, start, end);
+    /// }
+    /// ```
+    pub fn encode_with_offsets(&self, text: &str, add_special_tokens: bool) -> Encoding {
+        let (mut tokens, mut offsets) = self.encode_raw_with_offsets(text);
 
-    #[cold]
-    #[inline(never)]
-    fn encode_piece(&mut self, piece: &str) -> Result<(), String> {
-        let kind = &self.tables.kind;
-        let scratch = &mut self.scratch;
-        match kind {
-            Kind::Bpe { byte_ids, pairs } => {
-                scratch.syms.clear();
-                for &byte in piece.as_bytes() {
-                    let id = byte_ids[byte as usize];
-                    if id == u32::MAX {
-                        return Err(format!("no vocab id for byte {byte:#04x}"));
+        if let Some(ref trunc) = self.truncation {
+            let special = if add_special_tokens {
+                self.post_processor.num_special_tokens_single()
+            } else {
+                0
+            };
+            let max_content = trunc.max_length.saturating_sub(special);
+            if tokens.len() > max_content {
+                match trunc.direction {
+                    crate::padding::TruncationDirection::Right => {
+                        tokens.truncate(max_content);
+                        offsets.truncate(max_content);
                     }
-                    scratch.syms.push(id);
+                    crate::padding::TruncationDirection::Left => {
+                        let start = tokens.len() - max_content;
+                        tokens.drain(..start);
+                        offsets.drain(..start);
+                    }
                 }
-                merge_ids(&mut scratch.syms, pairs);
-                scratch.piece.extend_from_slice(&scratch.syms);
             }
-            Kind::WordPiece {
-                vocab,
-                unk,
-                prefix,
-                max_chars,
-            } => {
-                let unk = *unk;
-                let max_chars = *max_chars;
-                wordpiece(
-                    piece,
-                    unk,
-                    max_chars,
-                    prefix,
-                    &mut scratch.marked,
-                    |token| vocab.get(token).copied(),
-                    &mut scratch.piece,
-                );
+        }
+
+        let (ids, final_offsets) = if add_special_tokens {
+            let processed = self.post_processor.process(&tokens);
+            // Build offsets for the processed sequence (special tokens get (0,0))
+            let mut new_offsets = Vec::with_capacity(processed.len());
+            let mut content_idx = 0;
+            for &id in &processed {
+                if self.post_processor.is_special_token(id) {
+                    new_offsets.push((0, 0));
+                } else if content_idx < offsets.len() {
+                    new_offsets.push(offsets[content_idx]);
+                    content_idx += 1;
+                } else {
+                    new_offsets.push((0, 0));
+                }
             }
-            Kind::Unigram { lattice } => {
-                lattice.segment(piece.as_bytes(), &mut scratch.piece);
+            (processed, new_offsets)
+        } else {
+            (tokens, offsets)
+        };
+
+        let mut encoding = Encoding::from_ids_with_offsets(ids, final_offsets);
+
+        if let Some(ref pad) = self.padding {
+            if let crate::padding::PaddingStrategy::Fixed(n) = pad.strategy {
+                pad_encoding(&mut encoding, n, pad);
             }
-            Kind::Spm { chars, bytes, pairs } => {
-                scratch.syms.clear();
-                for ch in piece.chars() {
-                    if let Some(&id) = chars.get(&ch) {
-                        scratch.syms.push(id);
+        }
+
+        encoding
+    }
+
+    /// Encode a pair of texts (e.g. for cross-encoder models).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let enc = tokenizer.encode_pair("What is Berlin?", "Berlin is the capital.", true);
+    /// ```
+    pub fn encode_pair(&self, text_a: &str, text_b: &str, add_special_tokens: bool) -> Encoding {
+        let mut tokens_a = self.encode_raw(text_a);
+        let mut tokens_b = self.encode_raw(text_b);
+
+        if let Some(ref trunc) = self.truncation {
+            let special = if add_special_tokens {
+                self.post_processor.num_special_tokens_pair()
+            } else {
+                0
+            };
+            let max_content = trunc.max_length.saturating_sub(special);
+            truncate_pair(&mut tokens_a, &mut tokens_b, max_content, trunc.strategy, trunc.direction);
+        }
+
+        let (ids, type_ids) = if add_special_tokens {
+            self.post_processor.process_pair(&tokens_a, &tokens_b)
+        } else {
+            let mut ids = Vec::with_capacity(tokens_a.len() + tokens_b.len());
+            ids.extend_from_slice(&tokens_a);
+            ids.extend_from_slice(&tokens_b);
+            let mut type_ids = vec![0u8; tokens_a.len()];
+            type_ids.resize(tokens_a.len() + tokens_b.len(), 1u8);
+            (ids, type_ids)
+        };
+
+        Encoding::from_pair(ids, type_ids)
+    }
+
+    /// Core encoding path: normalize + pretokenize + encode. No special tokens.
+    fn encode_raw(&self, text: &str) -> Vec<TokenId> {
+        self.encode_raw_ctx(text, None)
+    }
+
+    /// Cache-first: when no per-thread cache is supplied and the model is
+    /// BPE-with-pretokenizer, check out a pooled, process-lived
+    /// [`WorkerCaches`], so repeated pieces resolve to a single table probe
+    /// even across single-document calls.
+    /// A caller-supplied cache marks a batch-worker context: the batch is
+    /// already running one worker per CPU, so per-document parallel
+    /// chunking would only oversubscribe (a `thread::scope` spawn+join
+    /// costs ~100us on macOS — phase-1 profile_spawn_cost) and is
+    /// disabled. Standalone calls check out a pooled lease and keep the
+    /// parallel path for large documents.
+    fn encode_raw_ctx(&self, text: &str, cache: Option<&mut WorkerCaches>) -> Vec<TokenId> {
+        let allow_parallel = cache.is_none();
+        if cache.is_none() && (self.encoder.as_backtracking().is_some() || self.encoder.as_simple().is_some() || self.encoder.as_wordpiece().is_some()) && self.pretokenizer.is_some() {
+            let mut lease = crate::pool::CacheLease::checkout(self.cache_generation);
+            return self.encode_raw_dispatch(text, Some(lease.caches()), allow_parallel);
+        }
+        self.encode_raw_dispatch(text, cache, allow_parallel)
+    }
+
+    fn encode_raw_dispatch(&self, text: &str, cache: Option<&mut WorkerCaches>, allow_parallel: bool) -> Vec<TokenId> {
+        // If there are added tokens, split the text at their boundaries first.
+        // HuggingFace scans for added tokens BEFORE pretokenization.
+        if self.raw_added_matcher.is_some() || self.norm_added_matcher.is_some() {
+            return self.encode_with_added_tokens(text, cache, allow_parallel);
+        }
+
+        self.encode_raw_inner(text, cache, allow_parallel)
+    }
+
+    /// Encode text after splitting at added token boundaries.
+    ///
+    /// Mirrors HF's `AddedVocabulary::extract_and_normalize` two-stage split:
+    /// 1. the raw input is split on non-normalized added tokens;
+    /// 2. each remaining segment is normalized (position-aware for the
+    ///    metaspace prepend) and split on the normalized-token patterns;
+    ///    the leftover pieces are encoded without being normalized again.
+    fn encode_with_added_tokens(
+        &self,
+        text: &str,
+        mut cache: Option<&mut WorkerCaches>,
+        allow_parallel: bool,
+    ) -> Vec<TokenId> {
+        let mut out = Vec::with_capacity(text.len() / 3);
+        match &self.raw_added_matcher {
+            Some(matcher) if self.raw_added_first.may_occur(text.as_bytes()) => {
+                for (spec_idx, range) in split_on_added(text, matcher, &self.added_tokens_raw) {
+                    match spec_idx {
+                        Some(idx) => out.push(self.added_tokens_raw[idx].id),
+                        None => self.encode_raw_segment_into(text, range, cache.as_deref_mut(), allow_parallel, &mut out),
+                    }
+                }
+            }
+            // No raw added token can start anywhere in `text` (or there are
+            // none): it is a single segment, as `split_on_added` would return.
+            _ => self.encode_raw_segment_into(text, 0..text.len(), cache, allow_parallel, &mut out),
+        }
+        out
+    }
+
+    /// Encode the non-added-token segment `text[range]` of a raw split into
+    /// `out`: normalize it with segment-position awareness, then split it on
+    /// the normalized added-token patterns.
+    fn encode_raw_segment_into(
+        &self,
+        text: &str,
+        range: std::ops::Range<usize>,
+        mut cache: Option<&mut WorkerCaches>,
+        allow_parallel: bool,
+        out: &mut Vec<TokenId>,
+    ) {
+        let segment = &text[range.clone()];
+        if segment.is_empty() {
+            return;
+        }
+        // Only the segment at byte 0 of the original input counts as
+        // "first" (HF Metaspace prepend_scheme=first checks the
+        // original offset).
+        let first_segment = range.start == 0;
+
+        match &self.norm_added_matcher {
+            None => self.encode_segment_into(segment, first_segment, cache, allow_parallel, out),
+            Some(matcher) => {
+                let normalized = self.normalizer.normalize_segment(segment, first_segment);
+                let normalized = normalized.as_ref();
+                if !self.norm_added_first.may_occur(normalized.as_bytes()) {
+                    if !normalized.is_empty() {
+                        self.encode_prenormalized_into(normalized, cache, allow_parallel, out);
+                    }
+                    return;
+                }
+                for (nidx, nrange) in split_on_added(normalized, matcher, &self.added_tokens_raw) {
+                    if let Some(idx) = nidx {
+                        out.push(self.added_tokens_raw[idx].id);
                         continue;
                     }
-                    let mut buf = [0u8; 4];
-                    for &byte in ch.encode_utf8(&mut buf).as_bytes() {
-                        scratch.syms.push(bytes[byte as usize]);
+                    let piece = &normalized[nrange];
+                    if !piece.is_empty() {
+                        self.encode_prenormalized_into(piece, cache.as_deref_mut(), allow_parallel, out);
                     }
                 }
-                merge_ids(&mut scratch.syms, pairs);
-                scratch.piece.extend_from_slice(&scratch.syms);
             }
         }
-        Ok(())
     }
-}
 
-#[derive(Clone, Copy)]
-enum Part {
-    Text(usize, usize),
-    Id(u32),
-}
+    /// Encode one raw segment of an added-token split into `out`,
+    /// normalizing it with segment-position awareness.
+    fn encode_segment_into(
+        &self,
+        segment: &str,
+        first_segment: bool,
+        cache: Option<&mut WorkerCaches>,
+        allow_parallel: bool,
+        out: &mut Vec<TokenId>,
+    ) {
+        if self.pretokenizer.is_none() {
+            let normalized = self.normalizer.normalize_segment(segment, first_segment);
+            self.encoder.encode_into(normalized.as_ref().as_bytes(), cache, out);
+            return;
+        }
+        // Models with a pretokenizer never use position-aware metaspace
+        // prepending, so the standard path (with its parallel branch for
+        // large segments) is equivalent.
+        self.encode_raw_inner_into(segment, cache, allow_parallel, out)
+    }
 
-fn contains_added(text: &str, raw: &Needles, norm: &Needles) -> bool {
-    needle_hits(raw, text) || needle_hits(norm, text)
-}
+    /// Encode an already-normalized piece (stage 2 of the added-token split)
+    /// into `out`.
+    fn encode_prenormalized_into(
+        &self,
+        piece: &str,
+        cache: Option<&mut WorkerCaches>,
+        allow_parallel: bool,
+        out: &mut Vec<TokenId>,
+    ) {
+        if self.pretokenizer.is_none() {
+            self.encoder.encode_into(piece.as_bytes(), cache, out);
+            return;
+        }
+        // Pretokenizer models pair with idempotent normalizers (None, NFC,
+        // Bert clean-text), so re-normalizing in the standard path is a
+        // no-op and keeps the parallel branch for large pieces.
+        self.encode_raw_inner_into(piece, cache, allow_parallel, out)
+    }
 
-fn needle_hits(needles: &Needles, text: &str) -> bool {
-    match needles {
-        Needles::Empty => false,
-        Needles::Single(token) => find_token(text, token).is_some(),
-        Needles::Multi {
-            ac,
-            required,
-            use_required,
-            ..
-        } => {
-            if *use_required && memchr::memchr(*required, text.as_bytes()).is_none() {
-                return false;
+    /// Inner encoding without added token splitting.
+    fn encode_raw_inner(&self, text: &str, cache: Option<&mut WorkerCaches>, allow_parallel: bool) -> Vec<TokenId> {
+        let mut out = Vec::with_capacity(text.len() / 3);
+        self.encode_raw_inner_into(text, cache, allow_parallel, &mut out);
+        out
+    }
+
+    /// [`Self::encode_raw_inner`] appending into `out`.
+    fn encode_raw_inner_into(
+        &self,
+        text: &str,
+        cache: Option<&mut WorkerCaches>,
+        allow_parallel: bool,
+        out: &mut Vec<TokenId>,
+    ) {
+        // For models without pretokenizer (SentencePiece, Unigram), normalize the full
+        // text first and pass directly to the encoder. The encoder handles its own
+        // chunking at safe boundaries (metaspace). We must NOT use encode_parallel_into here
+        // because it splits raw text at spaces before normalization, which breaks:
+        // - Whitespace collapsing in SentencePiece normalizer (T5, XLM-R)
+        // - Metaspace sequence merging (Voyage-code-2, Voyage-law-2)
+        if self.pretokenizer.is_none() {
+            let normalized = self.normalizer.normalize(text);
+            self.encoder.encode_into(normalized.as_ref().as_bytes(), cache, out);
+            return;
+        }
+
+        if allow_parallel && text.len() >= Self::PARALLEL_CHUNK_THRESHOLD {
+            self.encode_parallel_into(text, cache, out);
+        } else {
+            let normalized = self.normalizer.normalize(text);
+            self.encode_sequential_into(normalized.as_ref(), cache, out);
+        }
+    }
+
+    /// Core encoding path with byte offset tracking: the ids of
+    /// [`Self::encode_raw`], each with its byte range.
+    ///
+    /// It takes the same added-token splits and normalizations as
+    /// `encode_raw`. Offsets index the normalized text: each segment between
+    /// added tokens, normalized as `encode_raw` normalizes it, with the added
+    /// tokens' matched bytes in between. With an identity normalizer that is
+    /// `text` itself.
+    fn encode_raw_with_offsets(&self, text: &str) -> (Vec<TokenId>, Vec<(usize, usize)>) {
+        let mut lease = crate::pool::CacheLease::checkout(self.cache_generation);
+        let cache = lease.caches();
+        let mut acc = OffsetAcc::default();
+        if self.raw_added_matcher.is_none() && self.norm_added_matcher.is_none() {
+            let normalized = self.normalizer.normalize(text);
+            self.encode_normalized_with_offsets(normalized.as_ref(), cache, &mut acc);
+            return (acc.ids, acc.offsets);
+        }
+        let raw_splits = match &self.raw_added_matcher {
+            Some(m) if self.raw_added_first.may_occur(text.as_bytes()) => split_on_added(text, m, &self.added_tokens_raw),
+            _ => vec![(None, 0..text.len())],
+        };
+        for (idx, range) in raw_splits {
+            if let Some(idx) = idx {
+                acc.push_added(self.added_tokens_raw[idx].id, range.len());
+                continue;
             }
-            ac.find(text.as_bytes()).is_some()
-        }
-    }
-}
-
-/// Home-pair hits for one batch. The output pointer is not a `Vec`, so the
-/// loop keeps the table mask and the cursor in registers instead of
-/// recounting a reservation. Returns how many pieces were consumed and the
-/// new output length. A miss, a spill, or an empty key stops the batch.
-#[inline(never)]
-fn emit_fast(
-    mut prep: *const Prep,
-    n: usize,
-    dst: *mut u32,
-    mut w: usize,
-    table: ProbeView,
-) -> (usize, usize) {
-    const DISTANCE: usize = 16;
-    for i in 0..DISTANCE.min(n) {
-        table.prefetch::<true>(unsafe { (*prep.add(i)).hash });
-    }
-    let end = unsafe { prep.add(n) };
-    let mut done = 0;
-    while prep < end {
-        let ahead = unsafe { *prep.add(DISTANCE) };
-        table.prefetch::<true>(ahead.hash);
-        let item = unsafe { *prep };
-        let (val, ext, found) = table.probe_pair(item.key, item.hash);
-        let fast = found & ((val & 0x80) == 0) & (item.key != 0);
-        let ab = pack_pair(val);
-        unsafe {
-            let p = dst.add(w);
-            (p as *mut u64).write_unaligned(ab);
-            (p.add(2) as *mut u64).write_unaligned(ext);
-        }
-        if !fast {
-            return (done, w);
-        }
-        w += (val & 0x7f) as usize;
-        prep = unsafe { prep.add(1) };
-        done += 1;
-    }
-    (n, w)
-}
-
-/// Pack token lanes 1 and 2 into one store. The shift is written out so
-/// the probe loop does not reload a 64-bit mask for every piece.
-#[inline(always)]
-fn pack_pair(val: u64) -> u64 {
-    let tok1 = u64::from(((val >> 8) as u32) & 0x00ff_ffff);
-    let mut tok2 = u64::from((val >> 32) as u32);
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!(
-            "shl {tok2}, 32",
-            "or {tok2}, {tok1}",
-            tok1 = in(reg) tok1,
-            tok2 = inout(reg) tok2,
-            options(pure, nomem, nostack),
-        );
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        tok2 = (tok2 << 32) | tok1;
-    }
-    tok2
-}
-
-fn split_added(text: &str, needles: &Needles, out: &mut Vec<Part>) {
-    out.clear();
-    match needles {
-        Needles::Empty => {
-            if !text.is_empty() {
-                out.push(Part::Text(0, text.len()));
+            let segment = &text[range.clone()];
+            if segment.is_empty() {
+                continue;
             }
-        }
-        Needles::Single(token) => {
-            let mut at = 0;
-            while at < text.len() {
-                let Some(pos) = find_token(&text[at..], token) else {
-                    out.push(Part::Text(at, text.len()));
-                    return;
+            let first_segment = range.start == 0;
+            // As `encode_raw_segment_into`.
+            let Some(matcher) = &self.norm_added_matcher else {
+                let normalized = match self.pretokenizer {
+                    None => self.normalizer.normalize_segment(segment, first_segment),
+                    Some(_) => self.normalizer.normalize(segment),
                 };
-                let start = at + pos;
-                let end = start + token.content.len();
-                if start > at {
-                    out.push(Part::Text(at, start));
-                }
-                out.push(Part::Id(token.id));
-                at = end;
-            }
-        }
-        Needles::Multi {
-            ac,
-            ids,
-            required,
-            use_required,
-        } => {
-            let bytes = text.as_bytes();
-            if *use_required && memchr::memchr(*required, bytes).is_none() {
-                if !text.is_empty() {
-                    out.push(Part::Text(0, text.len()));
-                }
-                return;
-            }
-            let mut at = 0;
-            while at < bytes.len() {
-                let Some(hit) = ac.find(&bytes[at..]) else {
-                    out.push(Part::Text(at, text.len()));
-                    return;
-                };
-                let start = at + hit.start();
-                let end = at + hit.end();
-                debug_assert!(text.is_char_boundary(start) && text.is_char_boundary(end));
-                if start > at {
-                    out.push(Part::Text(at, start));
-                }
-                out.push(Part::Id(ids[hit.pattern().as_usize()]));
-                at = end;
-            }
-        }
-    }
-}
-
-/// Byte search for an ASCII special. Those bytes never sit inside a
-/// multibyte character, so the match is a char boundary. Anything else uses
-/// the string search.
-fn find_token(haystack: &str, token: &Added) -> Option<usize> {
-    if let Some(finder) = &token.finder {
-        finder.find(haystack.as_bytes())
-    } else {
-        haystack.find(&token.content)
-    }
-}
-
-fn norms_of(value: Option<&Value>) -> Result<Vec<Step>, String> {
-    let mut steps = Vec::new();
-    if let Some(value) = value {
-        push_norm(value, &mut steps)?;
-    }
-    Ok(steps)
-}
-
-fn push_norm(value: &Value, steps: &mut Vec<Step>) -> Result<(), String> {
-    if value.is_null() {
-        return Ok(());
-    }
-    let obj = value.as_object().ok_or("normalizer is not an object")?;
-    let kind = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match kind {
-        "Sequence" => {
-            let kids = obj
-                .get("normalizers")
-                .and_then(|v| v.as_array())
-                .ok_or("sequence normalizer has no normalizers")?;
-            for kid in kids {
-                push_norm(kid, steps)?;
-            }
-        }
-        "NFC" => steps.push(Step::Norm(Norm::Nfc)),
-        "NFD" => steps.push(Step::Norm(Norm::Nfd)),
-        "NFKC" => steps.push(Step::Norm(Norm::Nfkc)),
-        "NFKD" => steps.push(Step::Norm(Norm::Nfkd)),
-        "Nmt" => steps.push(Step::Norm(Norm::Nmt)),
-        "Lowercase" => steps.push(Step::Norm(Norm::Lower)),
-        "Strip" => steps.push(Step::Norm(Norm::Strip)),
-        "StripAccents" => steps.push(Step::Norm(Norm::StripAccents)),
-        "Prepend" => steps.push(Step::Norm(Norm::Prepend)),
-        "Replace" => {
-            let from = literal_pattern(obj.get("pattern").ok_or("replace has no pattern")?)?;
-            let to = obj
-                .get("content")
-                .and_then(|v| v.as_str())
-                .ok_or("replace has no content")?
-                .to_string();
-            if from.is_empty() {
-                return Err("replace pattern is empty".to_string());
-            }
-            if from == " " && to == "▁" {
-                steps.push(Step::Norm(Norm::ReplaceSpace));
-            } else {
-                steps.push(Step::Literal { from, to });
-            }
-        }
-        "Precompiled" => {
-            let blob = obj
-                .get("precompiled_charsmap")
-                .and_then(|v| v.as_str())
-                .ok_or("precompiled normalizer has no charsmap")?;
-            let bytes = decode_base64(blob)?;
-            let map = normalie::Precompiled::parse(&bytes)
-                .map_err(|err| format!("precompiled charsmap: {err}"))?;
-            steps.push(Step::Compiled { map, blob: bytes });
-        }
-        "BertNormalizer" => {
-            let lowercase = obj.get("lowercase").and_then(|v| v.as_bool()).unwrap_or(false);
-            if lowercase {
-                steps.push(Step::Norm(Norm::BertUncased));
-            } else {
-                steps.push(Step::Norm(Norm::BertCased));
-                if obj.get("strip_accents").and_then(|v| v.as_bool()) == Some(true) {
-                    steps.push(Step::Norm(Norm::StripAccents));
-                }
-            }
-        }
-        other => return Err(format!("unsupported normalizer {other}")),
-    }
-    Ok(())
-}
-
-enum Step {
-    Norm(Norm),
-    Compiled { map: normalie::Precompiled, blob: Vec<u8> },
-    Literal { from: String, to: String },
-}
-
-fn literal_pattern(value: &Value) -> Result<String, String> {
-    match value {
-        Value::String(text) => Ok(text.clone()),
-        Value::Object(map) => map
-            .get("String")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| format!("replace pattern is not a literal: {value}")),
-        _ => Err(format!("replace pattern is not a literal: {value}")),
-    }
-}
-
-fn literal_replace(text: &str, from: &str, to: &str, out: &mut String) -> bool {
-    let Some(hit) = text.find(from) else {
-        return false;
-    };
-    out.push_str(&text[..hit]);
-    out.push_str(to);
-    let mut at = hit + from.len();
-    while let Some(next) = text[at..].find(from) {
-        let end = at + next;
-        out.push_str(&text[at..end]);
-        out.push_str(to);
-        at = end + from.len();
-    }
-    out.push_str(&text[at..]);
-    true
-}
-
-struct PreState {
-    patterns: Vec<String>,
-    digits: bool,
-    bert: bool,
-    byte_regex: bool,
-    prefix_space: bool,
-    whitespace: bool,
-    mark: bool,
-}
-
-fn cut_of(value: Option<&Value>) -> Result<(Cut, bool, bool), String> {
-    let Some(value) = value.filter(|v| !v.is_null()) else {
-        return Ok((Cut::None, false, false));
-    };
-    let mut state = PreState {
-        patterns: Vec::new(),
-        digits: false,
-        bert: false,
-        byte_regex: false,
-        prefix_space: false,
-        whitespace: false,
-        mark: false,
-    };
-    walk_pre(value, &mut state)?;
-    let cut = if state.bert {
-        Cut::Bert
-    } else if state.digits && state.byte_regex {
-        Cut::SmolLM
-    } else if state.patterns.iter().any(|pattern| pattern == DEEPSEEK) {
-        Cut::DeepSeek
-    } else if state.patterns.iter().any(|pattern| pattern == O200K) {
-        Cut::O200k
-    } else if state.patterns.iter().any(|pattern| pattern == NEMOTRON) {
-        Cut::Nemotron
-    } else if state.patterns.iter().any(|pattern| pattern == KIMI) {
-        Cut::Kimi
-    } else if state.patterns.iter().any(|pattern| pattern == VOYAGE) {
-        Cut::Voyage
-    } else if state.patterns.iter().any(|pattern| pattern == QWEN) {
-        Cut::Qwen
-    } else if state.patterns.iter().any(|pattern| pattern == CL100K) {
-        Cut::Cl100k
-    } else if state.patterns.iter().any(|pattern| pattern == GPT2) || state.byte_regex {
-        Cut::Gpt2
-    } else if state.whitespace && state.patterns.is_empty() {
-        Cut::T5
-    } else {
-        return Err(format!("unsupported pretokenizer patterns: {:?}", state.patterns));
-    };
-    Ok((cut, state.prefix_space, state.mark))
-}
-
-fn walk_pre(value: &Value, state: &mut PreState) -> Result<(), String> {
-    let obj = value.as_object().ok_or("pre_tokenizer is not an object")?;
-    let kind = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match kind {
-        "Sequence" => {
-            let kids = obj
-                .get("pretokenizers")
-                .and_then(|v| v.as_array())
-                .ok_or("sequence pretokenizer has no pretokenizers")?;
-            for kid in kids {
-                walk_pre(kid, state)?;
-            }
-        }
-        "ByteLevel" => {
-            if obj.get("use_regex").and_then(|v| v.as_bool()).unwrap_or(true) {
-                state.byte_regex = true;
-            }
-            if obj.get("add_prefix_space").and_then(|v| v.as_bool()).unwrap_or(false) {
-                state.prefix_space = true;
-            }
-        }
-        "Digits" => state.digits = true,
-        "BertPreTokenizer" => state.bert = true,
-        "WhitespaceSplit" => state.whitespace = true,
-        "Metaspace" => {
-            let replacement = obj.get("replacement").and_then(|v| v.as_str()).unwrap_or("▁");
-            if replacement != "▁" {
-                return Err(format!("unsupported metaspace replacement {replacement:?}"));
-            }
-            state.mark = match obj.get("prepend_scheme").and_then(|v| v.as_str()) {
-                Some("always") => true,
-                Some("never") => false,
-                Some(other) => return Err(format!("unsupported metaspace prepend {other}")),
-                None => obj.get("add_prefix_space").and_then(|v| v.as_bool()).unwrap_or(true),
+                self.encode_normalized_with_offsets(normalized.as_ref(), cache, &mut acc);
+                continue;
             };
-        }
-        "Split" => {
-            let pattern = obj.get("pattern").ok_or("split has no pattern")?;
-            state.patterns.push(canon_pattern(&regex_of(pattern)?));
-        }
-        other => return Err(format!("unsupported pretokenizer {other}")),
-    }
-    Ok(())
-}
-
-fn canon_pattern(pattern: &str) -> String {
-    let mut out = String::with_capacity(pattern.len());
-    for ch in pattern.chars() {
-        match ch {
-            '\r' => out.push_str("\\r"),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn regex_of(value: &Value) -> Result<String, String> {
-    match value {
-        Value::String(text) => Ok(text.clone()),
-        Value::Object(map) => map
-            .get("Regex")
-            .or_else(|| map.get("String"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| format!("pattern has no regex: {value}")),
-        _ => Err(format!("pattern is not a regex: {value}")),
-    }
-}
-
-struct Post {
-    prefix: Vec<u32>,
-    suffix: Vec<u32>,
-}
-
-/// Single-sequence template. Anything other than `TemplateProcessing` adds
-/// no ids. Specials before the sequence are the prefix. Specials after it
-/// are the suffix.
-fn post_of(value: Option<&Value>) -> Result<Post, String> {
-    let empty = Post {
-        prefix: Vec::new(),
-        suffix: Vec::new(),
-    };
-    let Some(value) = value.filter(|v| !v.is_null()) else {
-        return Ok(empty);
-    };
-    let obj = value.as_object().ok_or("post_processor is not an object")?;
-    if obj.get("type").and_then(|v| v.as_str()) != Some("TemplateProcessing") {
-        return Ok(empty);
-    }
-    let specials = obj
-        .get("special_tokens")
-        .and_then(|v| v.as_object())
-        .ok_or("template has no special_tokens")?;
-    let single = obj
-        .get("single")
-        .and_then(|v| v.as_array())
-        .ok_or("template has no single sequence")?;
-    let mut prefix = Vec::new();
-    let mut suffix = Vec::new();
-    let mut seen_seq = false;
-    for item in single {
-        let item = item.as_object().ok_or("template piece is not an object")?;
-        if item.contains_key("Sequence") {
-            if seen_seq {
-                return Err("single template has two sequences".to_string());
+            let normalized = self.normalizer.normalize_segment(segment, first_segment);
+            let normalized = normalized.as_ref();
+            if normalized.is_empty() {
+                continue;
             }
-            seen_seq = true;
-            continue;
-        }
-        let name = item
-            .get("SpecialToken")
-            .and_then(|v| v.get("id"))
-            .and_then(|v| v.as_str())
-            .ok_or("template piece is not a token or a sequence")?;
-        let ids = specials
-            .get(name)
-            .and_then(|v| v.get("ids"))
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| format!("template token {name} has no ids"))?;
-        let dest = if seen_seq { &mut suffix } else { &mut prefix };
-        for id in ids {
-            let id = id.as_u64().ok_or_else(|| format!("template id for {name} is not an integer"))?;
-            dest.push(u32::try_from(id).map_err(|_| format!("template id {id} does not fit in u32"))?);
-        }
-    }
-    Ok(Post { prefix, suffix })
-}
-
-fn from_image(image: crate::file::Image) -> Result<Tokenizer, Error> {
-    use crate::file::{Model, StepRec};
-    let kind = match image.model {
-        Model::Bpe => Kind::Bpe {
-            byte_ids: image.byte_ids.ok_or("bpe file has no byte ids")?,
-            pairs: pair_map(&image.pairs),
-        },
-        Model::WordPiece => Kind::WordPiece {
-            vocab: string_map(&image.wp),
-            unk: image.unk,
-            prefix: image.prefix.clone(),
-            max_chars: image.max_chars as usize,
-        },
-        Model::Unigram => {
-            check_lattice(&image.nodes, &image.edges)?;
-            Kind::Unigram {
-                lattice: Lattice::from_parts(image.nodes.clone(), image.edges.clone(), image.unk, image.unk_score),
-            }
-        }
-        Model::Spm => Kind::Spm {
-            chars: char_map(&image.spm_chars)?,
-            bytes: image.spm_bytes.ok_or("sentencepiece file has no byte tokens")?,
-            pairs: pair_map(&image.pairs),
-        },
-    };
-    let mut steps = Vec::with_capacity(image.steps.len());
-    for step in &image.steps {
-        steps.push(match step {
-            StepRec::Norm(norm) => Step::Norm(*norm),
-            StepRec::Compiled(index) => {
-                let rec = image
-                    .charsmaps
-                    .get(*index as usize)
-                    .ok_or("compiled step has no charsmap")?;
-                let map = normalie::Precompiled::from_stored(&rec.blob, rec.bmp.clone())
-                    .map_err(|err| format!("precompiled charsmap: {err}"))?;
-                Step::Compiled {
-                    map,
-                    blob: rec.blob.clone(),
+            let splits = if self.norm_added_first.may_occur(normalized.as_bytes()) {
+                split_on_added(normalized, matcher, &self.added_tokens_raw)
+            } else {
+                vec![(None, 0..normalized.len())]
+            };
+            for (nidx, nrange) in splits {
+                if let Some(idx) = nidx {
+                    acc.push_added(self.added_tokens_raw[idx].id, nrange.len());
+                    continue;
+                }
+                let piece = &normalized[nrange];
+                if piece.is_empty() {
+                    continue;
+                }
+                // As `encode_prenormalized_into`: pretokenizer models
+                // normalize again (a no-op for their normalizers).
+                match self.pretokenizer {
+                    None => self.encode_normalized_with_offsets(piece, cache, &mut acc),
+                    Some(_) => self.encode_normalized_with_offsets(self.normalizer.normalize(piece).as_ref(), cache, &mut acc),
                 }
             }
-            StepRec::Literal(index) => {
-                let (from, to) = image
-                    .literals
-                    .get(*index as usize)
-                    .ok_or("literal step has no replacement")?;
-                Step::Literal {
-                    from: from.clone(),
-                    to: to.clone(),
+        }
+        (acc.ids, acc.offsets)
+    }
+
+    /// Encode an already-normalized text into `acc`, then advance its base
+    /// past the text.
+    fn encode_normalized_with_offsets(&self, text: &str, cache: &mut WorkerCaches, acc: &mut OffsetAcc) {
+        match &self.pretokenizer {
+            Some(pretok) => {
+                let base_ptr = text.as_ptr() as usize;
+                for piece in pretok.split(text) {
+                    self.encode_piece_with_offsets(piece.as_bytes(), piece.as_ptr() as usize - base_ptr, cache, acc);
                 }
             }
+            None => self.encode_piece_with_offsets(text.as_bytes(), 0, cache, acc),
+        }
+        acc.base += text.len();
+    }
+
+    /// Encode one piece starting `start` bytes into the current text, with
+    /// each token's range taken from its vocab bytes and clamped to the
+    /// piece. WordPiece tokens don't spell their input: a continuation token
+    /// covers its bytes without the `##` prefix, and `[UNK]` the whole piece.
+    fn encode_piece_with_offsets(&self, piece: &[u8], start: usize, cache: &mut WorkerCaches, acc: &mut OffsetAcc) {
+        let first = acc.ids.len();
+        self.encoder.encode_into(piece, Some(cache), &mut acc.ids);
+        let wordpiece = self.encoder.as_wordpiece();
+        let begin = acc.base + start;
+        let end = begin + piece.len();
+        let mut pos = begin;
+        for (i, &id) in acc.ids[first..].iter().enumerate() {
+            let mut len = self.decoder.token_len(id);
+            if let Some(wp) = wordpiece {
+                if id == wp.unk_token() {
+                    len = piece.len();
+                } else if i > 0 && self.decoder.token_to_bytes(id).starts_with(wp.continuation_prefix()) {
+                    len -= wp.continuation_prefix().len();
+                }
+            }
+            acc.offsets.push((pos.min(end), (pos + len).min(end)));
+            pos += len;
+        }
+        // Stretch the last token over any bytes the lengths fell short of.
+        if acc.ids.len() > first && pos < end {
+            acc.offsets.last_mut().unwrap().1 = end;
+        }
+    }
+
+    /// Sequential fused pretokenize+encode of one normalized text.
+    ///
+    /// For the Backtracking encoder both per-piece enum dispatches (the
+    /// `PretokenizerIter` match and the `Encoder` match) are hoisted out of
+    /// the loop: `for_each_piece` monomorphizes the walker per config and
+    /// the consumer closure calls the concrete encoder directly. Phase-1
+    /// profiling (profile_glue_costs, gpt2/OWT) put the two enum taxes at
+    /// ~1 ns/piece of a ~16 ns/piece loop.
+    #[cfg(test)]
+    fn encode_sequential(&self, text: &str, cache: Option<&mut WorkerCaches>) -> Vec<TokenId> {
+        let mut out = Vec::with_capacity(text.len() / 3);
+        self.encode_sequential_into(text, cache, &mut out);
+        out
+    }
+
+    /// [`Self::encode_sequential`] appending into a caller-owned buffer —
+    /// the byte-source bulk path reuses one buffer per worker chunk so no
+    /// per-document vector is ever allocated.
+    #[inline]
+    fn encode_sequential_into(
+        &self,
+        text: &str,
+        mut cache: Option<&mut WorkerCaches>,
+        out: &mut Vec<TokenId>,
+    ) {
+        let pretok = self.pretokenizer.as_ref().unwrap();
+        let db = text.as_bytes();
+        if let Some(bt) = self.encoder.as_backtracking() {
+            match cache {
+                // Only the BPE pretoken half of the worker caches is used on
+                // the Backtracking fused path.
+                Some(c) => {
+                    let pc = &mut c.pretok;
+                    // Block drain: keys and probes for a block of pieces run
+                    // in their own loops instead of inside the walker. Seed
+                    // only here; a short text's per-piece walk would pay the
+                    // whole seed for a few pieces.
+                    let blocked = text.len() >= BLOCK_MIN_LEN && {
+                        if pc.wants_seed() {
+                            pc.seed(bt.cache_seeds());
+                        }
+                        pretok.for_each_block(text, &mut |start, ends| {
+                            pc.encode_block(db, start, ends, out, |c, p, o| bt.encode_piece_into(db, p, Some(c), o))
+                        })
+                    };
+                    if !blocked {
+                        pretok.for_each_piece(text, |p| {
+                            bt.encode_piece_into(db, p.as_bytes(), Some(&mut *pc), out)
+                        })
+                    }
+                }
+                None => pretok.for_each_piece(text, |p| {
+                    bt.encode_piece_into(db, p.as_bytes(), None, out)
+                }),
+            }
+        } else if let Some(wp) = self.encoder.as_wordpiece() {
+            let mut pc = cache.map(|c| &mut c.pretok);
+            pretok.for_each_piece(text, |p| {
+                wp.encode_piece_into(db, p.as_bytes(), pc.as_deref_mut(), out)
+            })
+        } else if let Some(se) = self.encoder.as_simple() {
+            let mut pc = cache.map(|c| &mut c.pretok);
+            // Seed only for the block path, as above.
+            let blocked = match pc.as_deref_mut() {
+                Some(c) if text.len() >= BLOCK_MIN_LEN => {
+                    if c.wants_seed() {
+                        c.seed(se.cache_seeds());
+                    }
+                    pretok.for_each_block(text, &mut |start, ends| {
+                        c.encode_block(db, start, ends, out, |c, p, o| se.encode_piece_into(db, p, Some(c), o))
+                    })
+                }
+                _ => false,
+            };
+            if !blocked {
+                pretok.for_each_piece(text, |p| {
+                    se.encode_piece_into(db, p.as_bytes(), pc.as_deref_mut(), out)
+                })
+            }
+        } else {
+            for piece in pretok.split(text) {
+                self.encoder.encode_piece_into(db, piece.as_bytes(), cache.as_deref_mut(), out);
+            }
+        }
+    }
+
+    /// Split text into chunks at piece boundaries and encode them in
+    /// parallel, appending to `out`. The calling thread encodes the first
+    /// chunk with `cache` (the caller's pooled lease) while the others run
+    /// on their own leases.
+    fn encode_parallel_into(&self, text: &str, cache: Option<&mut WorkerCaches>, out: &mut Vec<TokenId>) {
+        let bytes = text.as_bytes();
+        let chunks = match self.pretokenizer {
+            // A custom pattern has no cut point known to be safe.
+            Some(Pretokenizer::Regex(_)) => vec![bytes],
+            _ => parallel_cuts(bytes, num_cpus()),
+        };
+        let encode_chunk = |chunk: &[u8], cache: Option<&mut WorkerCaches>, out: &mut Vec<TokenId>| {
+            // SAFETY: `text` is UTF-8 and every cut is before an ASCII byte.
+            let chunk = unsafe { std::str::from_utf8_unchecked(chunk) };
+            let normalized = self.normalizer.normalize(chunk);
+            self.encode_sequential_into(normalized.as_ref(), cache, out);
+        };
+        let (first, rest) = chunks.split_first().expect("parallel_cuts returns at least one chunk");
+        if rest.is_empty() {
+            return encode_chunk(first, cache, out);
+        }
+        let generation = self.cache_generation;
+        let mut rest_ids: Vec<Vec<TokenId>> = rest.iter().map(|_| Vec::new()).collect();
+        // `in_place_scope` runs its body on this thread (a `join` from
+        // outside the pool would park it while the pool ran both halves).
+        pool().in_place_scope(|s| {
+            for (&chunk, ids) in rest.iter().zip(rest_ids.iter_mut()) {
+                let encode_chunk = &encode_chunk;
+                s.spawn(move |_| {
+                    let mut lease = crate::pool::CacheLease::checkout(generation);
+                    ids.reserve(chunk.len() / 3);
+                    encode_chunk(chunk, Some(lease.caches()), ids);
+                });
+            }
+            encode_chunk(first, cache, out);
         });
-    }
-    let vocab = vocab_from_slots(&image)?;
-    let raw_added = needles_of(image.added_raw.clone())?;
-    let norm_added = needles_of(image.added_norm.clone())?;
-    let mut cache = Cache::new();
-    for (piece, ids) in &image.pieces {
-        cache.insert(piece, ids);
-    }
-    Ok(Tokenizer {
-        cache,
-        scratch: Scratch::new(),
-        cut: image.cut,
-        prefix_space: image.prefix_space,
-        mark: image.mark,
-        sha: image.sha,
-        piece_seed: Arc::new(image.pieces),
-        tables: Arc::new(Tables {
-            steps,
-            raw_added,
-            norm_added,
-            raw_rows: image.added_raw,
-            norm_rows: image.added_norm,
-            kind,
-            post: Post {
-                prefix: image.post_prefix,
-                suffix: image.post_suffix,
-            },
-            vocab,
-        }),
-        threads: default_threads(),
-        pool: Pool::new(),
-    })
-}
-
-fn pair_map(pairs: &[(u32, u32, u32, u32)]) -> FxHashMap<(u32, u32), Pair> {
-    let mut map = FxHashMap::with_capacity_and_hasher(pairs.len(), Default::default());
-    for &(left, right, rank, id) in pairs {
-        map.insert((left, right), Pair { rank, id });
-    }
-    map
-}
-
-fn string_map(rows: &[(String, u32)]) -> FxHashMap<String, u32> {
-    let mut map = FxHashMap::with_capacity_and_hasher(rows.len(), Default::default());
-    for (token, id) in rows {
-        map.insert(token.clone(), *id);
-    }
-    map
-}
-
-fn char_map(rows: &[(u32, u32)]) -> Result<FxHashMap<char, u32>, String> {
-    let mut map = FxHashMap::default();
-    for &(scalar, id) in rows {
-        let ch = char::from_u32(scalar).ok_or("sentencepiece char is not a scalar")?;
-        map.insert(ch, id);
-    }
-    Ok(map)
-}
-
-fn check_lattice(nodes: &[(u32, u16, u32, f64)], edges: &[(u8, u32)]) -> Result<(), String> {
-    for &(edge_at, edge_n, _, _) in nodes {
-        let end = edge_at as usize + edge_n as usize;
-        if end > edges.len() {
-            return Err("unigram node edges run past the edge list".to_string());
+        let rest = rest_ids;
+        out.reserve(rest.iter().map(Vec::len).sum());
+        for ids in rest {
+            out.extend_from_slice(&ids);
         }
     }
-    for &(_, to) in edges {
-        if to as usize >= nodes.len() {
-            return Err("unigram edge leaves the lattice".to_string());
+
+    /// Encode raw bytes directly (bypasses pretokenizer and normalizer).
+    pub fn encode_bytes(&self, bytes: &[u8]) -> Vec<TokenId> {
+        self.encoder.encode(bytes)
+    }
+
+    /// Split `text` at added-token matches, honoring per-token flags.
+    /// Exposed for tests; see [`split_on_added`].
+    #[doc(hidden)]
+    pub fn debug_split_added(&self, text: &str) -> Vec<(Option<TokenId>, std::ops::Range<usize>)> {
+        match &self.raw_added_matcher {
+            Some(m) => split_on_added(text, m, &self.added_tokens_raw)
+                .into_iter()
+                .map(|(idx, r)| (idx.map(|i| self.added_tokens_raw[i].id), r))
+                .collect(),
+            None => vec![(None, 0..text.len())],
         }
     }
-    Ok(())
-}
 
-fn vocab_from_slots(image: &crate::file::Image) -> Result<Vocab, String> {
-    if image.slots.len() != image.vocab_len as usize {
-        return Err("slot count does not match the vocab length".to_string());
+    /// Streaming iterator over encoded tokens.
+    pub fn encode_iter<'a>(&'a self, text: &'a str) -> TokenizeIter<'a> {
+        TokenizeIter::new(self, text)
     }
-    let n = image.slots.len();
-    let mut vocab = Vocab {
-        arena: image.arena.clone(),
-        lead: Vec::with_capacity(n),
-        next: Vec::with_capacity(n),
-        tokens: Vec::with_capacity(n),
-        ids: FxHashMap::with_capacity_and_hasher(n, Default::default()),
-        special: Vec::with_capacity(n),
-        strip_space: image.strip_space,
-    };
-    for (id, slot) in image.slots.iter().enumerate() {
-        let lead = Slice {
-            at: slot.lead_at,
-            len: slot.lead_len,
-        };
-        let next = Slice {
-            at: slot.next_at,
-            len: slot.next_len,
-        };
-        check_slice(vocab.arena.len(), lead)?;
-        check_slice(vocab.arena.len(), next)?;
-        vocab.lead.push(lead);
-        vocab.next.push(next);
-        vocab.special.push(slot.special);
-        if let Some(token) = &slot.token {
-            vocab.ids.insert(token.clone(), id as u32);
-            vocab.tokens.push(Some(token.clone()));
+
+    /// Streaming iterator over encoded tokens from bytes (bypasses pretokenizer).
+    pub fn encode_bytes_iter<'a>(&'a self, bytes: &'a [u8]) -> EncoderIter<'a> {
+        self.encoder.encode_iter(bytes)
+    }
+
+    // --- Decoding ---
+
+    /// Decode token IDs back to a string, applying text-level post-processing.
+    ///
+    /// Behavior depends on the [`DecoderType`]:
+    /// - **WordPiece**: Strips `##` continuation prefixes, joins tokens with spaces,
+    ///   and skips special tokens (CLS, SEP, etc.)
+    /// - **Metaspace** (SentencePiece/Unigram): Replaces `▁` with spaces, strips leading space
+    /// - **ByteLevel** (BPE): Direct byte concatenation (already correct)
+    ///
+    /// Returns `None` if the result is not valid UTF-8.
+    pub fn decode(&self, tokens: &[TokenId]) -> Option<String> {
+        self.decoder.decode(tokens, &self.post_processor)
+    }
+
+    /// Raw byte-level decode without text post-processing.
+    pub fn decode_bytes(&self, tokens: &[TokenId]) -> Vec<u8> {
+        self.decoder.decode_bytes(tokens)
+    }
+
+    /// Decode multiple token sequences in parallel.
+    pub fn decode_batch(&self, sequences: &[&[TokenId]]) -> Vec<Option<String>> {
+        let cpus = num_cpus();
+        if sequences.len() <= cpus || cpus == 1 {
+            return sequences.iter().map(|tokens| self.decode(tokens)).collect();
+        }
+
+        let chunk_size = (sequences.len() + cpus - 1) / cpus;
+        pool().install(|| sequences.par_iter().with_min_len(chunk_size.min(64)).map(|tokens| self.decode(tokens)).collect())
+    }
+
+    // --- Batch encoding ---
+
+    /// Encode multiple texts in parallel, with optional padding.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let encodings = tokenizer.encode_batch(&["Hello!", "World"], true);
+    /// ```
+    pub fn encode_batch(&self, texts: &[&str], add_special_tokens: bool) -> Vec<Encoding> {
+        let mut encodings: Vec<Encoding> = if use_workers(texts) {
+            self.steal_batches(texts, |chunk, cache| {
+                chunk
+                    .iter()
+                    .map(|t| self.encode_inner(t, add_special_tokens, Some(cache)))
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .flatten()
+            .collect()
         } else {
-            vocab.tokens.push(None);
-        }
-    }
-    Ok(vocab)
-}
-
-fn check_slice(arena_len: usize, slice: Slice) -> Result<(), String> {
-    if slice.at == u32::MAX {
-        return Ok(());
-    }
-    let end = (slice.at as usize).saturating_add(slice.len as usize);
-    if end > arena_len {
-        return Err("decode slice runs past the arena".to_string());
-    }
-    Ok(())
-}
-
-fn added_of(
-    value: Option<&Value>,
-) -> Result<(Needles, Needles, Vec<(String, u32)>, Vec<(String, u32)>), String> {
-    let Some(value) = value else {
-        return Ok((Needles::Empty, Needles::Empty, Vec::new(), Vec::new()));
-    };
-    if value.is_null() {
-        return Ok((Needles::Empty, Needles::Empty, Vec::new(), Vec::new()));
-    }
-    let list = value.as_array().ok_or("added_tokens is not a list")?;
-    let mut raw = Vec::new();
-    let mut norm = Vec::new();
-    for token in list {
-        let obj = token.as_object().ok_or("added token is not an object")?;
-        let content = obj
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or("added token has no content")?
-            .to_string();
-        if content.is_empty() {
-            continue;
-        }
-        let id = obj
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or("added token has no id")?;
-        let id = u32::try_from(id).map_err(|_| format!("added token id {id} does not fit u32"))?;
-        let normalized = obj.get("normalized").and_then(|v| v.as_bool()).unwrap_or(false);
-        if normalized {
-            norm.push((content, id));
-        } else {
-            raw.push((content, id));
-        }
-    }
-    let raw_rows = raw.clone();
-    let norm_rows = norm.clone();
-    Ok((needles_of(raw)?, needles_of(norm)?, raw_rows, norm_rows))
-}
-
-fn needles_of(tokens: Vec<(String, u32)>) -> Result<Needles, String> {
-    if tokens.is_empty() {
-        return Ok(Needles::Empty);
-    }
-    if tokens.len() == 1 {
-        let (content, id) = tokens.into_iter().next().unwrap();
-        let finder = if content.bytes().all(|byte| byte < 128) {
-            Some(memchr::memmem::Finder::new(content.as_bytes()).into_owned())
-        } else {
-            None
+            texts.iter().map(|t| self.encode(t, add_special_tokens)).collect()
         };
-        return Ok(Needles::Single(Added { content, id, finder }));
-    }
-    let mut ids = Vec::with_capacity(tokens.len());
-    let mut patterns = Vec::with_capacity(tokens.len());
-    for (content, id) in tokens {
-        patterns.push(content);
-        ids.push(id);
-    }
-    let ac = aho_corasick::AhoCorasick::builder()
-        .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-        .build(&patterns)
-        .map_err(|err| format!("added tokens: {err}"))?;
-    let (required, use_required) = shared_byte(&patterns);
-    Ok(Needles::Multi {
-        ac,
-        ids,
-        required,
-        use_required,
-    })
-}
 
-/// A byte shared by every pattern, if there is one.
-fn shared_byte(patterns: &[String]) -> (u8, bool) {
-    let Some(first) = patterns.first() else {
-        return (0, false);
-    };
-    for &byte in first.as_bytes() {
-        if patterns.iter().all(|pattern| pattern.as_bytes().contains(&byte)) {
-            return (byte, true);
+        if let Some(ref pad) = self.padding {
+            pad_batch(&mut encodings, pad);
         }
-    }
-    (0, false)
-}
 
-fn kind_of(model: &serde_json::Map<String, Value>) -> Result<Kind, String> {
-    let byte_fallback = model.get("byte_fallback").and_then(|v| v.as_bool()) == Some(true);
-    let merges = model.get("merges").and_then(|v| v.as_array());
-    if let Some(merges) = merges.filter(|list| !list.is_empty()) {
-        let vocab_obj = model
-            .get("vocab")
-            .and_then(|v| v.as_object())
-            .ok_or("model has no vocab")?;
-        if byte_fallback {
-            return spm_of(model, vocab_obj, merges);
+        encodings
+    }
+
+    /// Encode multiple texts in parallel into one contiguous id buffer.
+    ///
+    /// Returns `(ids, lens)`: every document's token ids concatenated in
+    /// order, and per-document id counts. This is the zero-materialization
+    /// bulk contract — no per-document `Encoding` objects or vectors reach
+    /// the caller, so bindings can hand the buffers over as flat arrays.
+    /// Truncation and special tokens apply as in [`Self::encode_ids`];
+    /// padding does not (bulk consumers reconstruct boundaries from
+    /// `lens`).
+    pub fn encode_batch_flat(
+        &self,
+        texts: &[&str],
+        add_special_tokens: bool,
+    ) -> (Vec<TokenId>, Vec<u64>) {
+        self.encode_docs_flat(texts, add_special_tokens)
+    }
+
+    /// Encode corpus files in bulk into one contiguous id buffer.
+    ///
+    /// Reads each file's bytes in Rust, splits every file on the
+    /// `separator` byte sequence (documents never span files; an empty
+    /// separator treats each file as a single document), drops empty
+    /// documents — matching the usual Python
+    /// `[d for d in text.split(sep) if d]` pre-split — and encodes all
+    /// documents with the parallel bulk pipeline. No text ever crosses a
+    /// binding boundary, so this is the fastest way to tokenize corpora
+    /// from disk.
+    ///
+    /// Each document is UTF-8-validated once; documents containing invalid
+    /// UTF-8 fall back to lossy conversion (invalid sequences become
+    /// U+FFFD) instead of failing, so arbitrary bytes are safe. Valid
+    /// documents are borrowed straight from the read buffer — no copies.
+    ///
+    /// Returns `(ids, offsets)`: every document's token ids concatenated
+    /// in order, plus document boundaries with `offsets.len() == ndocs + 1`
+    /// — document `i` is `ids[offsets[i] as usize..offsets[i + 1] as usize]`.
+    /// Truncation and special tokens apply as in [`Self::encode_batch_flat`];
+    /// padding does not.
+    pub fn encode_files_flat<P: AsRef<Path>>(
+        &self,
+        paths: &[P],
+        separator: &[u8],
+        add_special_tokens: bool,
+    ) -> std::io::Result<(Vec<TokenId>, Vec<u64>)> {
+        let profile = std::env::var_os("TOKIE_PROFILE_FILES").is_some();
+        let t0 = std::time::Instant::now();
+        let buffers: Vec<FileBytes> = paths
+            .iter()
+            .map(|p| read_file_bytes(p.as_ref()))
+            .collect::<std::io::Result<_>>()?;
+        if profile {
+            eprintln!("[files] read : {:6.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
-        return bpe_of(vocab_obj, merges);
-    }
-    if byte_fallback {
-        return Err("byte_fallback without merges is not loaded yet".to_string());
-    }
-    if let Some(list) = model.get("vocab").and_then(|v| v.as_array()) {
-        return unigram_of(model, list);
-    }
-    let vocab_obj = model
-        .get("vocab")
-        .and_then(|v| v.as_object())
-        .ok_or("model has no vocab")?;
-    wordpiece_of(model, vocab_obj)
-}
-
-fn unigram_of(model: &serde_json::Map<String, Value>, list: &[Value]) -> Result<Kind, String> {
-    let mut pieces = Vec::with_capacity(list.len());
-    for item in list {
-        let pair = item.as_array().ok_or("unigram vocab entry is not a pair")?;
-        let token = pair
-            .first()
-            .and_then(|v| v.as_str())
-            .ok_or("unigram piece is not a string")?;
-        let score = pair
-            .get(1)
-            .and_then(|v| v.as_f64())
-            .ok_or("unigram piece has no score")?;
-        pieces.push((token.to_string(), score));
-    }
-    let unk = model
-        .get("unk_id")
-        .and_then(|v| v.as_u64())
-        .ok_or("unigram has no unk_id")?;
-    let unk = u32::try_from(unk).map_err(|_| format!("unk_id {unk} does not fit u32"))?;
-    if pieces.is_empty() || unk as usize >= pieces.len() {
-        return Err("unk_id is outside the unigram vocab".to_string());
-    }
-    Ok(Kind::Unigram {
-        lattice: Lattice::build(pieces, unk),
-    })
-}
-
-fn bpe_of(
-    vocab_obj: &serde_json::Map<String, Value>,
-    merges: &[Value],
-) -> Result<Kind, String> {
-    let mut vocab: FxHashMap<&str, u32> = FxHashMap::with_capacity_and_hasher(vocab_obj.len(), Default::default());
-    let mut singles: FxHashMap<char, u32> = FxHashMap::default();
-    for (token, id) in vocab_obj {
-        let id = id_of(id)?;
-        vocab.insert(token.as_str(), id);
-        let mut chars = token.chars();
-        if let (Some(ch), None) = (chars.next(), chars.next()) {
-            singles.insert(ch, id);
+        let t0 = std::time::Instant::now();
+        let docs = split_file_docs(&buffers, separator);
+        if profile {
+            eprintln!("[files] split: {:6.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
-    }
-    let mut byte_ids = [u32::MAX; 256];
-    for (byte, ch) in bytes_to_unicode().into_iter().enumerate() {
-        if let Some(id) = singles.get(&ch) {
-            byte_ids[byte] = *id;
+        let t0 = std::time::Instant::now();
+        let (ids, lens) = self.encode_docs_flat(&docs, add_special_tokens);
+        if profile {
+            eprintln!("[files] encode: {:6.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
-    }
-    let mut pairs = FxHashMap::with_capacity_and_hasher(merges.len(), Default::default());
-    for (rank, merge) in merges.iter().enumerate() {
-        let (left, right) = merge_sides(merge)?;
-        let left_id = *vocab.get(left).ok_or_else(|| format!("merge left {left:?} is not in the vocab"))?;
-        let right_id = *vocab.get(right).ok_or_else(|| format!("merge right {right:?} is not in the vocab"))?;
-        let mut joined = String::with_capacity(left.len() + right.len());
-        joined.push_str(left);
-        joined.push_str(right);
-        let id = *vocab.get(joined.as_str()).ok_or_else(|| format!("merge result {joined:?} is not in the vocab"))?;
-        pairs.insert(
-            (left_id, right_id),
-            Pair {
-                rank: u32::try_from(rank).map_err(|_| "too many merges".to_string())?,
-                id,
-            },
-        );
-    }
-    Ok(Kind::Bpe { byte_ids, pairs })
-}
-
-fn spm_of(
-    model: &serde_json::Map<String, Value>,
-    vocab_obj: &serde_json::Map<String, Value>,
-    merges: &[Value],
-) -> Result<Kind, String> {
-    let prefix = model
-        .get("continuing_subword_prefix")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let suffix = model
-        .get("end_of_word_suffix")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !prefix.is_empty() || !suffix.is_empty() {
-        return Err("affixed byte_fallback bpe is not loaded yet".to_string());
-    }
-    let mut vocab: FxHashMap<&str, u32> =
-        FxHashMap::with_capacity_and_hasher(vocab_obj.len(), Default::default());
-    let mut chars: FxHashMap<char, u32> = FxHashMap::default();
-    let mut bytes = [u32::MAX; 256];
-    for (token, id) in vocab_obj {
-        let id = id_of(id)?;
-        vocab.insert(token.as_str(), id);
-        let mut iter = token.chars();
-        if let (Some(ch), None) = (iter.next(), iter.next()) {
-            chars.entry(ch).or_insert(id);
+        // Unmapping/freeing the corpus buffers is off the hot path too.
+        drop(docs);
+        std::thread::spawn(move || drop(buffers));
+        let mut offsets = Vec::with_capacity(lens.len() + 1);
+        let mut acc = 0u64;
+        offsets.push(0);
+        for l in lens {
+            acc += l;
+            offsets.push(acc);
         }
-        if let Some(hex) = token.strip_prefix("<0x").and_then(|rest| rest.strip_suffix('>'))
-            && hex.len() == 2
-            && let Ok(byte) = u8::from_str_radix(hex, 16)
-        {
-            bytes[byte as usize] = id;
+        Ok((ids, offsets))
+    }
+
+    /// Bulk-encode documents (text or bytes) into one contiguous id buffer.
+    ///
+    /// Worker chunks turn each document into text (bytes are validated in
+    /// parallel; a serial prepass over a 191MB corpus costs ~60ms) and
+    /// append ids straight into one buffer per chunk. Chunk buffers are
+    /// then copied into the final flat buffer, in parallel for large
+    /// corpora.
+    fn encode_docs_flat<T: ByteLen + ?Sized + Sync>(
+        &self,
+        docs: &[&T],
+        add_special_tokens: bool,
+    ) -> (Vec<TokenId>, Vec<u64>) {
+        if docs.is_empty() {
+            return (Vec::new(), Vec::new());
         }
-    }
-    if bytes.contains(&u32::MAX) {
-        return Err("byte_fallback vocab is missing a <0xHH> token".to_string());
-    }
-    let mut pairs = FxHashMap::with_capacity_and_hasher(merges.len(), Default::default());
-    for (rank, merge) in merges.iter().enumerate() {
-        let (left, right) = merge_sides(merge)?;
-        let left_id = *vocab
-            .get(left)
-            .ok_or_else(|| format!("merge left {left:?} is not in the vocab"))?;
-        let right_id = *vocab
-            .get(right)
-            .ok_or_else(|| format!("merge right {right:?} is not in the vocab"))?;
-        let mut joined = String::with_capacity(left.len() + right.len());
-        joined.push_str(left);
-        joined.push_str(right);
-        let id = *vocab
-            .get(joined.as_str())
-            .ok_or_else(|| format!("merge result {joined:?} is not in the vocab"))?;
-        pairs.insert(
-            (left_id, right_id),
-            Pair {
-                rank: u32::try_from(rank).map_err(|_| "too many merges".to_string())?,
-                id,
-            },
-        );
-    }
-    Ok(Kind::Spm { chars, bytes, pairs })
-}
-
-/// GPT-2 bytes-to-unicode. Printable ASCII and the latin-1 run stay themselves.
-/// Every other byte is assigned the next scalar from U+0100.
-fn bytes_to_unicode() -> [char; 256] {
-    let mut seen = [false; 256];
-    let mut bs = Vec::with_capacity(256);
-    for byte in b'!'..=b'~' {
-        bs.push(byte);
-    }
-    for byte in 0xA1..=0xAC {
-        bs.push(byte);
-    }
-    for byte in 0xAE..=0xFF {
-        bs.push(byte);
-    }
-    for &byte in &bs {
-        seen[byte as usize] = true;
-    }
-    let mut cs: Vec<u32> = bs.iter().map(|&byte| u32::from(byte)).collect();
-    let mut next = 0u32;
-    for byte in 0..256 {
-        if !seen[byte] {
-            bs.push(byte as u8);
-            cs.push(256 + next);
-            next += 1;
-        }
-    }
-    let mut out = ['\0'; 256];
-    for (byte, scalar) in bs.into_iter().zip(cs) {
-        out[byte as usize] = char::from_u32(scalar).expect("byte-level scalar");
-    }
-    out
-}
-
-fn wordpiece_of(
-    model: &serde_json::Map<String, Value>,
-    vocab_obj: &serde_json::Map<String, Value>,
-) -> Result<Kind, String> {
-    let mut vocab = FxHashMap::with_capacity_and_hasher(vocab_obj.len(), Default::default());
-    for (token, id) in vocab_obj {
-        vocab.insert(token.clone(), id_of(id)?);
-    }
-    let unk_token = model
-        .get("unk_token")
-        .and_then(|v| v.as_str())
-        .ok_or("wordpiece has no unk_token")?;
-    let unk = *vocab.get(unk_token).ok_or_else(|| format!("unk {unk_token} is not in the vocab"))?;
-    let prefix = model
-        .get("continuing_subword_prefix")
-        .and_then(|v| v.as_str())
-        .unwrap_or("##")
-        .to_string();
-    let max_chars = model
-        .get("max_input_chars_per_word")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(100) as usize;
-    Ok(Kind::WordPiece {
-        vocab,
-        unk,
-        prefix,
-        max_chars,
-    })
-}
-
-fn id_of(value: &Value) -> Result<u32, String> {
-    let id = value.as_u64().ok_or_else(|| format!("vocab id is not an integer: {value}"))?;
-    u32::try_from(id).map_err(|_| format!("vocab id {id} does not fit u32"))
-}
-
-fn merge_sides(value: &Value) -> Result<(&str, &str), String> {
-    match value {
-        Value::String(text) => text
-            .split_once(' ')
-            .ok_or_else(|| format!("merge {text:?} has no space")),
-        Value::Array(sides) if sides.len() == 2 => {
-            let left = sides[0].as_str().ok_or("merge left is not a string")?;
-            let right = sides[1].as_str().ok_or("merge right is not a string")?;
-            Ok((left, right))
-        }
-        _ => Err(format!("merge is not a pair: {value}")),
-    }
-}
-
-/// Whitespace pieces with `▁` in front of each one, separated by a space
-/// the T5 cut drops.
-fn mark_words(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + text.len() / 8 + 3);
-    let mut gap = false;
-    let mut in_word = false;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            if in_word {
-                gap = true;
-                in_word = false;
+        let total_bytes: usize = docs.iter().map(|d| d.byte_len()).sum();
+        let cpus = num_cpus();
+        if !use_workers(docs) {
+            // Each document on its own (pooled) lease, so a large one keeps
+            // its parallel path with the whole pool to itself.
+            let mut ids = Vec::with_capacity(total_bytes / 3);
+            let mut lens = Vec::with_capacity(docs.len());
+            for d in docs {
+                let v = self.encode_ids(&d.text(), add_special_tokens);
+                lens.push(v.len() as u64);
+                ids.extend_from_slice(&v);
             }
-            continue;
+            return (ids, lens);
         }
-        if !in_word {
-            if gap {
-                out.push(' ');
-            }
-            out.push('▁');
-            in_word = true;
-        }
-        out.push(ch);
-    }
-    out
-}
 
-fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
-    fn val(byte: u8) -> Result<u8, String> {
-        match byte {
-            b'A'..=b'Z' => Ok(byte - b'A'),
-            b'a'..=b'z' => Ok(byte - b'a' + 26),
-            b'0'..=b'9' => Ok(byte - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err("precompiled charsmap is not base64".to_string()),
-        }
-    }
-    let bytes: Vec<u8> = text.bytes().filter(|byte| !byte.is_ascii_whitespace()).collect();
-    if bytes.len() % 4 != 0 {
-        return Err("precompiled charsmap is not base64".to_string());
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks_exact(4) {
-        let pad = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
-        if pad > 2 {
-            return Err("precompiled charsmap is not base64".to_string());
-        }
-        let mut n = [0u8; 4];
-        for (i, &byte) in chunk.iter().enumerate() {
-            n[i] = if byte == b'=' { 0 } else { val(byte)? };
-        }
-        out.push((n[0] << 2) | (n[1] >> 4));
-        if pad < 2 {
-            out.push((n[1] << 4) | (n[2] >> 2));
-        }
-        if pad < 1 {
-            out.push((n[2] << 6) | n[3]);
-        }
-    }
-    Ok(out)
-}
+        let profile = std::env::var_os("TOKIE_PROFILE_FILES").is_some();
+        let t_workers = std::time::Instant::now();
 
-fn default_threads() -> usize {
-    thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-}
-
-fn chunk_ranges(len: usize, n: usize) -> Vec<(usize, usize)> {
-    let n = n.max(1).min(len);
-    let base = len / n;
-    let extra = len % n;
-    let mut ranges = Vec::with_capacity(n);
-    let mut start = 0;
-    for i in 0..n {
-        let size = base + usize::from(i < extra);
-        ranges.push((start, start + size));
-        start += size;
-    }
-    ranges
-}
-
-fn serve(mut tokenizer: Tokenizer, rx: mpsc::Receiver<Job>) {
-    while let Ok(job) = rx.recv() {
-        match job {
-            Job::Stop => break,
-            Job::Batch(texts, tx) => {
-                let mut ids = Vec::new();
-                let mut ends = Vec::new();
-                let mut error = None;
-                for text in &texts {
-                    if let Err(err) = tokenizer.encode(text, &mut ids) {
-                        error = Some(err.to_string());
-                        break;
-                    }
-                    ends.push(ids.len());
+        // A large corpus allocates and prefaults the final id buffer
+        // concurrently with the encode workers: zeroing ~180MB of fresh
+        // pages on first touch costs ~8ms serial, which would otherwise land
+        // in the concat phase. bytes/3 over-estimates every BPE corpus we
+        // ship (OWT/gpt2 is ~bytes/4.4); the rare under-estimate falls back
+        // to a plain allocation below. Small batches skip the helper threads,
+        // whose spawns cost more than they save.
+        let est = total_bytes / 3;
+        let large = est >= LARGE_FLAT_IDS;
+        let prealloc = large.then(|| {
+            std::thread::spawn(move || {
+                let mut v: Vec<TokenId> = Vec::with_capacity(est);
+                let spare = v.spare_capacity_mut();
+                let mut i = 0;
+                while i < spare.len() {
+                    spare[i] = std::mem::MaybeUninit::new(0);
+                    i += 1024;
                 }
-                let _ = tx.send(Chunk { ids, ends, error });
+                v
+            })
+        });
+
+        let results: Vec<(Vec<TokenId>, Vec<u64>)> = self.steal_batches(docs, |chunk, cache| {
+            let chunk_bytes: usize = chunk.iter().map(|d| d.byte_len()).sum();
+            let mut ids: Vec<TokenId> = Vec::with_capacity(chunk_bytes / 3);
+            let mut lens: Vec<u64> = Vec::with_capacity(chunk.len());
+            self.encode_docs_into(chunk, add_special_tokens, cache, &mut ids, &mut lens);
+            (ids, lens)
+        });
+
+        if profile {
+            eprintln!("[files] workers: {:6.1} ms", t_workers.elapsed().as_secs_f64() * 1e3);
+        }
+        let t_concat = std::time::Instant::now();
+        let total_ids: usize = results.iter().map(|(i, _)| i.len()).sum();
+        let mut lens = Vec::with_capacity(docs.len());
+        for (_, l) in &results {
+            lens.extend_from_slice(l);
+        }
+        if !large {
+            let mut ids = Vec::with_capacity(total_ids);
+            for (chunk_ids, _) in &results {
+                ids.extend_from_slice(chunk_ids);
             }
+            return (ids, lens);
         }
-    }
-}
 
-enum Form {
-    Bytes,
-    Pieces { prefix: String, cleanup: bool },
-    Metaspace,
-    Spm { strip_space: bool },
-}
-
-fn vocab_of(
-    model: &serde_json::Map<String, Value>,
-    added: Option<&Value>,
-    decoder: Option<&Value>,
-    kind: &Kind,
-) -> Result<Vocab, String> {
-    let form = form_of(decoder, kind);
-    let entries = vocab_entries(model)?;
-    let added = added_entries(added)?;
-    let mut max = 0u32;
-    for (_, id) in &entries {
-        max = max.max(*id);
-    }
-    for (_, id, _) in &added {
-        max = max.max(*id);
-    }
-    let n = max as usize + 1;
-    let missing = Slice { at: u32::MAX, len: 0 };
-    let mut vocab = Vocab {
-        arena: Vec::new(),
-        lead: vec![missing; n],
-        next: vec![missing; n],
-        tokens: vec![None; n],
-        ids: FxHashMap::with_capacity_and_hasher(n, Default::default()),
-        special: vec![false; n],
-        strip_space: matches!(form, Form::Spm { strip_space: true }),
-    };
-    let map = unicode_to_byte();
-    for (token, id) in entries {
-        vocab.place(id, &token, &form, &map, false);
-    }
-    for (token, id, special) in added {
-        vocab.place(id, &token, &form, &map, special);
-    }
-    Ok(vocab)
-}
-
-impl Vocab {
-    fn place(&mut self, id: u32, token: &str, form: &Form, map: &FxHashMap<char, u8>, special: bool) {
-        let index = id as usize;
-        let (lead_bytes, next_bytes) = piece_forms(token, form, map);
-        let lead = self.store(&lead_bytes);
-        self.lead[index] = lead;
-        self.next[index] = if next_bytes == lead_bytes {
-            lead
-        } else {
-            self.store(&next_bytes)
+        // Concatenate chunk id buffers in parallel: a serial memcpy of a
+        // large corpus' ids (~180MB for 191MB of OWT) costs ~15-20ms.
+        let mut ids: Vec<TokenId> = match prealloc.map(|h| h.join()) {
+            Some(Ok(v)) if v.capacity() >= total_ids => v,
+            _ => Vec::with_capacity(total_ids),
         };
-        self.ids.insert(token.to_string(), id);
-        self.tokens[index] = Some(token.to_string());
-        if special {
-            self.special[index] = true;
+        {
+            let mut spare = &mut ids.spare_capacity_mut()[..total_ids];
+            let mut jobs: Vec<(&mut [std::mem::MaybeUninit<TokenId>], &[TokenId])> =
+                Vec::with_capacity(results.len());
+            for (chunk_ids, _) in &results {
+                let (dst, rest) = spare.split_at_mut(chunk_ids.len());
+                spare = rest;
+                jobs.push((dst, chunk_ids));
+            }
+            let workers = cpus.min(jobs.len()).max(1);
+            let mut per_worker: Vec<Vec<(&mut [std::mem::MaybeUninit<TokenId>], &[TokenId])>> =
+                (0..workers).map(|_| Vec::new()).collect();
+            // Chunks are byte-balanced, so round-robin keeps copies even.
+            for (i, job) in jobs.into_iter().enumerate() {
+                per_worker[i % workers].push(job);
+            }
+            pool().install(|| {
+                per_worker.into_par_iter().with_max_len(1).for_each(|work| {
+                    for (dst, src) in work {
+                        // SAFETY: dst and src have equal length; the
+                        // uninitialized destination is only written.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<TokenId>(), src.len());
+                        }
+                    }
+                })
+            });
         }
+        // SAFETY: the jobs above covered ..total_ids exactly.
+        unsafe { ids.set_len(total_ids) };
+        // Freeing ~180MB of chunk buffers costs several ms; hand them to a
+        // detached thread so the caller gets its result first.
+        std::thread::spawn(move || drop(results));
+        if profile {
+            eprintln!("[files] concat : {:6.1} ms", t_concat.elapsed().as_secs_f64() * 1e3);
+        }
+        (ids, lens)
     }
 
-    fn store(&mut self, bytes: &[u8]) -> Slice {
-        let at = u32::try_from(self.arena.len()).expect("decode arena is longer than 4 GiB");
-        let len = u32::try_from(bytes.len()).expect("one token is longer than 4 GiB");
-        self.arena.extend_from_slice(bytes);
-        Slice { at, len }
-    }
-}
-
-fn piece_forms(token: &str, form: &Form, map: &FxHashMap<char, u8>) -> (Vec<u8>, Vec<u8>) {
-    match form {
-        Form::Bytes => {
-            let bytes = byte_level_bytes(token, map);
-            (bytes.clone(), bytes)
-        }
-        Form::Pieces { prefix, cleanup } => {
-            let lead = if *cleanup { wordpiece_cleanup(token) } else { token.to_string() };
-            let mut next = if let Some(rest) = token.strip_prefix(prefix.as_str()) {
-                rest.to_string()
+    /// Encode `docs` with `cache`, appending their ids to `ids` and their id
+    /// counts to `lens`. On the fused path (pretokenizer model, no added
+    /// tokens, no truncation, no special tokens) no per-document vector is
+    /// allocated.
+    fn encode_docs_into<T: ByteLen + ?Sized>(
+        &self,
+        docs: &[&T],
+        add_special_tokens: bool,
+        cache: &mut WorkerCaches,
+        ids: &mut Vec<TokenId>,
+        lens: &mut Vec<u64>,
+    ) {
+        // Mirrors the exact conditions under which `encode_ids_ctx` with a
+        // caller-supplied cache reduces to normalize + `encode_sequential`
+        // (see `encode_raw_dispatch` / `encode_raw_inner`).
+        let fused = self.pretokenizer.is_some()
+            && self.raw_added_matcher.is_none()
+            && self.norm_added_matcher.is_none()
+            && self.truncation.is_none()
+            && !add_special_tokens;
+        for d in docs {
+            let text = d.text();
+            let before = ids.len();
+            if fused {
+                let normalized = self.normalizer.normalize(&text);
+                self.encode_sequential_into(normalized.as_ref(), Some(&mut *cache), ids);
             } else {
-                format!(" {token}")
-            };
-            if *cleanup {
-                next = wordpiece_cleanup(&next);
+                ids.extend_from_slice(&self.encode_ids_ctx(&text, add_special_tokens, Some(&mut *cache)));
             }
-            (lead.into_bytes(), next.into_bytes())
-        }
-        Form::Metaspace => {
-            let lead: String = token.chars().filter(|ch| *ch != '▁').collect();
-            let next = token.replace('▁', " ");
-            (lead.into_bytes(), next.into_bytes())
-        }
-        Form::Spm { .. } => {
-            let bytes = spm_bytes(token);
-            (bytes.clone(), bytes)
+            lens.push((ids.len() - before) as u64);
         }
     }
-}
 
-fn byte_level_bytes(token: &str, map: &FxHashMap<char, u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(token.len());
-    for ch in token.chars() {
-        let Some(&byte) = map.get(&ch) else {
-            return token.as_bytes().to_vec();
-        };
-        out.push(byte);
+    /// Count tokens across corpus files without materializing ids.
+    ///
+    /// Same file reading, separator splitting, empty-document filtering,
+    /// and lossy UTF-8 handling as [`Self::encode_files_flat`]; returns the
+    /// total token count over all documents (no special tokens, as in
+    /// [`Self::count_tokens`]).
+    pub fn count_tokens_files<P: AsRef<Path>>(
+        &self,
+        paths: &[P],
+        separator: &[u8],
+    ) -> std::io::Result<usize> {
+        let buffers: Vec<FileBytes> = paths
+            .iter()
+            .map(|p| read_file_bytes(p.as_ref()))
+            .collect::<std::io::Result<_>>()?;
+        let docs = split_file_docs(&buffers, separator);
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        let counts = self.steal_batches(&docs, |chunk, cache| {
+            let mut n = 0usize;
+            for d in chunk {
+                n += self.encode_raw_ctx(&d.text(), Some(cache)).len();
+            }
+            n
+        });
+        Ok(counts.iter().sum())
     }
-    out
-}
 
-fn spm_bytes(token: &str) -> Vec<u8> {
-    if token.len() == 6
-        && let Some(hex) = token.strip_prefix("<0x").and_then(|rest| rest.strip_suffix('>'))
-        && let Ok(byte) = u8::from_str_radix(hex, 16)
-    {
-        return vec![byte];
+    /// Count tokens for multiple texts in parallel.
+    pub fn count_tokens_batch(&self, texts: &[&str]) -> Vec<usize> {
+        if !use_workers(texts) {
+            return texts.iter().map(|t| self.count_tokens(t)).collect();
+        }
+
+        self.steal_batches(texts, |chunk, cache| {
+            chunk
+                .iter()
+                .map(|t| self.encode_raw_ctx(t, Some(cache)).len())
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     }
-    token.replace('▁', " ").into_bytes()
-}
 
-fn wordpiece_cleanup(token: &str) -> String {
-    token
-        .replace(" .", ".")
-        .replace(" ?", "?")
-        .replace(" !", "!")
-        .replace(" ,", ",")
-        .replace(" ' ", "'")
-        .replace(" n't", "n't")
-        .replace(" 'm", "'m")
-        .replace(" do not", " don't")
-        .replace(" 's", "'s")
-        .replace(" 've", "'ve")
-        .replace(" 're", "'re")
-}
-
-fn unicode_to_byte() -> FxHashMap<char, u8> {
-    let mut map = FxHashMap::default();
-    for (byte, ch) in bytes_to_unicode().into_iter().enumerate() {
-        map.insert(ch, byte as u8);
+    /// Count tokens without storing them (no special tokens).
+    pub fn count_tokens(&self, text: &str) -> usize {
+        self.encode_raw(text).len()
     }
-    map
-}
 
-fn form_of(decoder: Option<&Value>, kind: &Kind) -> Form {
-    if let Some(form) = decoder.and_then(read_form) {
-        return form;
-    }
-    match kind {
-        Kind::Bpe { .. } => Form::Bytes,
-        Kind::WordPiece { prefix, .. } => Form::Pieces {
-            prefix: prefix.clone(),
-            cleanup: true,
-        },
-        Kind::Unigram { .. } => Form::Metaspace,
-        Kind::Spm { .. } => Form::Spm { strip_space: true },
-    }
-}
-
-fn read_form(value: &Value) -> Option<Form> {
-    let obj = value.as_object()?;
-    match obj.get("type").and_then(|v| v.as_str())? {
-        "ByteLevel" => Some(Form::Bytes),
-        "WordPiece" => Some(Form::Pieces {
-            prefix: obj.get("prefix").and_then(|v| v.as_str()).unwrap_or("##").to_string(),
-            cleanup: obj.get("cleanup").and_then(|v| v.as_bool()).unwrap_or(true),
-        }),
-        "Metaspace" => Some(Form::Metaspace),
-        "Sequence" => sequence_form(obj.get("decoders")?.as_array()?),
-        _ => None,
-    }
-}
-
-fn sequence_form(list: &[Value]) -> Option<Form> {
-    for item in list {
-        if item.get("type").and_then(|v| v.as_str()) == Some("ByteLevel") {
-            return Some(Form::Bytes);
+    /// Lazy token count with early termination for comparisons.
+    ///
+    /// # Example
+    /// ```ignore
+    /// if tokenizer.token_count(text) > 8192 {
+    ///     println!("text exceeds context window");
+    /// }
+    /// ```
+    pub fn token_count<'a>(&'a self, text: &'a str) -> TokenCount<'a> {
+        TokenCount {
+            iter: RefCell::new(Some(self.encoder.encode_iter(text.as_bytes()))),
         }
     }
-    for item in list {
-        if item.get("type").and_then(|v| v.as_str()) == Some("WordPiece") {
-            return read_form(item);
+}
+
+/// Lazy token count that supports comparison with `usize`.
+/// Each `TokenCount` can only be compared once (the iterator is consumed).
+pub struct TokenCount<'a> {
+    iter: RefCell<Option<EncoderIter<'a>>>,
+}
+
+impl PartialEq<usize> for TokenCount<'_> {
+    fn eq(&self, other: &usize) -> bool {
+        self.partial_cmp(other) == Some(Ordering::Equal)
+    }
+}
+
+impl PartialOrd<usize> for TokenCount<'_> {
+    fn partial_cmp(&self, limit: &usize) -> Option<Ordering> {
+        let iter = self.iter.borrow_mut().take()?;
+        let count = iter.take(*limit + 1).count();
+        Some(count.cmp(limit))
+    }
+}
+
+/// Iterator over tokens from the high-level Tokenizer.
+pub struct TokenizeIter<'a> {
+    tokenizer: &'a Tokenizer,
+    pretokens: Option<Box<dyn Iterator<Item = &'a str> + 'a>>,
+    current_encoder_iter: Option<EncoderIter<'a>>,
+    bytes_iter: Option<EncoderIter<'a>>,
+}
+
+impl<'a> TokenizeIter<'a> {
+    fn new(tokenizer: &'a Tokenizer, text: &'a str) -> Self {
+        if tokenizer.pretokenizer.is_some() {
+            let pretokens = tokenizer.pretokenizer.as_ref().unwrap().split(text);
+            Self {
+                tokenizer,
+                pretokens: Some(Box::new(pretokens)),
+                current_encoder_iter: None,
+                bytes_iter: None,
+            }
+        } else {
+            Self {
+                tokenizer,
+                pretokens: None,
+                current_encoder_iter: None,
+                bytes_iter: Some(tokenizer.encoder.encode_iter(text.as_bytes())),
+            }
         }
     }
-    for item in list {
-        if item.get("type").and_then(|v| v.as_str()) == Some("Metaspace") {
-            return Some(Form::Metaspace);
+}
+
+impl<'a> Iterator for TokenizeIter<'a> {
+    type Item = TokenId;
+
+    fn next(&mut self) -> Option<TokenId> {
+        if let Some(ref mut iter) = self.bytes_iter {
+            return iter.next();
+        }
+
+        loop {
+            if let Some(ref mut encoder_iter) = self.current_encoder_iter {
+                if let Some(token) = encoder_iter.next() {
+                    return Some(token);
+                }
+            }
+
+            if let Some(ref mut pretokens) = self.pretokens {
+                if let Some(piece) = pretokens.next() {
+                    self.current_encoder_iter =
+                        Some(self.tokenizer.encoder.encode_iter(piece.as_bytes()));
+                    continue;
+                }
+            }
+
+            return None;
         }
     }
-    let marks = list.iter().any(replaces_metaspace);
-    let bytes = list.iter().any(|item| item.get("type").and_then(|v| v.as_str()) == Some("ByteFallback"));
-    let strip = list.iter().any(|item| item.get("type").and_then(|v| v.as_str()) == Some("Strip"));
-    if marks || bytes {
-        Some(Form::Spm { strip_space: strip })
-    } else {
-        None
-    }
 }
 
-fn replaces_metaspace(value: &Value) -> bool {
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-    if obj.get("type").and_then(|v| v.as_str()) != Some("Replace") {
-        return false;
-    }
-    let pattern = obj.get("pattern").map(pattern_text).unwrap_or_default();
-    pattern.contains('▁')
-}
+impl std::iter::FusedIterator for TokenizeIter<'_> {}
 
-fn pattern_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Object(map) => map
-            .get("String")
-            .or_else(|| map.get("Regex"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        _ => String::new(),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoder::BacktrackingBytePairEncoder;
+    use crate::padding::{PaddingStrategy, PaddingDirection};
 
-fn vocab_entries(model: &serde_json::Map<String, Value>) -> Result<Vec<(String, u32)>, String> {
-    if let Some(list) = model.get("vocab").and_then(|v| v.as_array()) {
-        let mut out = Vec::with_capacity(list.len());
-        for (index, item) in list.iter().enumerate() {
-            let token = item
-                .as_array()
-                .and_then(|pair| pair.first())
-                .and_then(|v| v.as_str())
-                .ok_or("unigram piece is not a string")?;
-            out.push((token.to_string(), u32::try_from(index).map_err(|_| "unigram vocab is too large".to_string())?));
+    fn make_tokenizer() -> Tokenizer {
+        let base_tokens: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
+        let merges = vec![(b'a' as u32, b'b' as u32)];
+        let (encoder, token_bytes) = BacktrackingBytePairEncoder::from_merges(&merges, &base_tokens);
+        let decoder = Decoder::new(token_bytes);
+        Tokenizer::new(Encoder::Backtracking(encoder), decoder, PretokType::None, Normalizer::None, PostProcessor::None)
+    }
+
+    fn make_pretok_tokenizer() -> Tokenizer {
+        let base_tokens: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
+        let merges = vec![(b'a' as u32, b'b' as u32)];
+        let (encoder, token_bytes) = BacktrackingBytePairEncoder::from_merges(&merges, &base_tokens);
+        let decoder = Decoder::new(token_bytes);
+        Tokenizer::new(Encoder::Backtracking(encoder), decoder, PretokType::Gpt2, Normalizer::None, PostProcessor::None)
+    }
+
+    fn make_bert_tokenizer() -> Tokenizer {
+        let base_tokens: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
+        let merges = vec![(b'a' as u32, b'b' as u32)];
+        let (encoder, token_bytes) = BacktrackingBytePairEncoder::from_merges(&merges, &base_tokens);
+        let decoder = Decoder::new(token_bytes);
+        Tokenizer::new(Encoder::Backtracking(encoder), decoder, PretokType::None, Normalizer::None, PostProcessor::bert(101, 102))
+    }
+
+    #[test]
+    fn test_no_pretokenizer() {
+        let tokenizer = make_tokenizer();
+        let enc = tokenizer.encode("abc", false);
+        assert_eq!(enc.ids.len(), 2);
+    }
+
+    #[test]
+    fn test_seed_only_long_texts_into_pooled_caches() {
+        let tokenizer = make_pretok_tokenizer();
+        let short = "ab ab abc";
+        let long = "ab abc abd ".repeat(8);
+        assert!(short.len() < BLOCK_MIN_LEN && long.len() >= BLOCK_MIN_LEN);
+
+        // A pooled cache skips the seed on a short text, then seeds on its
+        // first long one.
+        let mut pooled = WorkerCaches::new();
+        assert_eq!(tokenizer.encode_sequential(short, Some(&mut pooled)), tokenizer.encode_sequential(short, None));
+        assert!(!pooled.pretok.is_seeded());
+        assert_eq!(tokenizer.encode_sequential(&long, Some(&mut pooled)), tokenizer.encode_sequential(&long, None));
+        assert!(pooled.pretok.is_seeded());
+
+        // A private (one-call) cache is never seeded.
+        let mut private = WorkerCaches::private();
+        assert_eq!(tokenizer.encode_sequential(&long, Some(&mut private)), tokenizer.encode_sequential(&long, None));
+        assert!(!private.pretok.is_seeded());
+    }
+
+    #[test]
+    fn test_encode_returns_encoding() {
+        let tokenizer = make_tokenizer();
+        let enc = tokenizer.encode("abc", false);
+        assert_eq!(enc.ids.len(), enc.attention_mask.len());
+        assert_eq!(enc.ids.len(), enc.type_ids.len());
+        assert!(enc.attention_mask.iter().all(|&m| m == 1));
+        assert!(enc.type_ids.iter().all(|&t| t == 0));
+    }
+
+    #[test]
+    fn test_with_pretokenizer() {
+        let tokenizer = make_pretok_tokenizer();
+        let enc = tokenizer.encode("Hello world", false);
+        assert!(!enc.ids.is_empty());
+        let decoded = tokenizer.decode(&enc.ids).unwrap();
+        assert_eq!(decoded, "Hello world");
+    }
+
+    #[test]
+    fn test_count_tokens() {
+        let tokenizer = make_pretok_tokenizer();
+        let text = "Hello world";
+        let count = tokenizer.count_tokens(text);
+        let enc = tokenizer.encode(text, false);
+        assert_eq!(count, enc.ids.len());
+    }
+
+    #[test]
+    fn test_token_count_comparisons() {
+        let tokenizer = make_pretok_tokenizer();
+        let text = "Hello world test";
+        let total = tokenizer.count_tokens(text);
+        assert!(tokenizer.token_count(text) > total - 1);
+        assert!(!(tokenizer.token_count(text) > total));
+        assert!(tokenizer.token_count(text) < total + 1);
+        assert!(!(tokenizer.token_count(text) < total));
+        assert!(tokenizer.token_count(text) == total);
+    }
+
+    #[test]
+    fn test_encode_iter() {
+        let tokenizer = make_pretok_tokenizer();
+        let text = "Hello world";
+        let tokens: Vec<_> = tokenizer.encode_iter(text).collect();
+        let expected = tokenizer.encode_raw(text);
+        assert_eq!(tokens, expected);
+    }
+
+    #[test]
+    fn test_decode_bytes() {
+        let tokenizer = make_tokenizer();
+        let text = b"abc";
+        let tokens = tokenizer.encode_bytes(text);
+        let decoded = tokenizer.decode_bytes(&tokens);
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn test_encode_batch_empty() {
+        let tokenizer = make_tokenizer();
+        let result = tokenizer.encode_batch(&[], false);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_encode_batch_single() {
+        let tokenizer = make_pretok_tokenizer();
+        let single = tokenizer.encode("Hello world", false);
+        let batch = tokenizer.encode_batch(&["Hello world"], false);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0], single);
+    }
+
+    #[test]
+    fn test_encode_batch_multiple() {
+        let tokenizer = make_pretok_tokenizer();
+        let texts = vec!["Hello world", "abc def", "test"];
+        let batch = tokenizer.encode_batch(&texts, false);
+        assert_eq!(batch.len(), 3);
+        for (i, text) in texts.iter().enumerate() {
+            assert_eq!(batch[i], tokenizer.encode(text, false));
         }
-        return Ok(out);
     }
-    let vocab = model
-        .get("vocab")
-        .and_then(|v| v.as_object())
-        .ok_or("model has no vocab")?;
-    let mut out = Vec::with_capacity(vocab.len());
-    for (token, id) in vocab {
-        out.push((token.clone(), id_of(id)?));
-    }
-    Ok(out)
-}
 
-fn added_entries(value: Option<&Value>) -> Result<Vec<(String, u32, bool)>, String> {
-    let Some(value) = value.filter(|v| !v.is_null()) else {
-        return Ok(Vec::new());
-    };
-    let list = value.as_array().ok_or("added_tokens is not a list")?;
-    let mut out = Vec::new();
-    for token in list {
-        let obj = token.as_object().ok_or("added token is not an object")?;
-        let content = obj
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or("added token has no content")?;
-        if content.is_empty() {
-            continue;
+    #[test]
+    fn test_encode_batch_preserves_order() {
+        let tokenizer = make_pretok_tokenizer();
+        let texts: Vec<&str> = (0..20).map(|i| match i % 4 {
+            0 => "alpha",
+            1 => "beta gamma",
+            2 => "delta epsilon zeta",
+            _ => "x",
+        }).collect();
+        let batch = tokenizer.encode_batch(&texts, false);
+        assert_eq!(batch.len(), texts.len());
+        for (i, text) in texts.iter().enumerate() {
+            assert_eq!(batch[i], tokenizer.encode(text, false));
         }
-        let id = obj
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or("added token has no id")?;
-        let id = u32::try_from(id).map_err(|_| format!("added token id {id} does not fit u32"))?;
-        let special = obj.get("special").and_then(|v| v.as_bool()).unwrap_or(false);
-        out.push((content.to_string(), id, special));
     }
-    Ok(out)
-}
 
-const _: fn() = || {
-    fn assert_send<T: Send>() {}
-    assert_send::<Tokenizer>();
-};
+    #[test]
+    fn test_encode_batch_with_special_tokens() {
+        let tokenizer = make_pretok_tokenizer();
+        let texts = vec!["Hello", "world"];
+        let batch_with = tokenizer.encode_batch(&texts, true);
+        let batch_without = tokenizer.encode_batch(&texts, false);
+        assert_eq!(batch_with, batch_without);
+    }
+
+    #[test]
+    fn test_encode_batch_flat_matches_encode_batch() {
+        let tokenizer = make_pretok_tokenizer();
+        // Enough texts to cross the parallel threshold (texts.len() > cpus)
+        let texts: Vec<&str> = (0..64).map(|i| match i % 5 {
+            0 => "Hello world, this is a somewhat longer document to encode.",
+            1 => "abc def ghi",
+            2 => "",
+            3 => "short",
+            _ => "the quick brown fox jumps over the lazy dog 0123456789",
+        }).collect();
+        let (flat, lens) = tokenizer.encode_batch_flat(&texts, false);
+        let batch = tokenizer.encode_batch(&texts, false);
+        assert_eq!(lens.len(), texts.len());
+        assert_eq!(flat.len() as u64, lens.iter().sum::<u64>());
+        let mut off = 0usize;
+        for (i, enc) in batch.iter().enumerate() {
+            let n = lens[i] as usize;
+            assert_eq!(&flat[off..off + n], enc.ids.as_slice(), "doc {i}");
+            off += n;
+        }
+        assert_eq!(off, flat.len());
+    }
+
+    #[test]
+    fn test_encode_batch_flat_matches_encode_ids_on_every_path() {
+        // Few docs (one lease, a large doc on its own parallel path) and
+        // many docs (workers), with and without special tokens (the fused
+        // and the per-document branches).
+        let big = "The cat sat.  On   the mat
+
+".repeat(2 * Tokenizer::PARALLEL_CHUNK_THRESHOLD / 28);
+        let few: Vec<&str> = vec!["ab abc", "", &big];
+        let many: Vec<&str> = (0..100).map(|i| ["x ab", "", "abc abd ab", &big[..300]][i % 4]).collect();
+        for tokenizer in [make_pretok_tokenizer(), make_bert_tokenizer()] {
+            for texts in [&few, &many] {
+                for special in [false, true] {
+                    let (flat, lens) = tokenizer.encode_batch_flat(texts, special);
+                    let expect: Vec<Vec<TokenId>> = texts.iter().map(|t| tokenizer.encode_ids(t, special)).collect();
+                    assert_eq!(lens, expect.iter().map(|e| e.len() as u64).collect::<Vec<_>>());
+                    assert_eq!(flat, expect.concat());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_batch_flat_empty() {
+        let tokenizer = make_pretok_tokenizer();
+        let (flat, lens) = tokenizer.encode_batch_flat(&[], false);
+        assert!(flat.is_empty() && lens.is_empty());
+    }
+
+    /// Unfused per-piece reference: full-text pretokenization, each piece
+    /// encoded independently through the ground-truth `Encoder::encode`.
+    /// No caches, no chunking, no fused loop.
+    fn reference_encode(tokenizer: &Tokenizer, text: &str) -> Vec<TokenId> {
+        let pretok = tokenizer.pretokenizer().expect("pretokenizer");
+        let mut out = Vec::new();
+        for piece in pretok.split(text) {
+            out.extend(tokenizer.encoder.encode(piece.as_bytes()));
+        }
+        out
+    }
+
+    fn tricky_texts() -> Vec<String> {
+        vec![
+            String::new(),
+            " ".to_string(),
+            "Hello world".to_string(),
+            "don't we're I'll O'Toole don'ts".to_string(),
+            "a\n\nb  c   d\te".to_string(),
+            "日本語のテキスト and English, русский текст".to_string(),
+            "money $100.99, 50% off! e.g. Dr. Smith's co-op".to_string(),
+            // Pieces over the 15-byte cache key limit (long letter runs)
+            "Supercalifragilisticexpialidocious antidisestablishmentarianism".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab".to_string(),
+            "«ab» ¹²³ ½ cup \u{200B}école".to_string(),
+        ]
+    }
+
+    #[test]
+    fn test_fused_sequential_matches_reference() {
+        let tokenizer = make_pretok_tokenizer();
+        for text in tricky_texts() {
+            let expect = reference_encode(&tokenizer, &text);
+            // Twice: second pass reads pooled-cache entries the first inserted.
+            for pass in 0..2 {
+                let got = tokenizer.encode(&text, false).ids;
+                assert_eq!(got, expect, "pass {pass}, text {:?}", text);
+                assert_eq!(tokenizer.count_tokens(&text), expect.len(), "count, text {:?}", text);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parallel_path_matches_reference() {
+        // A document over PARALLEL_CHUNK_THRESHOLD exercises encode_parallel_into
+        // (chunked, pooled per-thread caches); output must equal the
+        // unchunked per-piece reference.
+        let tokenizer = make_pretok_tokenizer();
+        let atom = "The quick brown fox! Ate 1234 grapes, don't ask — «why?» \u{200B}école 日本語 ";
+        let big: String = atom.repeat(2 * Tokenizer::PARALLEL_CHUNK_THRESHOLD / atom.len());
+        assert!(big.len() > Tokenizer::PARALLEL_CHUNK_THRESHOLD);
+        let expect = reference_encode(&tokenizer, &big);
+        assert_eq!(tokenizer.encode(&big, false).ids, expect);
+        assert_eq!(tokenizer.count_tokens(&big), expect.len());
+    }
+
+    #[test]
+    fn test_parallel_path_keeps_whitespace_runs_whole() {
+        // With merges for runs of spaces, cutting a run changes its tokens
+        // (cl100k: 9 spaces + "x" is 8 spaces + " x"; cut after 3 it is
+        // 3 | 5 + " x"). The parallel path must only cut where the whole
+        // text would end a piece.
+        let base_tokens: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
+        let merges = vec![(32, 32), (256, 256), (257, 257), (b'\n' as u32, b'\n' as u32)];
+        let (encoder, token_bytes) = BacktrackingBytePairEncoder::from_merges(&merges, &base_tokens);
+        let tokenizer = Tokenizer::new(
+            Encoder::Backtracking(encoder),
+            Decoder::new(token_bytes),
+            PretokType::Cl100k,
+            Normalizer::None,
+            PostProcessor::None,
+        );
+        let n = 2 * Tokenizer::PARALLEL_CHUNK_THRESHOLD;
+        let texts = [
+            format!("x{}y", " ".repeat(n)),
+            "The cat sat on the mat.  It was   happy.\n\n".repeat(n / 40),
+            "a\t \t b  ".repeat(n / 8),
+            "word         ".repeat(n / 13),
+            "x \u{3000}y z\n\n\n".repeat(n / 10),
+        ];
+        for big in &texts {
+            assert!(big.len() > Tokenizer::PARALLEL_CHUNK_THRESHOLD);
+            assert_eq!(tokenizer.encode(big, false).ids, reference_encode(&tokenizer, big), "{:?}", &big[..12]);
+        }
+    }
+
+    #[test]
+    fn test_parallel_cuts_only_at_safe_points() {
+        let text = "ab  cd\n\nef gh\t ij\nkl 12\n".repeat(500);
+        let chunks = parallel_cuts(text.as_bytes(), 8);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), text.as_bytes());
+        let mut at = 0;
+        for c in &chunks[..chunks.len() - 1] {
+            at += c.len();
+            let b = text.as_bytes();
+            let ok = match b[at] {
+                b' ' => b[at - 1].is_ascii_alphabetic() && b[at + 1].is_ascii_alphabetic(),
+                b'\n' => b[at - 1].is_ascii_alphanumeric(),
+                _ => false,
+            };
+            assert!(ok, "unsafe cut at {at}: {:?}", &text[at - 2..at + 2]);
+        }
+        // No safe point: one chunk.
+        assert_eq!(parallel_cuts("日本語".repeat(1000).as_bytes(), 8).len(), 1);
+        assert_eq!(parallel_cuts(" ".repeat(1000).as_bytes(), 8).len(), 1);
+    }
+
+    #[test]
+    fn test_batch_with_large_doc_matches_reference() {
+        // Batch workers never nest parallel chunking; a large doc inside a
+        // batch takes the fused sequential path and must still match both
+        // the reference and the standalone (parallel) result.
+        let tokenizer = make_pretok_tokenizer();
+        let atom = "Words, numbers 42 and unicode — ½ cup of \u{AD}soft hyphens. ";
+        let big: String = atom.repeat(2 * Tokenizer::PARALLEL_CHUNK_THRESHOLD / atom.len());
+        let mut texts: Vec<&str> = vec!["Hello world", "", "don't", &big, "tail piece"];
+        // Enough docs to force the steal_batches worker path.
+        for _ in 0..32 {
+            texts.push("filler doc with some text 123");
+        }
+        let counts = tokenizer.count_tokens_batch(&texts);
+        let encs = tokenizer.encode_batch(&texts, false);
+        for (i, t) in texts.iter().enumerate() {
+            let expect = reference_encode(&tokenizer, t);
+            assert_eq!(encs[i].ids, expect, "doc {i}");
+            assert_eq!(counts[i], expect.len(), "doc {i}");
+        }
+        let (flat, lens) = tokenizer.encode_batch_flat(&texts, false);
+        let mut off = 0usize;
+        for (i, t) in texts.iter().enumerate() {
+            let expect = reference_encode(&tokenizer, t);
+            assert_eq!(&flat[off..off + lens[i] as usize], &expect[..], "flat doc {i}");
+            off += lens[i] as usize;
+        }
+    }
+
+    #[test]
+    fn test_count_tokens_batch() {
+        let tokenizer = make_pretok_tokenizer();
+        let texts = vec!["Hello world", "abc", "test one two"];
+        let counts = tokenizer.count_tokens_batch(&texts);
+        assert_eq!(counts.len(), 3);
+        for (i, text) in texts.iter().enumerate() {
+            assert_eq!(counts[i], tokenizer.count_tokens(text));
+        }
+    }
+
+    #[test]
+    fn test_count_tokens_batch_empty() {
+        let tokenizer = make_tokenizer();
+        let result = tokenizer.count_tokens_batch(&[]);
+        assert!(result.is_empty());
+    }
+
+    // --- encode_files_flat tests ---
+
+    /// Write bytes to a unique temp file and return its path.
+    fn tmp_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("tokie_files_test_{}_{}", std::process::id(), name));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// Reference result: split on `sep`, drop empties, lossy-convert,
+    /// encode each doc with `encode_batch` and concatenate.
+    fn reference_files(
+        tokenizer: &Tokenizer,
+        contents: &[&[u8]],
+        sep: &[u8],
+    ) -> (Vec<TokenId>, Vec<u64>) {
+        let mut docs: Vec<String> = Vec::new();
+        for buf in contents {
+            let pieces: Vec<&[u8]> = if sep.is_empty() {
+                vec![&buf[..]]
+            } else {
+                let mut out = Vec::new();
+                let mut start = 0;
+                for pos in memchr::memmem::find_iter(buf, sep) {
+                    out.push(&buf[start..pos]);
+                    start = pos + sep.len();
+                }
+                out.push(&buf[start..]);
+                out
+            };
+            for p in pieces {
+                if !p.is_empty() {
+                    docs.push(String::from_utf8_lossy(p).into_owned());
+                }
+            }
+        }
+        let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+        let encs = tokenizer.encode_batch(&refs, false);
+        let mut ids = Vec::new();
+        let mut offsets = vec![0u64];
+        for e in encs {
+            ids.extend_from_slice(&e.ids);
+            offsets.push(ids.len() as u64);
+        }
+        (ids, offsets)
+    }
+
+    fn assert_files_match(name: &str, contents: &[&[u8]], sep: &[u8]) {
+        let tokenizer = make_pretok_tokenizer();
+        let paths: Vec<std::path::PathBuf> = contents
+            .iter()
+            .enumerate()
+            .map(|(i, c)| tmp_file(&format!("{name}_{i}"), c))
+            .collect();
+        let (ids, offsets) = tokenizer.encode_files_flat(&paths, sep, false).unwrap();
+        let (want_ids, want_offsets) = reference_files(&tokenizer, contents, sep);
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+        assert_eq!(ids, want_ids, "{name}: ids mismatch");
+        assert_eq!(offsets, want_offsets, "{name}: offsets mismatch");
+    }
+
+    #[test]
+    fn test_encode_files_multi_doc() {
+        assert_files_match(
+            "multi",
+            &[b"Hello world<SEP>second doc here<SEP>and a third"],
+            b"<SEP>",
+        );
+    }
+
+    #[test]
+    fn test_encode_files_separator_at_edges() {
+        // Separator at file start and end: leading/trailing empty docs are
+        // dropped, matching Python's `[d for d in text.split(sep) if d]`.
+        assert_files_match("edges", &[b"<SEP>middle doc<SEP>"], b"<SEP>");
+    }
+
+    #[test]
+    fn test_encode_files_consecutive_separators() {
+        assert_files_match("consecutive", &[b"one<SEP><SEP><SEP>two"], b"<SEP>");
+    }
+
+    #[test]
+    fn test_encode_files_no_separator() {
+        assert_files_match("nosep", &[b"just one document, no separator"], b"<SEP>");
+    }
+
+    #[test]
+    fn test_encode_files_non_utf8() {
+        // Invalid UTF-8 must take the lossy path (U+FFFD), never panic.
+        assert_files_match(
+            "nonutf8",
+            &[b"good doc<SEP>bad \xff\xfe bytes<SEP>trailing ok"],
+            b"<SEP>",
+        );
+    }
+
+    #[test]
+    fn test_encode_files_multiple_files() {
+        assert_files_match(
+            "multifile",
+            &[
+                b"file one doc a<SEP>file one doc b<SEP>",
+                b"file two doc a",
+                b"<SEP>file three doc a<SEP>file three doc b",
+            ],
+            b"<SEP>",
+        );
+    }
+
+    #[test]
+    fn test_encode_files_empty_file() {
+        assert_files_match("emptyfile", &[b"", b"only doc"], b"<SEP>");
+    }
+
+    #[test]
+    fn test_encode_files_empty_separator() {
+        // Empty separator: each file is a single doc.
+        assert_files_match("emptysep", &[b"whole file is one doc"], b"");
+    }
+
+    #[test]
+    fn test_encode_files_many_docs_parallel() {
+        // Enough docs to force the steal_batches worker path.
+        let mut content = Vec::new();
+        for i in 0..200 {
+            content.extend_from_slice(
+                format!("document number {i} with some text abc").as_bytes(),
+            );
+            content.extend_from_slice(b"<SEP>");
+        }
+        assert_files_match("parallel", &[&content], b"<SEP>");
+    }
+
+    #[test]
+    fn test_encode_files_special_tokens_fallback() {
+        // add_special_tokens=true leaves the fused fast path; the
+        // per-document fallback must still match encode_batch exactly.
+        let tokenizer = make_bert_tokenizer();
+        let path = tmp_file("special", b"abc<SEP>ab ab<SEP>zz");
+        let (ids, offsets) = tokenizer.encode_files_flat(&[&path], b"<SEP>", true).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let encs = tokenizer.encode_batch(&["abc", "ab ab", "zz"], true);
+        let mut want = Vec::new();
+        let mut want_offsets = vec![0u64];
+        for e in encs {
+            want.extend_from_slice(&e.ids);
+            want_offsets.push(want.len() as u64);
+        }
+        assert_eq!(ids, want);
+        assert_eq!(offsets, want_offsets);
+    }
+
+    #[test]
+    fn test_encode_files_truncation_fallback() {
+        // Truncation also leaves the fused fast path.
+        let mut tokenizer = make_pretok_tokenizer();
+        tokenizer.enable_truncation(TruncationParams { max_length: 2, ..Default::default() });
+        let path = tmp_file("trunc", b"Hello world again<SEP>ab");
+        let (ids, offsets) = tokenizer.encode_files_flat(&[&path], b"<SEP>", false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let encs = tokenizer.encode_batch(&["Hello world again", "ab"], false);
+        let mut want = Vec::new();
+        for e in encs {
+            want.extend_from_slice(&e.ids);
+        }
+        assert_eq!(ids, want);
+        assert_eq!(offsets.len(), 3);
+    }
+
+    #[test]
+    fn test_encode_files_missing_file_errors() {
+        let tokenizer = make_pretok_tokenizer();
+        let missing = std::env::temp_dir().join("tokie_files_test_does_not_exist_xyz");
+        assert!(tokenizer.encode_files_flat(&[missing], b"<SEP>", false).is_err());
+    }
+
+    #[test]
+    fn test_count_tokens_files() {
+        let tokenizer = make_pretok_tokenizer();
+        let content: &[u8] = b"Hello world<SEP>second doc<SEP>third one here";
+        let path = tmp_file("count", content);
+        let total = tokenizer.count_tokens_files(&[&path], b"<SEP>").unwrap();
+        let (ids, _) = tokenizer.encode_files_flat(&[&path], b"<SEP>", false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(total, ids.len());
+    }
+
+    #[test]
+    fn test_vocab_access() {
+        let tokenizer = make_tokenizer();
+        // Token 97 = 'a', Token 98 = 'b', Token 256 = 'ab'
+        assert_eq!(tokenizer.id_to_token(97).unwrap(), "a");
+        assert_eq!(tokenizer.id_to_token(98).unwrap(), "b");
+        assert_eq!(tokenizer.token_to_id("a"), Some(97));
+        assert_eq!(tokenizer.token_to_id("b"), Some(98));
+        assert!(tokenizer.id_to_token(999999).is_none());
+        assert!(tokenizer.token_to_id("nonexistent_token_xyz").is_none());
+
+        let vocab = tokenizer.get_vocab();
+        // Vocab may have fewer entries than vocab_size due to lossy UTF-8 collisions
+        assert!(vocab.len() <= tokenizer.vocab_size());
+        assert!(vocab.len() > 0);
+        assert_eq!(vocab["a"], 97);
+    }
+
+    // --- Truncation tests ---
+
+    #[test]
+    fn test_encode_with_truncation() {
+        let mut tokenizer = make_tokenizer();
+        tokenizer.enable_truncation(TruncationParams {
+            max_length: 3,
+            ..Default::default()
+        });
+        let enc = tokenizer.encode("abcde", false);
+        assert!(enc.ids.len() <= 3);
+    }
+
+    #[test]
+    fn test_encode_truncation_preserves_special_tokens() {
+        let mut tokenizer = make_bert_tokenizer();
+        tokenizer.enable_truncation(TruncationParams {
+            max_length: 4,
+            ..Default::default()
+        });
+        let enc = tokenizer.encode("abcde", true);
+        assert!(enc.ids.len() <= 4);
+        assert_eq!(enc.ids[0], 101);
+        assert_eq!(*enc.ids.last().unwrap(), 102);
+    }
+
+    #[test]
+    fn test_encode_pair_with_truncation() {
+        let mut tokenizer = make_bert_tokenizer();
+        tokenizer.enable_truncation(TruncationParams {
+            max_length: 7,
+            ..Default::default()
+        });
+        let enc = tokenizer.encode_pair("abcde", "fghij", true);
+        assert!(enc.ids.len() <= 7);
+        assert_eq!(enc.ids[0], 101);
+    }
+
+    // --- Padding tests ---
+
+    #[test]
+    fn test_encode_batch_with_padding() {
+        let mut tokenizer = make_tokenizer();
+        tokenizer.enable_padding(PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
+            pad_id: 0,
+            ..Default::default()
+        });
+        let batch = tokenizer.encode_batch(&["ab", "abcde"], false);
+        assert_eq!(batch[0].ids.len(), batch[1].ids.len());
+        assert!(batch[0].attention_mask.iter().any(|&m| m == 0));
+        assert!(batch[1].attention_mask.iter().all(|&m| m == 1));
+    }
+
+    #[test]
+    fn test_encode_with_fixed_padding() {
+        let mut tokenizer = make_tokenizer();
+        tokenizer.enable_padding(PaddingParams {
+            strategy: PaddingStrategy::Fixed(10),
+            pad_id: 0,
+            ..Default::default()
+        });
+        let enc = tokenizer.encode("ab", false);
+        assert_eq!(enc.ids.len(), 10);
+        assert_eq!(enc.attention_mask.iter().filter(|&&m| m == 0).count(), 10 - 1);
+    }
+
+    #[test]
+    fn test_encode_batch_with_fixed_padding() {
+        let mut tokenizer = make_tokenizer();
+        tokenizer.enable_padding(PaddingParams {
+            strategy: PaddingStrategy::Fixed(8),
+            pad_id: 0,
+            ..Default::default()
+        });
+        let batch = tokenizer.encode_batch(&["ab", "cd", "e"], false);
+        assert!(batch.iter().all(|e| e.ids.len() == 8));
+    }
+
+    #[test]
+    fn test_encode_batch_left_padding() {
+        let mut tokenizer = make_tokenizer();
+        tokenizer.enable_padding(PaddingParams {
+            strategy: PaddingStrategy::Fixed(5),
+            direction: PaddingDirection::Left,
+            pad_id: 0,
+            ..Default::default()
+        });
+        let enc = tokenizer.encode("ab", false);
+        assert_eq!(enc.ids.len(), 5);
+        assert_eq!(enc.attention_mask[0], 0);
+        assert_eq!(*enc.attention_mask.last().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_no_padding_no_truncation_defaults() {
+        let tokenizer = make_tokenizer();
+        assert!(tokenizer.padding().is_none());
+        assert!(tokenizer.truncation().is_none());
+        assert!(tokenizer.pad_token_id().is_none());
+    }
+
+    #[test]
+    fn test_config_methods() {
+        let mut tokenizer = make_tokenizer();
+        tokenizer.enable_padding(PaddingParams::default());
+        assert!(tokenizer.padding().is_some());
+        tokenizer.no_padding();
+        assert!(tokenizer.padding().is_none());
+
+        tokenizer.enable_truncation(TruncationParams::default());
+        assert!(tokenizer.truncation().is_some());
+        tokenizer.no_truncation();
+        assert!(tokenizer.truncation().is_none());
+
+        tokenizer.set_pad_token_id(0);
+        assert_eq!(tokenizer.pad_token_id(), Some(0));
+    }
+
+    // --- Offset tests ---
+
+    #[test]
+    fn test_encode_with_offsets_basic() {
+        let tokenizer = make_tokenizer();
+        let enc = tokenizer.encode_with_offsets("abc", false);
+        // "abc" with merges a+b -> ab: tokens are [ab, c]
+        assert_eq!(enc.ids.len(), 2);
+        assert_eq!(enc.offsets.len(), 2);
+        // "ab" covers bytes 0..2, "c" covers bytes 2..3
+        assert_eq!(enc.offsets[0], (0, 2));
+        assert_eq!(enc.offsets[1], (2, 3));
+    }
+
+    #[test]
+    fn test_encode_with_offsets_single_byte() {
+        let tokenizer = make_tokenizer();
+        let enc = tokenizer.encode_with_offsets("x", false);
+        assert_eq!(enc.ids.len(), 1);
+        assert_eq!(enc.offsets, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn test_encode_with_offsets_contiguous() {
+        // Verify offsets are contiguous (end of one = start of next)
+        let tokenizer = make_pretok_tokenizer();
+        let text = "Hello world";
+        let enc = tokenizer.encode_with_offsets(text, false);
+        assert_eq!(enc.ids.len(), enc.offsets.len());
+        // Each offset should be valid byte range
+        for &(start, end) in &enc.offsets {
+            assert!(start <= end);
+            assert!(end <= text.len());
+        }
+    }
+
+    #[test]
+    fn test_encode_with_offsets_roundtrip() {
+        // Verify reconstructing text from offsets gives the original
+        let tokenizer = make_tokenizer();
+        let text = "abcde";
+        let enc = tokenizer.encode_with_offsets(text, false);
+        let mut reconstructed = String::new();
+        for &(start, end) in &enc.offsets {
+            reconstructed.push_str(&text[start..end]);
+        }
+        assert_eq!(reconstructed, text);
+    }
+
+    #[test]
+    fn test_encode_with_offsets_special_tokens() {
+        let tokenizer = make_bert_tokenizer();
+        let enc = tokenizer.encode_with_offsets("ab", true);
+        // Should have [CLS] ab [SEP]
+        assert_eq!(enc.ids[0], 101); // CLS
+        assert_eq!(*enc.ids.last().unwrap(), 102); // SEP
+        // Special tokens get (0, 0) offsets
+        assert_eq!(enc.offsets[0], (0, 0));
+        assert_eq!(*enc.offsets.last().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn test_encode_with_offsets_empty() {
+        let tokenizer = make_tokenizer();
+        let enc = tokenizer.encode_with_offsets("", false);
+        assert!(enc.ids.is_empty());
+        assert!(enc.offsets.is_empty());
+    }
+
+    #[test]
+    fn test_encode_with_offsets_truncation() {
+        let mut tokenizer = make_tokenizer();
+        tokenizer.enable_truncation(TruncationParams {
+            max_length: 2,
+            ..Default::default()
+        });
+        let enc = tokenizer.encode_with_offsets("abcde", false);
+        assert!(enc.ids.len() <= 2);
+        assert_eq!(enc.ids.len(), enc.offsets.len());
+    }
+
+    /// Ids equal `encode`'s, and offsets tile `text` (identity normalizer).
+    fn assert_offsets_tile(tokenizer: &Tokenizer, text: &str) -> Encoding {
+        let enc = tokenizer.encode_with_offsets(text, false);
+        assert_eq!(enc.ids, tokenizer.encode(text, false).ids, "{text:?}");
+        assert_eq!(enc.ids.len(), enc.offsets.len());
+        let mut pos = 0;
+        for &(s, e) in &enc.offsets {
+            assert!(s == pos && e > s, "{text:?}: {:?}", enc.offsets);
+            pos = e;
+        }
+        assert_eq!(pos, text.len(), "{text:?}: {:?}", enc.offsets);
+        enc
+    }
+
+    #[test]
+    fn test_added_tokens_past_the_vocab_decode() {
+        // Llama 3 style: the special token's id lies past the vocab table.
+        let mut tokenizer = make_pretok_tokenizer();
+        let n = tokenizer.vocab_size() as TokenId;
+        tokenizer.set_added_tokens(&[AddedTokenSpec::plain(n + 43, b"<|x|>".to_vec())]);
+        let text = "ab <|x|>abc";
+        let ids = tokenizer.encode(text, false).ids;
+        assert!(ids.contains(&(n + 43)));
+        assert_eq!(tokenizer.decode(&ids).as_deref(), Some(text));
+        assert_eq!(tokenizer.decode_bytes(&ids), text.as_bytes());
+        assert_eq!(tokenizer.decode_batch(&[&ids[..], &ids[..1]])[0].as_deref(), Some(text));
+        assert_eq!(tokenizer.id_to_token(n + 43).as_deref(), Some("<|x|>"));
+        assert_eq!(tokenizer.token_to_id("<|x|>"), Some(n + 43));
+        // An id in the gap, or past every token, decodes to nothing and is
+        // no token.
+        assert_eq!(tokenizer.decode(&[n + 1, n + 99]).as_deref(), Some(""));
+        assert_eq!(tokenizer.id_to_token(n + 1), None);
+        assert_eq!(tokenizer.id_to_token(n + 99), None);
+        assert_eq!(tokenizer.token_to_id(""), None);
+        assert!(!tokenizer.get_vocab().contains_key(""));
+
+        // A declared id far past the table is ignored, not allocated up to.
+        tokenizer.set_added_tokens(&[AddedTokenSpec::plain(u32::MAX - 1, b"<|far|>".to_vec())]);
+        assert_eq!(tokenizer.id_to_token(u32::MAX - 1), None);
+    }
+
+    /// A child forked after the parent used rayon's pool must not wait on
+    /// the pool's missing threads.
+    #[cfg(unix)]
+    #[test]
+    fn test_batch_after_fork_runs_without_the_pool() {
+        let tokenizer = make_pretok_tokenizer();
+        let texts: Vec<String> = (0..200).map(|i| format!("ab abc doc {i} ").repeat(20)).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let expect = tokenizer.encode_batch_flat(&refs, false);
+        // SAFETY: the child only encodes and then exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe { libc::alarm(20) };
+            let ok = tokenizer.encode_batch_flat(&refs, false) == expect;
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status}");
+    }
+
+    #[test]
+    fn test_encode_with_offsets_splits_on_added_tokens() {
+        let mut tokenizer = make_pretok_tokenizer();
+        tokenizer.set_added_tokens(&[AddedTokenSpec::plain(999, b"<|x|>".to_vec())]);
+        for text in ["ab<|x|>abc", "<|x|>", "ab <|x|><|x|> ab", "no token here"] {
+            assert_offsets_tile(&tokenizer, text);
+        }
+        let enc = assert_offsets_tile(&tokenizer, "ab<|x|>abc");
+        let i = enc.ids.iter().position(|&id| id == 999).unwrap();
+        assert_eq!(enc.offsets[i], (2, 7));
+    }
+
+    #[test]
+    fn test_encode_with_offsets_wordpiece_spans_input() {
+        use crate::encoder::WordPieceEncoder;
+        let names = ["[UNK]", "play", "##ing", "##ed", "the", "!"];
+        let vocab: Vec<(Vec<u8>, TokenId)> =
+            names.iter().enumerate().map(|(i, t)| (t.as_bytes().to_vec(), i as TokenId)).collect();
+        let encoder = WordPieceEncoder::from_vocab_default(&vocab, 0);
+        let decoder = Decoder::new(names.iter().map(|t| t.as_bytes().to_vec()).collect());
+        let tokenizer = Tokenizer::new(Encoder::WordPiece(encoder), decoder, PretokType::Bert, Normalizer::None, PostProcessor::None);
+        let text = "the playing xyz played!";
+        let enc = tokenizer.encode_with_offsets(text, false);
+        assert_eq!(enc.ids, tokenizer.encode(text, false).ids);
+        let spans: Vec<&str> = enc.offsets.iter().map(|&(s, e)| &text[s..e]).collect();
+        assert_eq!(spans, ["the", "play", "ing", "xyz", "play", "ed", "!"]);
+    }
+
+    /// The added-token prefilter never rules out a text in which some
+    /// pattern occurs.
+    #[test]
+    fn first_bytes_prefilter_is_conservative() {
+        let sets: &[&[&[u8]]] = &[
+            &[b"<|endoftext|>"],
+            &[b"<|im_start|>", b"<|im_end|>", b"<s>"],
+            &[b"[CLS]", b"[SEP]", b"[PAD]", b"[MASK]", b"[UNK]"],
+            &[b"a", b"bc"],
+            &[b"<", b"<|x"],
+            &[b"xy", b"zw", b"q", b"rs"],
+        ];
+        let alphabet = b"<|[]CSPMUabcxyzqrsw ";
+        let mut state = 0x9E3779B97F4A7C15u64;
+        for pats in sets {
+            let mut fb = FirstBytes::default();
+            for p in *pats {
+                fb.add(p);
+            }
+            for _ in 0..20_000 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let len = (state >> 58) as usize;
+                let hay: Vec<u8> = (0..len)
+                    .map(|k| alphabet[((state >> (k % 50)) as usize ^ k * 7) % alphabet.len()])
+                    .collect();
+                let occurs = pats.iter().any(|p| hay.windows(p.len()).any(|w| w == *p));
+                if occurs {
+                    assert!(fb.may_occur(&hay), "{pats:?} occur in {:?}", String::from_utf8_lossy(&hay));
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,1639 @@
+//! Text normalization for tokenizers.
+//!
+//! Normalizers transform text before tokenization. Common operations include:
+//! - Lowercasing (BERT uncased models)
+//! - Unicode normalization (NFC/NFD)
+//! - Cleaning control characters
+//!
+//! # Example
+//!
+//! ```
+//! use tokie::Normalizer;
+//!
+//! let normalizer = Normalizer::BertUncased;
+//! let text = "Hello World!";
+//! let normalized = normalizer.normalize(text);
+//! assert_eq!(normalized, "hello world!");
+//! ```
+
+use std::borrow::Cow;
+use std::sync::Arc;
+use unicode_general_category::{get_general_category, GeneralCategory};
+
+use crate::charsmap::{CharsmapSink, PrecompiledCharsmap};
+
+/// Lookup table for ASCII bytes that need cleaning in clean_text.
+/// true = problematic byte (control char, DEL, or high bit set)
+/// false = safe ASCII byte (printable or tab/newline/CR)
+static NEEDS_CLEANING: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0u16;
+    while i < 256 {
+        let b = i as u8;
+        // High bit set (non-ASCII) - will trigger Unicode path
+        // Control chars (< 0x20) except tab (0x09), newline (0x0A), CR (0x0D)
+        // DEL (0x7F)
+        table[i as usize] = b >= 0x80
+            || (b < 0x20 && b != 0x09 && b != 0x0A && b != 0x0D)
+            || b == 0x7F;
+        i += 1;
+    }
+    table
+};
+
+/// How the SentencePiece metaspace `▁` prefix is applied to a text segment.
+///
+/// HuggingFace splits text at added-token boundaries first, then applies
+/// either a `Prepend("▁")` *normalizer* (per segment, unconditional) or a
+/// `Metaspace` *pre-tokenizer* (conditional on the segment's shape and
+/// position). The three schemes produce different tokens around specials:
+///
+/// - `Unconditional`: HF normalizer `Prepend("▁") + Replace(" "→"▁")`
+///   (Llama-2, TinyLlama, Phi-3, voyage-2 family). Every segment gets `▁`,
+///   even space-leading ones ("` world`" → "`▁▁world`").
+/// - `IfNotSpaceLed`: HF pre-tokenizer `Metaspace(prepend_scheme=always)`
+///   (bge-m3-style Unigram exports). `▁` is prepended only when the segment
+///   does not already start with a space or `▁` after replacement.
+/// - `FirstSegment`: HF pre-tokenizer `Metaspace(prepend_scheme=first)`
+///   (Mistral-7B-v0.1). Like `IfNotSpaceLed`, but only for the segment at
+///   byte offset 0 of the original input — segments after a special token
+///   are never prepended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MetaspacePrepend {
+    #[default]
+    Unconditional,
+    IfNotSpaceLed,
+    FirstSegment,
+}
+
+/// Text normalizer configuration.
+///
+/// Normalizers transform input text before pre-tokenization and encoding.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Normalizer {
+    /// No normalization (GPT-2, RoBERTa, Llama, etc.)
+    #[default]
+    None,
+
+    /// BERT uncased: clean_text + strip_accents + lowercase.
+    ///
+    /// Used by: bert-base-uncased, GTE, BGE, E5, MiniLM, etc.
+    ///
+    /// This implements:
+    /// - `clean_text`: removes control characters (BOM, null, etc.) and normalizes whitespace
+    /// - `strip_accents`: removes diacritical marks (é → e, ñ → n)
+    /// - `lowercase`: converts all text to lowercase
+    BertUncased,
+
+    /// BERT cased: clean_text only (no lowercasing).
+    ///
+    /// Used by: bert-base-cased, bert-multilingual-cased, etc.
+    ///
+    /// This implements:
+    /// - `clean_text`: removes control characters (BOM, null, etc.) and normalizes whitespace
+    /// - NO lowercasing (preserves case)
+    BertCased,
+
+    /// Unicode NFC normalization.
+    ///
+    /// Used by: ModernBERT, Qwen, etc.
+    Nfc,
+
+    /// SentencePiece Metaspace normalization.
+    ///
+    /// Used by: Llama, Mistral, Gemma, etc.
+    ///
+    /// This implements:
+    /// - Prepends `▁` (U+2581) at the start of the text
+    /// - Replaces all spaces with `▁`
+    ///
+    /// Example: "Hello world" → "▁Hello▁world"
+    ///
+    /// The [`MetaspacePrepend`] scheme controls when the leading `▁` is
+    /// added — see its docs. `Unconditional` matches the HF `Prepend`
+    /// normalizer; the other two match the HF `Metaspace` pre-tokenizer.
+    Metaspace(MetaspacePrepend),
+
+    /// SentencePiece normalization with NFKC.
+    ///
+    /// Used by: T5, XLM-RoBERTa, mT5, etc.
+    ///
+    /// This implements:
+    /// - NFKC Unicode normalization
+    /// - Collapse multiple whitespace to single space
+    /// - Strip leading/trailing whitespace
+    /// - Prepend `▁` and replace spaces with `▁`
+    ///
+    /// Example: "  Hello   world  " → "▁Hello▁world"
+    SentencePiece,
+
+    /// SentencePiece normalization with NFKC + lowercase.
+    ///
+    /// Used by: ALBERT, etc.
+    ///
+    /// Same as SentencePiece but also lowercases.
+    ///
+    /// Example: "  Hello   World  " → "▁hello▁world"
+    SentencePieceLowercase,
+
+    /// Replace space with metaspace only (no prepend).
+    ///
+    /// Used by: Gemma (Replace normalizer)
+    ///
+    /// This only replaces spaces with `▁`, without prepending at start.
+    ///
+    /// Example: "Hello world" → "Hello▁world"
+    MetaspaceReplace,
+
+    /// SentencePiece normalization driven by the model's exact
+    /// `precompiled_charsmap` blob (XLM-RoBERTa, T5, bge-m3, ...).
+    ///
+    /// This implements the model's own charsmap transform (NFKC-style
+    /// rewrites, exact per-character keep/map/drop decisions) followed by the
+    /// metaspace step matching the model's pre-tokenizer chain:
+    ///
+    /// - `whitespace_split: true` (XLM-R, T5 — WhitespaceSplit + Metaspace):
+    ///   collapse whitespace, strip leading/trailing, prepend `▁`, spaces → `▁`
+    /// - `whitespace_split: false` (bge-m3 family — Replace `" {2,}"` +
+    ///   Metaspace only): collapse space runs, no strip (a trailing space
+    ///   becomes a real `▁` token), prepend `▁`, spaces → `▁`
+    ///
+    /// Unlike [`Normalizer::SentencePiece`], which approximates the charsmap
+    /// with Unicode-category rules, this reproduces HF byte-for-byte (the real
+    /// xlm-roberta charsmap keeps U+00AD and C1 controls that category rules
+    /// would strip).
+    SentencePiecePrecompiled {
+        charsmap: Arc<PrecompiledCharsmap>,
+        whitespace_split: bool,
+    },
+
+    /// SentencePiece normalization with ASCII-punctuation padding
+    /// (minishlab/potion-multilingual-128M).
+    ///
+    /// Mirrors the HF normalizer chain
+    /// `[Precompiled, Replace(" {2,}"→" "), 32× Replace(p → " p "),
+    /// Replace(\s+→" "), Strip]` followed by a
+    /// `Metaspace(prepend_scheme=always, split=false)` pre-tokenizer,
+    /// fused into one pass:
+    ///
+    /// 1. charsmap transform
+    /// 2. every ASCII punctuation char is padded with spaces
+    /// 3. whitespace runs collapse to a single space, edges stripped
+    /// 4. prepend `▁` (unless the text starts with a literal `▁`), spaces → `▁`
+    ///
+    /// Example: "a.b  c" → "▁a▁.▁b▁c"
+    SentencePiecePunctPad {
+        charsmap: Arc<PrecompiledCharsmap>,
+    },
+
+    /// Plain lowercase (HF `Lowercase` normalizer): per-char Unicode
+    /// lowercase, nothing else — no control stripping, no CJK padding,
+    /// no accent stripping.
+    ///
+    /// Example: "HÉLLO 中文" → "héllo 中文"
+    Lowercase,
+}
+
+impl Normalizer {
+    /// Normalize text according to this normalizer's rules.
+    ///
+    /// Returns `Cow::Borrowed` when no changes are needed (zero allocation).
+    /// Returns `Cow::Owned` when text was modified.
+    ///
+    /// Equivalent to [`Normalizer::normalize_segment`] with
+    /// `first_segment = true` — correct for whole inputs and for the first
+    /// segment of an added-token split.
+    #[inline]
+    pub fn normalize<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        self.normalize_segment(text, true)
+    }
+
+    /// Normalize one segment of an added-token split.
+    ///
+    /// `first_segment` is true only for the segment that starts at byte 0 of
+    /// the original input; [`MetaspacePrepend::FirstSegment`] uses it to skip
+    /// the `▁` prefix on segments that follow an added token.
+    #[inline]
+    pub fn normalize_segment<'a>(&self, text: &'a str, first_segment: bool) -> Cow<'a, str> {
+        match self {
+            Normalizer::None => Cow::Borrowed(text),
+            Normalizer::BertCased => clean_text(text),
+            Normalizer::BertUncased => bert_uncased_normalize(text),
+            Normalizer::Nfc => normalize_nfc(text),
+            Normalizer::Metaspace(prepend) => metaspace_normalize_with(text, *prepend, first_segment),
+            Normalizer::SentencePiece => sentencepiece_normalize(text),
+            Normalizer::SentencePieceLowercase => sentencepiece_lowercase_normalize(text),
+            Normalizer::MetaspaceReplace => metaspace_replace_normalize(text),
+            Normalizer::SentencePiecePrecompiled { charsmap, whitespace_split } => {
+                sentencepiece_precompiled_normalize(charsmap, *whitespace_split, text)
+            }
+            Normalizer::SentencePiecePunctPad { charsmap } => {
+                sentencepiece_punct_pad_normalize(charsmap, text)
+            }
+            Normalizer::Lowercase => lowercase_normalize(text),
+        }
+    }
+
+    /// Check if this normalizer modifies text.
+    #[inline]
+    pub fn is_identity(&self) -> bool {
+        matches!(self, Normalizer::None)
+    }
+}
+
+/// NFC Unicode normalization with early exit.
+///
+/// Returns borrowed text if already NFC normalized, avoiding allocation.
+/// Uses ICU4X for fast normalization (~22x faster than unicode-normalization).
+#[inline]
+fn normalize_nfc<'a>(text: &'a str) -> Cow<'a, str> {
+    let nfc = icu_normalizer::ComposingNormalizer::new_nfc();
+
+    if nfc.is_normalized(text) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(nfc.normalize(text))
+}
+
+/// Plain lowercase, matching HF's `Lowercase` normalizer (`char::to_lowercase`
+/// per char, so no context-sensitive final sigma).
+///
+/// Returns `Cow::Borrowed` when the text has no uppercase characters.
+fn lowercase_normalize(text: &str) -> Cow<'_, str> {
+    if text.is_ascii() {
+        if !text.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Cow::Borrowed(text);
+        }
+        return Cow::Owned(text.to_ascii_lowercase());
+    }
+    let mut chars = text.char_indices();
+    let first = loop {
+        match chars.next() {
+            None => return Cow::Borrowed(text),
+            Some((i, c)) => {
+                let mut lc = c.to_lowercase();
+                if lc.len() != 1 || lc.next() != Some(c) {
+                    break i;
+                }
+            }
+        }
+    };
+    let mut result = String::with_capacity(text.len() + 8);
+    result.push_str(&text[..first]);
+    for c in text[first..].chars() {
+        result.extend(c.to_lowercase());
+    }
+    Cow::Owned(result)
+}
+
+/// Metaspace normalization for SentencePiece tokenizers.
+///
+/// Transforms text for SentencePiece-style tokenization:
+/// - Prepends `▁` (U+2581) at the start
+/// - Replaces all spaces with `▁`
+///
+/// This matches HuggingFace's `Prepend("▁")` + `Replace(" " → "▁")`
+/// normalizer sequence (Llama, Mistral, TinyLlama), which prepends
+/// unconditionally — even when the text starts with a space:
+/// - "Hello world" → "▁Hello▁world"
+/// - " spaces" → "▁▁spaces"
+///
+/// Added-token splitting normalizes each text segment independently, so
+/// a segment like " world" in "Hello </s> world" must keep both the
+/// prepended `▁` and the space-derived `▁`, exactly as HF emits them.
+///
+/// # Performance
+///
+/// Uses SIMD-accelerated `fnr` for fast space replacement.
+#[inline]
+pub fn metaspace_normalize(text: &str) -> Cow<'_, str> {
+    metaspace_normalize_with(text, MetaspacePrepend::Unconditional, true)
+}
+
+/// Metaspace normalization with an explicit prepend scheme.
+///
+/// See [`MetaspacePrepend`] for the per-scheme semantics. The
+/// `IfNotSpaceLed`/`FirstSegment` schemes mirror HF's Metaspace
+/// pre-tokenizer, which checks `starts_with(replacement)` after replacing
+/// spaces — a leading space (or a literal `▁` in the input) suppresses the
+/// extra prefix.
+#[inline]
+pub fn metaspace_normalize_with(
+    text: &str,
+    prepend: MetaspacePrepend,
+    first_segment: bool,
+) -> Cow<'_, str> {
+    // HF's Prepend normalizer and Metaspace pre-tokenizer are no-ops on
+    // empty input (the empty split is dropped).
+    if text.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let do_prepend = match prepend {
+        MetaspacePrepend::Unconditional => true,
+        MetaspacePrepend::IfNotSpaceLed => !(text.starts_with(' ') || text.starts_with('▁')),
+        MetaspacePrepend::FirstSegment => {
+            first_segment && !(text.starts_with(' ') || text.starts_with('▁'))
+        }
+    };
+    let replaced = fnr(text, " ", "▁");
+    if !do_prepend {
+        return replaced;
+    }
+    let mut result = String::with_capacity(replaced.len() + 3);
+    result.push('▁');
+    result.push_str(&replaced);
+    Cow::Owned(result)
+}
+
+/// Metaspace replace normalization (no prepend).
+///
+/// Unlike `metaspace_normalize`, this only replaces spaces with `▁`
+/// without prepending at the start.
+///
+/// Used by: Gemma (Replace normalizer in HF tokenizer.json)
+///
+/// Example: "Hello world" → "Hello▁world"
+#[inline]
+pub fn metaspace_replace_normalize(text: &str) -> Cow<'_, str> {
+    // Simply replace spaces with metaspace character
+    fnr(text, " ", "▁")
+}
+
+/// SentencePiece normalization with NFKC.
+///
+/// Used by T5, XLM-RoBERTa, mT5, etc.
+///
+/// Applies the following transformations:
+/// 1. NFKC Unicode normalization
+/// 2. Strip control characters (BOM, null, format chars)
+/// 3. Collapse all whitespace (space, tab, newline, etc.) to single space
+/// 4. Strip leading and trailing whitespace
+/// 5. Prepend `▁` and replace internal spaces with `▁`
+///
+/// Example: "  Hello   world\n" → "▁Hello▁world"
+#[inline]
+pub fn sentencepiece_normalize(text: &str) -> Cow<'_, str> {
+    if text.is_empty() {
+        return Cow::Borrowed(text);
+    }
+
+    // Step 1: NFKC normalization
+    let nfkc = icu_normalizer::ComposingNormalizer::new_nfkc();
+    let normalized = if nfkc.is_normalized(text) {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(nfkc.normalize(text))
+    };
+
+    // Step 2: Strip control characters (BOM, null, format chars, etc.)
+    // Step 3 & 4: Collapse whitespace and strip
+    let collapsed = collapse_strip_whitespace_and_controls(&normalized);
+
+    // Step 5: Apply metaspace (prepend ▁ and replace spaces)
+    let mut result = String::with_capacity(collapsed.len() + 3);
+    result.push('▁');
+    for c in collapsed.chars() {
+        if c == ' ' {
+            result.push('▁');
+        } else {
+            result.push(c);
+        }
+    }
+
+    Cow::Owned(result)
+}
+
+/// SentencePiece normalization using the model's exact `precompiled_charsmap`.
+///
+/// Applies the charsmap transform (grapheme-wise, HF-identical — see
+/// [`PrecompiledCharsmap`]) followed by the metaspace step matching the
+/// model's pre-tokenizer chain:
+///
+/// - `whitespace_split: true` — WhitespaceSplit + Metaspace (XLM-R, T5):
+///   whitespace runs of any kind separate words and are dropped, edges
+///   stripped, every word prefixed with `▁`.
+/// - `whitespace_split: false` — Replace `" {2,}"` → `" "` + Metaspace
+///   (bge-m3, snowflake-arctic-v2): only space runs collapse, nothing is
+///   stripped (e.g. a trailing space survives as a lone `▁`), and `▁` is
+///   prepended unless the text already starts with a space or `▁`.
+pub fn sentencepiece_precompiled_normalize<'a>(
+    charsmap: &PrecompiledCharsmap,
+    whitespace_split: bool,
+    text: &'a str,
+) -> Cow<'a, str> {
+    if text.is_empty() {
+        return Cow::Borrowed(text);
+    }
+
+    // One pass: the charsmap transform streams into the whitespace and
+    // metaspace step, and ASCII the charsmap keeps is copied in runs.
+    let mut scratch = String::new();
+    let out = String::with_capacity(text.len() + text.len() / 2 + 3);
+    if whitespace_split {
+        let mut sink = SplitMetaspace { out, owed: true };
+        charsmap.normalize_with(text, &mut sink, &mut scratch);
+        Cow::Owned(sink.out)
+    } else {
+        let mut sink = SpaceRunMetaspace { out, first: true, prev_space: false };
+        charsmap.normalize_with(text, &mut sink, &mut scratch);
+        Cow::Owned(sink.finish())
+    }
+}
+
+/// WhitespaceSplit + Metaspace over a charsmap's output: whitespace runs of
+/// any kind separate words and are dropped (edges stripped), and every word
+/// gets a `▁` prefix. Whitespace-only text gives `""` (no pieces, no `▁`).
+struct SplitMetaspace {
+    out: String,
+    /// A `▁` is due before the next word char.
+    owed: bool,
+}
+
+impl CharsmapSink for SplitMetaspace {
+    #[inline(always)]
+    fn bulk(&self, b: u8) -> bool {
+        // `char::is_whitespace` on ASCII.
+        !matches!(b, 0x09..=0x0D | b' ')
+    }
+
+    #[inline(always)]
+    fn run(&mut self, run: &str) {
+        if self.owed {
+            self.out.push_str("▁");
+            self.owed = false;
+        }
+        self.out.push_str(run);
+    }
+
+    #[inline(always)]
+    fn char(&mut self, c: char) {
+        if c.is_whitespace() {
+            self.owed = true;
+        } else {
+            if self.owed {
+                self.out.push_str("▁");
+                self.owed = false;
+            }
+            self.out.push(c);
+        }
+    }
+}
+
+/// Replace `" {2,}"` → `" "` + Metaspace over a charsmap's output: each run
+/// of spaces becomes one `▁` (other whitespace is kept), and `▁` is prepended
+/// unless the output starts with a space or `▁` (so empty output is `"▁"`).
+struct SpaceRunMetaspace {
+    out: String,
+    first: bool,
+    prev_space: bool,
+}
+
+impl SpaceRunMetaspace {
+    #[inline(always)]
+    fn start(&mut self, c: char) {
+        if self.first {
+            self.first = false;
+            if !(c == ' ' || c == '▁') {
+                self.out.push_str("▁");
+            }
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.first {
+            self.out.push_str("▁");
+        }
+        self.out
+    }
+}
+
+impl CharsmapSink for SpaceRunMetaspace {
+    #[inline(always)]
+    fn bulk(&self, b: u8) -> bool {
+        b != b' '
+    }
+
+    #[inline(always)]
+    fn run(&mut self, run: &str) {
+        self.start(run.as_bytes()[0] as char);
+        self.out.push_str(run);
+        self.prev_space = false;
+    }
+
+    #[inline(always)]
+    fn char(&mut self, c: char) {
+        self.start(c);
+        if c == ' ' {
+            if !self.prev_space {
+                self.out.push_str("▁");
+            }
+            self.prev_space = true;
+        } else {
+            self.out.push(c);
+            self.prev_space = false;
+        }
+    }
+}
+
+/// SentencePiece normalization with ASCII-punctuation padding
+/// (minishlab/potion-multilingual-128M).
+///
+/// Fuses the HF chain `[Precompiled, Replace(" {2,}"→" "),
+/// 32× Replace(p → " p "), Replace(\s+→" "), Strip]` plus the
+/// `Metaspace(prepend_scheme=always, split=false)` pre-tokenizer into a
+/// single scan. The intermediate space-collapse is subsumed by the final
+/// `\s+ → " "` rule, so one pass over the charsmap output suffices:
+/// punctuation is emitted as `▁p▁`, whitespace runs collapse to one `▁`,
+/// and edges are stripped.
+pub fn sentencepiece_punct_pad_normalize<'a>(
+    charsmap: &PrecompiledCharsmap,
+    text: &'a str,
+) -> Cow<'a, str> {
+    if text.is_empty() {
+        return Cow::Borrowed(text);
+    }
+
+    let mut transformed = String::with_capacity(text.len());
+    charsmap.normalize_into(text, &mut transformed);
+
+    // Single pass: pad ASCII punctuation, collapse whitespace runs to one
+    // separator, strip edges. `pending_sep` defers the separator until the
+    // next non-space char so trailing whitespace is stripped for free.
+    let mut result = String::with_capacity(transformed.len() + transformed.len() / 4 + 3);
+    // HF Metaspace(always) skips the prefix when the (stripped) text already
+    // starts with the replacement char — only possible via a literal ▁.
+    let stripped = transformed.trim_matches(|c: char| c.is_whitespace());
+    if !stripped.starts_with('▁') && !stripped.is_empty() {
+        result.push('▁');
+    }
+    let mut pending_sep = false;
+    let mut emitted_any = false;
+    for c in stripped.chars() {
+        if c.is_whitespace() {
+            pending_sep = true;
+        } else if c.is_ascii_punctuation() {
+            // " p " padding: a separator on each side, collapsed with
+            // neighboring whitespace and stripped at the edges.
+            if emitted_any {
+                result.push('▁');
+            }
+            result.push(c);
+            emitted_any = true;
+            // The trailing pad space merges into the next separator.
+            pending_sep = true;
+        } else {
+            if pending_sep {
+                result.push('▁');
+                pending_sep = false;
+            }
+            result.push(c);
+            emitted_any = true;
+        }
+    }
+    Cow::Owned(result)
+}
+
+/// SentencePiece normalization with NFKD + StripAccents + lowercase.
+///
+/// Used by ALBERT, etc.
+///
+/// Applies the following transformations:
+/// 1. NFKD Unicode normalization (decompose characters)
+/// 2. Strip accents (remove combining marks) and control characters
+/// 3. Lowercase
+/// 4. Collapse whitespace and strip
+/// 5. Prepend ▁ and replace spaces with ▁
+///
+/// Example: "  Héllo   Wörld\n" → "▁hello▁world"
+#[inline]
+pub fn sentencepiece_lowercase_normalize(text: &str) -> Cow<'_, str> {
+    if text.is_empty() {
+        return Cow::Borrowed(text);
+    }
+
+    // Step 1: NFKD normalization (decompose to separate base chars from combining marks)
+    let nfkd = icu_normalizer::DecomposingNormalizer::new_nfkd();
+    let normalized = nfkd.normalize(text);
+
+    // Step 2: Strip accents (combining marks) and control characters (BOM, null, etc.)
+    let stripped: String = normalized
+        .chars()
+        .filter(|&c| !is_combining_mark(c) && !is_control(c) && c != '\0' && c != '\u{FFFD}')
+        .collect();
+
+    // Step 3 & 4: Collapse whitespace and strip
+    let collapsed = collapse_and_strip_whitespace(&stripped);
+
+    // Step 5: Lowercase + Apply metaspace (prepend ▁ and replace spaces)
+    let mut result = String::with_capacity(collapsed.len() + 3);
+    result.push('▁');
+    for c in collapsed.chars() {
+        if c == ' ' {
+            result.push('▁');
+        } else {
+            // Lowercase each character
+            for lc in c.to_lowercase() {
+                result.push(lc);
+            }
+        }
+    }
+
+    Cow::Owned(result)
+}
+
+/// Collapse multiple whitespace chars to single space and strip leading/trailing.
+///
+/// Handles: space, tab, newline, carriage return, and Unicode whitespace.
+fn collapse_and_strip_whitespace(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut prev_was_space = true; // Start true to strip leading whitespace
+
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !prev_was_space {
+                result.push(' ');
+                prev_was_space = true;
+            }
+            // Skip if prev was already space (collapse)
+        } else {
+            result.push(c);
+            prev_was_space = false;
+        }
+    }
+
+    // Strip trailing space
+    if result.ends_with(' ') {
+        result.pop();
+    }
+
+    result
+}
+
+/// Collapse whitespace, strip leading/trailing, and handle control/format characters.
+///
+/// Matches SentencePiece's Precompiled charsmap behavior:
+/// - Control chars (Cc category, except tab/newline/CR): **removed**
+/// - Format chars (Cf category: ZWNJ, ZWJ, directional marks, BOM): **mapped to space**
+/// - Replacement char (U+FFFD): **mapped to space**
+/// - Whitespace: collapsed to single space, stripped from edges
+///
+/// The key difference from stripping format chars: ZWNJ (U+200C) between
+/// non-space chars becomes a space, creating a word boundary that affects
+/// tokenization (e.g., Persian "دولت‌زدائی" → "دولت زدائی").
+fn collapse_strip_whitespace_and_controls(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut prev_was_space = true; // Start true to strip leading whitespace
+
+    for c in text.chars() {
+        if c == '\0' {
+            continue;
+        }
+
+        // Classify the character
+        let cat = get_general_category(c);
+        match cat {
+            // Control chars (Cc): tab/newline/CR → space, others → removed
+            GeneralCategory::Control => {
+                if c == '\t' || c == '\n' || c == '\r' || c == '\x0C' {
+                    // Map to space (whitespace collapsing)
+                    if !prev_was_space {
+                        result.push(' ');
+                        prev_was_space = true;
+                    }
+                }
+                // Other control chars: silently removed
+            }
+            // Format chars (Cf): ZWNJ, ZWJ, directional marks, BOM → space
+            GeneralCategory::Format => {
+                if !prev_was_space {
+                    result.push(' ');
+                    prev_was_space = true;
+                }
+            }
+            _ => {
+                // Replacement char → space (matching charsmap)
+                if c == '\u{FFFD}' {
+                    if !prev_was_space {
+                        result.push(' ');
+                        prev_was_space = true;
+                    }
+                } else if c.is_whitespace() {
+                    if !prev_was_space {
+                        result.push(' ');
+                        prev_was_space = true;
+                    }
+                } else {
+                    result.push(c);
+                    prev_was_space = false;
+                }
+            }
+        }
+    }
+
+    // Strip trailing space
+    if result.ends_with(' ') {
+        result.pop();
+    }
+
+    result
+}
+
+/// Check if a character is a Unicode control character.
+///
+/// Returns true for Unicode categories Cc, Cf, Co (control, format, private-use),
+/// EXCEPT for tab, newline, and carriage return which are treated as whitespace.
+///
+/// Unassigned (Cn) code points are kept. That matches HF for both users of
+/// this predicate: BertNormalizer `clean_text` (`is_other()` = Cc|Cf|Co) and
+/// the ALBERT chain (NFKD + StripAccents + Lowercase + Precompiled), whose
+/// charsmap passes "a\u{5FF}b" through unchanged.
+#[inline]
+fn is_control(c: char) -> bool {
+    match c {
+        '\t' | '\n' | '\r' => false,
+        // HF keeps unassigned (Cn) code points: "a\u{5FF}b" → [a, [UNK], b].
+        _ => matches!(
+            get_general_category(c),
+            GeneralCategory::Control | GeneralCategory::Format | GeneralCategory::PrivateUse
+        ),
+    }
+}
+
+/// Check if a character is whitespace (for BERT normalization).
+///
+/// Includes standard ASCII whitespace plus Unicode space characters.
+#[inline]
+fn is_bert_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+        || get_general_category(c) == GeneralCategory::SpaceSeparator
+}
+
+/// CJK ideograph per HuggingFace's BertNormalizer `is_chinese_char`
+/// (tokenizers `normalizers/bert.rs`; ranges copied verbatim, including the
+/// 0x2B820..=0x2B91F gap).
+#[inline]
+fn is_chinese_char(c: char) -> bool {
+    matches!(c as u32,
+        0x4E00..=0x9FFF
+        | 0x3400..=0x4DBF
+        | 0x20000..=0x2A6DF
+        | 0x2A700..=0x2B73F
+        | 0x2B740..=0x2B81F
+        | 0x2B920..=0x2CEAF
+        | 0xF900..=0xFAFF
+        | 0x2F800..=0x2FA1F
+    )
+}
+
+/// Push `c`, padded with spaces if it is a CJK ideograph (BertNormalizer
+/// `handle_chinese_chars`: the BERT pre-tokenizer then isolates it).
+#[inline]
+fn push_padding_cjk(result: &mut String, c: char) {
+    if is_chinese_char(c) {
+        result.push(' ');
+        result.push(c);
+        result.push(' ');
+    } else {
+        result.push(c);
+    }
+}
+
+/// Clean text by removing control characters and normalizing whitespace.
+///
+/// This matches HuggingFace's BertNormalizer `clean_text` +
+/// `handle_chinese_chars` behavior:
+/// - Removes null (U+0000), replacement char (U+FFFD), and control characters
+/// - Normalizes all whitespace variants to standard space ' '
+/// - Pads CJK ideographs with spaces ("中文" → " 中  文 ")
+///
+/// Returns `Cow::Borrowed` when no changes needed (zero allocation).
+///
+/// Performance: Uses byte-level fast path for ASCII text (~2.7 GB/s vs ~475 MB/s).
+///
+/// # Example
+///
+/// ```
+/// use tokie::normalizer::clean_text;
+///
+/// // BOM and control chars are removed
+/// let text = "\u{FEFF}Hello\u{0000}World";
+/// let cleaned = clean_text(text);
+/// assert_eq!(cleaned, "HelloWorld");
+///
+/// // Various whitespace becomes regular space
+/// let text = "hello\u{00A0}world"; // non-breaking space
+/// let cleaned = clean_text(text);
+/// assert_eq!(cleaned, "hello world");
+/// ```
+pub fn clean_text<'a>(text: &'a str) -> Cow<'a, str> {
+    let bytes = text.as_bytes();
+
+    // Fast lookup-table scan (2x faster than complex condition)
+    // Find first byte that needs attention
+    let first_problem = bytes.iter().position(|&b| NEEDS_CLEANING[b as usize]);
+
+    let first_pos = match first_problem {
+        None => return Cow::Borrowed(text), // No cleaning needed
+        Some(pos) => pos,
+    };
+
+    // Check if we hit a non-ASCII byte (high bit set)
+    if bytes[first_pos] >= 0x80 {
+        return clean_text_unicode(text, first_pos);
+    }
+
+    // Pure ASCII with control chars - check rest for non-ASCII
+    if bytes[first_pos..].iter().any(|&b| b >= 0x80) {
+        return clean_text_unicode(text, first_pos);
+    }
+
+    // Pure ASCII path: process byte-by-byte without Unicode overhead
+    let mut result = Vec::with_capacity(text.len());
+    result.extend_from_slice(&bytes[..first_pos]);
+
+    for &b in &bytes[first_pos..] {
+        if b < 0x20 {
+            if b == b'\t' || b == b'\n' || b == b'\r' {
+                result.push(b' '); // Normalize whitespace to space
+            }
+            // else: skip control character
+        } else if b == 0x7F {
+            // Skip DEL
+        } else {
+            result.push(b);
+        }
+    }
+
+    // Safe: we only added ASCII bytes
+    Cow::Owned(unsafe { String::from_utf8_unchecked(result) })
+}
+
+/// Unicode path for clean_text - handles text with non-ASCII characters.
+/// `first_problem` is the byte position where we found the first problematic byte.
+fn clean_text_unicode<'a>(text: &'a str, first_problem: usize) -> Cow<'a, str> {
+    // Scan the prefix (pure ASCII) to find if it needs cleaning
+    let prefix_bytes = &text.as_bytes()[..first_problem];
+    let prefix_needs_cleaning = prefix_bytes.iter().any(|&b| NEEDS_CLEANING[b as usize]);
+
+    // Check if the Unicode portion needs cleaning
+    let suffix = &text[first_problem..];
+    let suffix_needs_cleaning = suffix.chars().any(|c| {
+        c == '\0'
+            || c == '\u{FFFD}'
+            || is_control(c)
+            || (is_bert_whitespace(c) && c != ' ')
+            || is_chinese_char(c)
+    });
+
+    if !prefix_needs_cleaning && !suffix_needs_cleaning {
+        return Cow::Borrowed(text);
+    }
+
+    // Build result: clean prefix + clean suffix
+    let mut result = String::with_capacity(text.len());
+
+    // Add cleaned prefix
+    for &b in prefix_bytes {
+        if b < 0x20 {
+            if b == b'\t' || b == b'\n' || b == b'\r' {
+                result.push(' ');
+            }
+        } else if b != 0x7F {
+            result.push(b as char);
+        }
+    }
+
+    // Add cleaned suffix
+    for c in suffix.chars() {
+        if c == '\0' || c == '\u{FFFD}' || is_control(c) {
+            continue;
+        }
+        if is_bert_whitespace(c) {
+            result.push(' ');
+        } else {
+            push_padding_cjk(&mut result, c);
+        }
+    }
+
+    Cow::Owned(result)
+}
+
+/// Strip accents (diacritical marks) from text.
+///
+/// This matches HuggingFace's BertNormalizer `strip_accents` behavior.
+/// Uses NFD normalization to decompose characters, then filters out
+/// combining marks (Unicode category Mn - NonspacingMark).
+///
+/// Performance: ~3.1 GB/s for pure ASCII text, ~469 MB/s for accented text (using ICU4X).
+///
+/// # Example
+///
+/// ```
+/// use tokie::normalizer::strip_accents;
+///
+/// let text = "Pávlovna café résumé";
+/// let stripped = strip_accents(text);
+/// assert_eq!(stripped, "Pavlovna cafe resume");
+/// ```
+pub fn strip_accents<'a>(text: &'a str) -> Cow<'a, str> {
+    // Fast path: if all ASCII, no accents possible
+    if text.bytes().all(|b| b < 0x80) {
+        return Cow::Borrowed(text);
+    }
+
+    // Use ICU4X for fast NFD normalization
+    let nfd = icu_normalizer::DecomposingNormalizer::new_nfd();
+    let normalized = nfd.normalize(text);
+
+    // Filter out combining marks (accents) using fast inline check
+    // Most combining marks are in range U+0300-U+036F (Combining Diacritical Marks)
+    // and U+0080-U+00FF doesn't contain combining marks
+    let result: String = normalized
+        .chars()
+        .filter(|&c| !is_combining_mark(c))
+        .collect();
+
+    Cow::Owned(result)
+}
+
+/// Fast check for combining marks (Unicode category Mn - NonspacingMark).
+/// Uses inline range checks for common ranges before falling back to full lookup.
+#[inline]
+fn is_combining_mark(c: char) -> bool {
+    let cp = c as u32;
+
+    // Fast path: ASCII and Latin-1 Supplement never have combining marks
+    if cp < 0x0300 {
+        return false;
+    }
+
+    // Common combining mark ranges (covers ~95% of combining marks in real text)
+    // U+0300-U+036F: Combining Diacritical Marks
+    // U+0483-U+0489: Cyrillic combining marks
+    // U+0591-U+05BD, U+05BF, U+05C1-U+05C2, U+05C4-U+05C5, U+05C7: Hebrew
+    // U+0610-U+061A, U+064B-U+065F, U+0670: Arabic
+    if cp <= 0x036F {
+        return true; // U+0300-U+036F
+    }
+
+    // For other ranges, use full Unicode lookup
+    // This is rare in typical text
+    get_general_category(c) == GeneralCategory::NonspacingMark
+}
+
+/// Fused BERT uncased normalization: clean_text + strip_accents + lowercase in one pass.
+///
+/// This is significantly faster than applying each transformation separately because:
+/// 1. Single pass over the text instead of 3 passes
+/// 2. Single allocation instead of up to 3 allocations
+/// 3. Better cache locality
+/// 4. Uses ICU4X for fast NFD normalization (~12x faster than unicode-normalization)
+///
+/// For pure ASCII lowercase text, returns `Cow::Borrowed` (zero allocation).
+/// Lookup table for bytes that need processing in bert_uncased_normalize.
+/// true = needs work (non-ASCII, uppercase, control char)
+static NEEDS_BERT_NORMALIZE: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0u16;
+    while i < 256 {
+        let b = i as u8;
+        // Non-ASCII (high bit set)
+        // Uppercase A-Z
+        // Control chars (< 0x20) except tab (0x09), newline (0x0A), CR (0x0D)
+        // Null byte
+        table[i as usize] = b >= 0x80
+            || (b >= b'A' && b <= b'Z')
+            || (b < 0x20 && b != 0x09 && b != 0x0A && b != 0x0D)
+            || b == 0
+            || b == 0x7F;
+        i += 1;
+    }
+    table
+};
+
+pub fn bert_uncased_normalize(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+
+    // Fast path: no byte needs work (`\t \n \r` stay; the Bert
+    // pretokenizer splits on them as on spaces)
+    if !bytes.iter().any(|&b| NEEDS_BERT_NORMALIZE[b as usize]) {
+        return Cow::Borrowed(text);
+    }
+
+    // Long ASCII runs map byte by byte; the rest is decomposed in segments
+    // that start and end at a non-ASCII run (NFD never reaches across an
+    // ASCII char: ASCII chars are starters that decompose to themselves, and
+    // canonical reordering only moves non-starters within a run of them). A
+    // curly quote in English text used to send the whole text through NFD;
+    // non-Latin words split by single spaces still take one NFD per stretch,
+    // since gaps under `BERT_ASCII_GAP` bytes stay inside the segment.
+    let mut result = String::with_capacity(text.len() + text.len() / 8);
+    let nfd = icu_normalizer::DecomposingNormalizer::new_nfd();
+    // From byte 0: the ASCII prefix maps `\t \n \r` to spaces too, as an
+    // owned result always has.
+    let mut i = 0;
+    while i < bytes.len() {
+        let ascii_end = bytes[i..].iter().position(|&b| b >= 0x80).map_or(bytes.len(), |n| i + n);
+        // SAFETY: only ASCII bytes are added.
+        bert_uncased_ascii_into(&bytes[i..ascii_end], unsafe { result.as_mut_vec() });
+        if ascii_end == bytes.len() {
+            break;
+        }
+        // The segment ends before the first `BERT_ASCII_GAP` ASCII bytes in
+        // a row (or at the end of the text).
+        let mut j = ascii_end;
+        let mut ascii_run = 0;
+        while j < bytes.len() && ascii_run < BERT_ASCII_GAP {
+            ascii_run = if bytes[j] < 0x80 { ascii_run + 1 } else { 0 };
+            j += 1;
+        }
+        let run_end = j - ascii_run;
+        // Both ends sit next to ASCII bytes (or the text's ends), so they are
+        // char boundaries.
+        let run = &text[ascii_end..run_end];
+        // One String per segment: `normalize` beats `normalize_iter`
+        // (char by char) by 10-20% on non-Latin text despite the allocation.
+        for c in nfd.normalize(run).chars() {
+            bert_uncased_push(&mut result, c);
+        }
+        i = run_end;
+    }
+
+    Cow::Owned(result)
+}
+
+/// The BertUncased output of an ASCII byte: lowercase letters, `\t \n \r`
+/// as a space, and `BERT_DROP` for controls and DEL (HF removes every Cc
+/// char but those three).
+static BERT_ASCII: [u8; 128] = {
+    let mut table = [0u8; 128];
+    let mut i = 0;
+    while i < 128 {
+        let b = i as u8;
+        table[i] = match b {
+            b'\t' | b'\n' | b'\r' => b' ',
+            0..=0x1F | 0x7F => BERT_DROP,
+            b'A'..=b'Z' => b + 32,
+            _ => b,
+        };
+        i += 1;
+    }
+    table
+};
+const BERT_DROP: u8 = 0xFF;
+
+/// ASCII gaps shorter than this between non-ASCII runs are decomposed with
+/// them rather than mapped on their own (see `bert_uncased_normalize`).
+const BERT_ASCII_GAP: usize = 64;
+
+/// Map ASCII `run` through [`BERT_ASCII`] onto `out`, branch-free.
+#[inline(always)]
+fn bert_uncased_ascii_into(run: &[u8], out: &mut Vec<u8>) {
+    out.reserve(run.len());
+    let start = out.len();
+    let dst = out.spare_capacity_mut();
+    let mut n = 0;
+    for &b in run {
+        let m = BERT_ASCII[b as usize];
+        dst[n].write(m);
+        n += (m != BERT_DROP) as usize;
+    }
+    // SAFETY: the first `n` spare bytes were written.
+    unsafe { out.set_len(start + n) };
+}
+
+/// Push one char of NFD text: accents (Mn) and controls dropped, whitespace
+/// as a space, CJK ideographs padded with spaces, the rest lowercased. One
+/// general-category lookup decides what `is_combining_mark`, `is_control` and
+/// `is_bert_whitespace` would, in that order.
+#[inline(always)]
+fn bert_uncased_push(result: &mut String, c: char) {
+    if c.is_ascii() {
+        let m = BERT_ASCII[c as usize];
+        if m != BERT_DROP {
+            result.push(m as char);
+        }
+        return;
+    }
+    if (0x300..=0x36F).contains(&(c as u32)) || c == '\u{FFFD}' {
+        return;
+    }
+    match get_general_category(c) {
+        GeneralCategory::NonspacingMark
+        | GeneralCategory::Control
+        | GeneralCategory::Format
+        | GeneralCategory::PrivateUse => {}
+        GeneralCategory::SpaceSeparator => result.push(' '),
+        // handle_chinese_chars (NFD maps CJK compatibility ideographs to
+        // unified ones, still in range)
+        _ if is_chinese_char(c) => push_padding_cjk(result, c),
+        _ => {
+            for lc in c.to_lowercase() {
+                result.push(lc);
+            }
+        }
+    }
+}
+
+/// Fast find-and-replace using SIMD-accelerated memchr/memmem.
+///
+/// Replaces all occurrences of `needle` with `replacement` in `text`.
+/// Returns `Cow::Borrowed` when no matches are found (zero allocation).
+///
+/// # Example
+///
+/// ```
+/// use tokie::normalizer::fnr;
+/// use std::borrow::Cow;
+///
+/// let result = fnr("hello world", "world", "rust");
+/// assert_eq!(result, "hello rust");
+///
+/// // No match - returns borrowed
+/// let result = fnr("hello", "xyz", "abc");
+/// assert!(matches!(result, Cow::Borrowed(_)));
+/// ```
+#[inline]
+pub fn fnr<'a>(text: &'a str, needle: &str, replacement: &str) -> Cow<'a, str> {
+    use memchr::memmem;
+
+    // Edge cases
+    if needle.is_empty() || text.is_empty() {
+        return Cow::Borrowed(text);
+    }
+
+    let finder = memmem::Finder::new(needle.as_bytes());
+    let text_bytes = text.as_bytes();
+
+    // Fast path: check if needle exists at all
+    if finder.find(text_bytes).is_none() {
+        return Cow::Borrowed(text);
+    }
+
+    // Estimate capacity: if replacement is shorter, we save space; if longer, we need more
+    let size_diff = replacement.len() as isize - needle.len() as isize;
+    let estimated_cap = if size_diff > 0 {
+        // Rough estimate: assume ~2 matches on average
+        text.len() + (size_diff as usize * 2)
+    } else {
+        text.len()
+    };
+
+    let mut result = String::with_capacity(estimated_cap);
+    let mut last_end = 0;
+
+    // Iterate over all matches (positions are absolute to the full text)
+    for pos in finder.find_iter(text_bytes) {
+        result.push_str(&text[last_end..pos]);
+        result.push_str(replacement);
+        last_end = pos + needle.len();
+    }
+
+    // Add remaining text
+    result.push_str(&text[last_end..]);
+
+    Cow::Owned(result)
+}
+
+/// Fast find-and-replace with precomputed finder for repeated searches.
+///
+/// Use this when searching for the same needle across multiple texts.
+///
+/// # Example
+///
+/// ```
+/// use tokie::normalizer::FnrFinder;
+///
+/// let finder = FnrFinder::new("foo");
+/// let result1 = finder.replace("foo bar foo", "baz");
+/// let result2 = finder.replace("no match here", "baz");
+///
+/// assert_eq!(result1, "baz bar baz");
+/// assert_eq!(result2, "no match here");
+/// ```
+pub struct FnrFinder<'n> {
+    needle: &'n str,
+    finder: memchr::memmem::Finder<'n>,
+}
+
+impl<'n> FnrFinder<'n> {
+    /// Create a new finder for the given needle.
+    #[inline]
+    pub fn new(needle: &'n str) -> Self {
+        Self {
+            needle,
+            finder: memchr::memmem::Finder::new(needle.as_bytes()),
+        }
+    }
+
+    /// Replace all occurrences of the needle with replacement.
+    #[inline]
+    pub fn replace<'a>(&self, text: &'a str, replacement: &str) -> Cow<'a, str> {
+        if self.needle.is_empty() || text.is_empty() {
+            return Cow::Borrowed(text);
+        }
+
+        let text_bytes = text.as_bytes();
+
+        // Fast path: check if needle exists
+        if self.finder.find(text_bytes).is_none() {
+            return Cow::Borrowed(text);
+        }
+
+        let size_diff = replacement.len() as isize - self.needle.len() as isize;
+        let estimated_cap = if size_diff > 0 {
+            text.len() + (size_diff as usize * 2)
+        } else {
+            text.len()
+        };
+
+        let mut result = String::with_capacity(estimated_cap);
+        let mut last_end = 0;
+
+        for pos in self.finder.find_iter(text_bytes) {
+            result.push_str(&text[last_end..pos]);
+            result.push_str(replacement);
+            last_end = pos + self.needle.len();
+        }
+
+        result.push_str(&text[last_end..]);
+
+        Cow::Owned(result)
+    }
+
+    /// Check if the needle exists in the text without allocating.
+    #[inline]
+    pub fn contains(&self, text: &str) -> bool {
+        self.finder.find(text.as_bytes()).is_some()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The previous `bert_uncased_normalize` (whole-text NFD whenever any
+    /// byte is non-ASCII), with DEL dropped as HF does.
+    fn bert_uncased_reference(text: &str) -> Cow<'_, str> {
+        let bytes = text.as_bytes();
+
+        // Fast lookup-table scan to find first byte needing work
+        let first_problem = bytes.iter().position(|&b| NEEDS_BERT_NORMALIZE[b as usize]);
+
+        // Fast path: no work needed
+        let first_pos = match first_problem {
+            None => return Cow::Borrowed(text),
+            Some(pos) => pos,
+        };
+
+        // Check if we have non-ASCII (need Unicode processing)
+        let has_non_ascii = bytes[first_pos] >= 0x80
+            || bytes[first_pos..].iter().any(|&b| b >= 0x80);
+
+        // Pre-allocate result
+        let mut result = String::with_capacity(text.len());
+
+        if has_non_ascii {
+            // Use ICU4X for fast NFD normalization
+            let nfd = icu_normalizer::DecomposingNormalizer::new_nfd();
+            let normalized = nfd.normalize(text);
+
+            // Process NFD-normalized text: filter accents, clean, lowercase
+            for c in normalized.chars() {
+                // Skip combining marks (accents) - use fast inline check
+                if is_combining_mark(c) {
+                    continue;
+                }
+                // Skip control characters
+                if is_control(c) || c == '\0' || c == '\u{FFFD}' {
+                    continue;
+                }
+                // Normalize whitespace to space
+                if is_bert_whitespace(c) {
+                    result.push(' ');
+                } else if c.is_ascii() {
+                    // Inline ASCII lowercase (faster than c.to_lowercase())
+                    if c >= 'A' && c <= 'Z' {
+                        result.push((c as u8 | 0x20) as char);
+                    } else {
+                        result.push(c);
+                    }
+                } else if is_chinese_char(c) {
+                    // handle_chinese_chars (NFD maps CJK compatibility
+                    // ideographs to unified ones, still in range)
+                    push_padding_cjk(&mut result, c);
+                } else {
+                    // Unicode lowercase
+                    for lc in c.to_lowercase() {
+                        result.push(lc);
+                    }
+                }
+            }
+        } else {
+            // ASCII-only path. (The old code copied this prefix unchanged,
+            // keeping `\t \n \r` that it mapped everywhere else; HF maps them all.)
+            for &b in &bytes[..first_pos] {
+                result.push(if matches!(b, b'\t' | b'\n' | b'\r') { ' ' } else { b as char });
+            }
+
+            for &b in &bytes[first_pos..] {
+                // Skip control characters (except tab/newline/cr)
+                if b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r' {
+                    continue;
+                }
+                if b == 0 || b == 0x7F {
+                    continue;
+                }
+                // Normalize whitespace
+                if b == b'\t' || b == b'\n' || b == b'\r' {
+                    result.push(' ');
+                } else if b >= b'A' && b <= b'Z' {
+                    // Lowercase ASCII
+                    result.push((b + 32) as char);
+                } else {
+                    result.push(b as char);
+                }
+            }
+        }
+
+        Cow::Owned(result)
+    }
+
+    #[test]
+    fn bert_uncased_runs_match_whole_text_nfd() {
+        let atoms = [
+            "a", "Z", "Hello", " ", "\t", "\n", "\r", "\0", "\u{7f}", "\u{1}", "é", "e\u{301}", "\u{301}\u{323}",
+            "É", "ﬁ", "Ⅻ", "日本", "中", "한국", "\u{1100}\u{1161}", "\u{ad}", "\u{200b}", "\u{a0}", "\u{3000}", "“q”",
+            "İ", "ẞ", "\u{fffd}", "😀", "\u{e000}",
+        ];
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            for k in 0..(x % 12) {
+                text.push_str(atoms[((x >> (k * 5)) % atoms.len() as u64) as usize]);
+            }
+            assert_eq!(bert_uncased_normalize(&text), bert_uncased_reference(&text), "{text:?}");
+        }
+    }
+
+    /// The old three passes of `sentencepiece_precompiled_normalize`:
+    /// charsmap transform, whitespace step, metaspace step.
+    fn precompiled_reference(cm: &PrecompiledCharsmap, whitespace_split: bool, text: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        let mut t = String::new();
+        cm.normalize_into(text, &mut t);
+        if whitespace_split {
+            let collapsed = collapse_and_strip_whitespace(&t);
+            if collapsed.is_empty() {
+                return String::new();
+            }
+            std::iter::once('▁').chain(collapsed.chars().map(|c| if c == ' ' { '▁' } else { c })).collect()
+        } else {
+            let mut r = String::new();
+            if !(t.starts_with(' ') || t.starts_with('▁')) {
+                r.push('▁');
+            }
+            let mut prev = false;
+            for c in t.chars() {
+                if c == ' ' {
+                    if !prev {
+                        r.push('▁');
+                    }
+                    prev = true;
+                } else {
+                    r.push(c);
+                    prev = false;
+                }
+            }
+            r
+        }
+    }
+
+    #[test]
+    fn precompiled_one_pass_matches_three_passes() {
+        let cm = PrecompiledCharsmap::from_blob(&[0, 0, 0, 0]).unwrap();
+        let atoms = [
+            "a", "Z", "1", ".", " ", "  ", "\t", "\n", "\r", "\r\n", "\u{b}", "\u{c}", "\u{85}", "\u{a0}", "\u{3000}",
+            "▁", "é", "e\u{301}", "\u{301}", "日本", "👍🏽", "\u{200d}", "\0", "x\u{301} ",
+        ];
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            for k in 0..(x % 12) {
+                text.push_str(atoms[((x >> (k * 5)) % atoms.len() as u64) as usize]);
+            }
+            for split in [true, false] {
+                let got = sentencepiece_precompiled_normalize(&cm, split, &text);
+                assert_eq!(got, precompiled_reference(&cm, split, &text), "{text:?} split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fnr_basic() {
+        // Single replacement
+        let result = fnr("hello world", "world", "rust");
+        assert_eq!(result, "hello rust");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_fnr_multiple() {
+        // Multiple replacements
+        let result = fnr("foo bar foo baz foo", "foo", "x");
+        assert_eq!(result, "x bar x baz x");
+    }
+
+    #[test]
+    fn test_fnr_no_match() {
+        // No match - should borrow
+        let result = fnr("hello world", "xyz", "abc");
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_fnr_empty_needle() {
+        // Empty needle - should borrow
+        let result = fnr("hello", "", "x");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_fnr_empty_text() {
+        // Empty text - should borrow
+        let result = fnr("", "foo", "bar");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_fnr_empty_replacement() {
+        // Empty replacement (deletion)
+        let result = fnr("hello world", " ", "");
+        assert_eq!(result, "helloworld");
+    }
+
+    #[test]
+    fn test_fnr_longer_replacement() {
+        // Replacement longer than needle
+        let result = fnr("a b c", " ", "---");
+        assert_eq!(result, "a---b---c");
+    }
+
+    #[test]
+    fn test_fnr_at_boundaries() {
+        // At start
+        let result = fnr("foo bar", "foo", "baz");
+        assert_eq!(result, "baz bar");
+
+        // At end
+        let result = fnr("bar foo", "foo", "baz");
+        assert_eq!(result, "bar baz");
+
+        // Entire string
+        let result = fnr("foo", "foo", "bar");
+        assert_eq!(result, "bar");
+    }
+
+    #[test]
+    fn test_fnr_unicode() {
+        let result = fnr("héllo wörld", "ö", "o");
+        assert_eq!(result, "héllo world");
+    }
+
+    #[test]
+    fn test_fnr_finder_reuse() {
+        let finder = FnrFinder::new("foo");
+
+        let r1 = finder.replace("foo bar foo", "baz");
+        assert_eq!(r1, "baz bar baz");
+
+        let r2 = finder.replace("no match", "baz");
+        assert!(matches!(r2, Cow::Borrowed(_)));
+        assert_eq!(r2, "no match");
+
+        assert!(finder.contains("has foo"));
+        assert!(!finder.contains("no match"));
+    }
+
+    #[test]
+    fn test_none_normalizer() {
+        let norm = Normalizer::None;
+        let text = "Hello World!";
+        let result = norm.normalize(text);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "Hello World!");
+    }
+
+    #[test]
+    fn test_bert_uncased_lowercase() {
+        let norm = Normalizer::BertUncased;
+
+        // Has uppercase - should allocate
+        let result = norm.normalize("Hello World!");
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result, "hello world!");
+
+        // Already lowercase - should borrow
+        let result = norm.normalize("hello world!");
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "hello world!");
+    }
+
+    #[test]
+    fn test_bert_uncased_unicode() {
+        let norm = Normalizer::BertUncased;
+
+        // Unicode uppercase - accents are stripped for uncased
+        let result = norm.normalize("HÉLLO");
+        assert_eq!(result, "hello"); // é → e (accent stripped)
+
+        // German sharp S stays as is (lowercase of ß is ß)
+        let result = norm.normalize("straße");
+        assert_eq!(result, "straße"); // ß has no accent to strip
+
+        // Test accent stripping
+        let result = norm.normalize("café résumé naïve");
+        assert_eq!(result, "cafe resume naive");
+    }
+
+    #[test]
+    fn test_nfc_normalizer() {
+        let norm = Normalizer::Nfc;
+
+        // Already NFC - should borrow
+        let result = norm.normalize("hello");
+        assert!(matches!(result, Cow::Borrowed(_)));
+
+        // NFD decomposed é (e + combining acute) -> NFC é
+        let nfd = "e\u{0301}"; // e + combining acute accent
+        let result = norm.normalize(nfd);
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result, "é");
+    }
+
+    #[test]
+    fn test_bert_cased() {
+        let norm = Normalizer::BertCased;
+        let text = "Hello World!";
+        let result = norm.normalize(text);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "Hello World!"); // No change
+    }
+
+    #[test]
+    fn test_bert_clean_keeps_unassigned() {
+        // Matches HF: Cc/Cf/Co are dropped, unassigned code points are kept.
+        let norm = Normalizer::BertCased;
+        assert_eq!(norm.normalize("a\u{5FF}b\u{378}"), "a\u{5FF}b\u{378}");
+        assert_eq!(norm.normalize("a\u{200B}\u{E000}\u{7F}b"), "ab");
+    }
+
+    #[test]
+    fn test_sentencepiece_lowercase_keeps_unassigned() {
+        // HF albert-base-v2 normalizer: "a\u{5FF}b\u{378}c" is unchanged.
+        let norm = Normalizer::SentencePieceLowercase;
+        assert_eq!(norm.normalize("a\u{5FF}b\u{378}c"), "▁a\u{5FF}b\u{378}c");
+    }
+
+    #[test]
+    fn test_bert_cjk_padding() {
+        // Expected values from HF `BertNormalizer(lowercase=..).normalize_str`.
+        let cases: &[(&str, &str, &str)] = &[
+            ("中文", " 中  文 ", " 中  文 "),
+            ("Ab中C", "Ab 中 C", "ab 中 c"),
+            // CJK compatibility ideograph: NFD (uncased) maps it to U+8C48.
+            ("x\u{F900}y", "x \u{F900} y", "x \u{8C48} y"),
+            ("\u{3400}\u{20000}\u{2A700}\u{2B740}", " \u{3400}  \u{20000}  \u{2A700}  \u{2B740} ", " \u{3400}  \u{20000}  \u{2A700}  \u{2B740} "),
+            // 0x2B820..=0x2B91F is outside HF's ranges: not padded.
+            ("a\u{2B820}\u{2B91F}b", "a\u{2B820}\u{2B91F}b", "a\u{2B820}\u{2B91F}b"),
+            ("a\u{2B920}b", "a \u{2B920} b", "a \u{2B920} b"),
+            ("a\u{2CEAF}\u{2CEB0}b", "a \u{2CEAF} \u{2CEB0}b", "a \u{2CEAF} \u{2CEB0}b"),
+            // Hiragana / Hangul are not padded (uncased NFD splits Hangul).
+            ("Ｈiあ한\u{2F800}", "Ｈiあ한 \u{2F800} ", "ｈiあ\u{1112}\u{1161}\u{11AB} \u{4E3D} "),
+            ("Café\t中\u{0}", "Café  中 ", "cafe  中 "),
+        ];
+        for &(input, cased, uncased) in cases {
+            assert_eq!(Normalizer::BertCased.normalize(input), cased, "cased {input:?}");
+            assert_eq!(Normalizer::BertUncased.normalize(input), uncased, "uncased {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_lowercase_only() {
+        let norm = Normalizer::Lowercase;
+        assert!(matches!(norm.normalize("hello 中文"), Cow::Borrowed(_)));
+        assert_eq!(norm.normalize("HeLLo"), "hello");
+        // No CJK padding, control stripping or accent stripping.
+        assert_eq!(norm.normalize("HÉ中\u{0}\tΣΑΣ"), "hé中\u{0}\tσασ");
+    }
+}
