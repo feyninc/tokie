@@ -28,6 +28,10 @@ fn bert_uncased_is_one_pass() {
     // U+F900 decomposes to U+8C48. The spaces are the CJK padding.
     assert_eq!(apply("\u{F900}"), " \u{8C48} ");
     assert_eq!(apply("\u{2F800}"), " \u{4E3D} ");
+    // Extension E starts at U+2B820. The old range began at U+2B920.
+    assert_eq!(apply("\u{2B820}"), " \u{2B820} ");
+    assert_eq!(apply("\u{2B91F}"), " \u{2B91F} ");
+    assert_eq!(apply("\u{2CEB0}"), "\u{2CEB0}");
     assert_eq!(apply("\u{3040}"), "");
     assert_eq!(apply("\u{3097}"), "");
     assert_eq!(apply("\u{3098}"), "");

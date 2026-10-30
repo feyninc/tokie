@@ -330,7 +330,7 @@ fn other_cjk(c: char) -> bool {
             | 0x20000..=0x2A6DF
             | 0x2A700..=0x2B73F
             | 0x2B740..=0x2B81F
-            | 0x2B920..=0x2CEAF
+            | 0x2B820..=0x2CEAF
             | 0xF900..=0xFAFF
             | 0x2F800..=0x2FA1F
     )
