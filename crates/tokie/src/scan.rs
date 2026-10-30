@@ -34,6 +34,11 @@ pub(crate) struct Scan {
     /// does not probe the pair table. The table is several megabytes and
     /// knocks the automaton out of the cache.
     merges: MergeBits,
+    /// One word per token. Bits set are partners of that token's right spine.
+    /// `u64::MAX` means the spine has too many partners to filter, and the
+    /// climb runs. A miss is a stable boundary: the climb's merge probes are
+    /// random loads, and almost every Japanese pair is stable.
+    stable: Box<[u64]>,
 }
 
 /// Bloom filter of real merge pairs. False positives still check the table.
@@ -154,12 +159,14 @@ impl Scan {
                 split[id as usize] = Split { left, right };
             }
         }
+        let stable = spine_blooms(&split, pairs);
         Some(Self {
             matcher,
             next_prefix,
             lengths,
             split: split.into_boxed_slice(),
             merges: MergeBits::from_pairs(pairs),
+            stable,
         })
     }
 
@@ -201,7 +208,7 @@ impl Scan {
                         let end_pos = pos + token_len;
                         let reachable = end_pos <= n && bit_set(bits, end_pos);
                         let compatible = last.is_none_or(|prev| {
-                            memo_probe(memo, pairs, &self.split, &self.merges, prev, token)
+                            memo_probe(memo, pairs, &self.split, &self.merges, &self.stable, prev, token)
                         });
                         if reachable && compatible && token_len > 0 {
                             tokens.push(token);
@@ -277,7 +284,7 @@ impl Scan {
                 let end_pos = pos + token_len;
                 let reachable = end_pos <= n && ((bits[end_pos / 64] >> (end_pos % 64)) & 1) == 1;
                 let compatible = last.is_none_or(|prev| {
-                    memo_probe(memo, pairs, &self.split, &self.merges, prev, token)
+                    memo_probe(memo, pairs, &self.split, &self.merges, &self.stable, prev, token)
                 });
                 if reachable && compatible && token_len > 0 {
                     tokens[ntok] = token;
@@ -522,6 +529,7 @@ fn memo_probe(
     pairs: &Pairs,
     split: &[Split],
     merges: &MergeBits,
+    stable: &[u64],
     left: u32,
     right: u32,
 ) -> bool {
@@ -532,7 +540,7 @@ fn memo_probe(
     let packed = ((left as u64) << 32) | right as u64;
     let stored = packed.wrapping_add(1);
     if stored == 0 {
-        return match valid_pair(pairs, split, merges, left, right) {
+        return match valid_pair(pairs, split, merges, stable, left, right) {
             Some(ok) => ok,
             None => {
                 memo.stuck = true;
@@ -544,7 +552,7 @@ fn memo_probe(
     if memo.key[slot] == stored {
         return (memo.bit[slot / 64] >> (slot % 64)) & 1 == 1;
     }
-    let Some(ok) = valid_pair(pairs, split, merges, left, right) else {
+    let Some(ok) = valid_pair(pairs, split, merges, stable, left, right) else {
         memo.stuck = true;
         return false;
     };
@@ -559,13 +567,92 @@ fn memo_probe(
     ok
 }
 
+fn spine_blooms(split: &[Split], pairs: &Pairs) -> Box<[u64]> {
+    let n = split.len();
+    let mut head = vec![u32::MAX; n];
+    let mut next = Vec::with_capacity(pairs.rows().len());
+    let mut partner = Vec::with_capacity(pairs.rows().len());
+    for &(left, right, _, _) in pairs.rows() {
+        if (left as usize) >= n {
+            continue;
+        }
+        let slot = next.len() as u32;
+        next.push(head[left as usize]);
+        partner.push(right);
+        head[left as usize] = slot;
+    }
+    let mut stable = vec![0u64; n];
+    for id in 0..n {
+        let mut bloom = 0u64;
+        let mut count = 0u32;
+        let mut cur = id as u32;
+        for _ in 0..32 {
+            let mut link = head[cur as usize];
+            while link != u32::MAX {
+                count += 1;
+                if count > 8 {
+                    bloom = u64::MAX;
+                    break;
+                }
+                let other = partner[link as usize];
+                bloom |= 1u64 << ((other.wrapping_mul(0x9E37_79B9)) & 63);
+                bloom |= 1u64 << ((other.wrapping_mul(0x85EB_CA6B)) & 63);
+                link = next[link as usize];
+            }
+            if bloom == u64::MAX {
+                break;
+            }
+            let child = split[cur as usize].right;
+            if child == cur {
+                break;
+            }
+            cur = child;
+        }
+        if split[cur as usize].right != cur {
+            bloom = u64::MAX;
+        }
+        stable[id] = bloom;
+    }
+    stable.into_boxed_slice()
+}
+
+/// `Some(true)` when no node on `right`'s left spine merges with `left`'s
+/// right spine. Anything else climbs. A hit in the bloom can be a partner
+/// the rank limit would ignore, so it is not taken as unstable.
+fn fast_stable(stable: &[u64], split: &[Split], left: u32, right: u32) -> Option<bool> {
+    let bloom = *stable.get(left as usize)?;
+    if bloom == u64::MAX {
+        return None;
+    }
+    let mut node = right;
+    for _ in 0..8 {
+        let Some(row) = split.get(node as usize) else {
+            return None;
+        };
+        let bit1 = (node.wrapping_mul(0x9E37_79B9)) & 63;
+        let bit2 = (node.wrapping_mul(0x85EB_CA6B)) & 63;
+        if (bloom >> bit1) & 1 == 1 && (bloom >> bit2) & 1 == 1 {
+            return None;
+        }
+        if row.left == node {
+            return Some(true);
+        }
+        node = row.left;
+    }
+    None
+}
+
 fn valid_pair(
     pairs: &Pairs,
     split: &[Split],
     merges: &MergeBits,
+    stable: &[u64],
     mut left: u32,
     mut right: u32,
 ) -> Option<bool> {
+    if fast_stable(stable, split, left, right) == Some(true) {
+        return Some(true);
+    }
     let mut limit = u32::MAX;
     for _ in 0..128 {
         if merges.may_hold(left, right)
@@ -724,6 +811,42 @@ mod tests {
     }
 
     #[test]
+    fn a_stable_bloom_miss_matches_the_climb() {
+        let pairs = rules();
+        let mut byte_ids = [u32::MAX; 256];
+        byte_ids[b'a' as usize] = 0;
+        byte_ids[b'b' as usize] = 1;
+        byte_ids[b'c' as usize] = 2;
+        let tokens: Vec<Option<String>> = ["a", "b", "c", "ab", "abc", "aa"]
+            .into_iter()
+            .map(|text| Some(text.to_string()))
+            .collect();
+        let scan = Scan::build(&tokens, &pairs, &byte_ids).expect("monotone vocab walks");
+        let forced = vec![u64::MAX; scan.stable.len()];
+        for left in 0..scan.split.len() as u32 {
+            for right in 0..scan.split.len() as u32 {
+                let climb = super::valid_pair(
+                    &pairs,
+                    &scan.split,
+                    &scan.merges,
+                    &forced,
+                    left,
+                    right,
+                );
+                let fast = super::valid_pair(
+                    &pairs,
+                    &scan.split,
+                    &scan.merges,
+                    &scan.stable,
+                    left,
+                    right,
+                );
+                assert_eq!(fast, climb, "{left} {right}");
+            }
+        }
+    }
+
+    #[test]
     fn the_pair_memo_follows_the_merge_table() {
         let mut memo = super::Memo {
             key: vec![1; super::MEMO_LEN],
@@ -742,5 +865,81 @@ mod tests {
         super::bind_memo(&mut memo, &second);
         assert_eq!(memo.key[3], 0);
         assert_ne!(first.stamp(), second.stamp());
+    }
+
+    #[test]
+    fn the_pair_memo_does_not_answer_for_another_model() {
+        let mut byte_ids = [u32::MAX; 256];
+        byte_ids[b'a' as usize] = 0;
+        byte_ids[b'b' as usize] = 1;
+        let merged = Pairs::from_list(&[(0, 1, 0, 2)]);
+        let tokens_ab: Vec<Option<String>> = ["a", "b", "ab"].into_iter().map(|text| Some(text.to_string())).collect();
+        let scan_ab = Scan::build(&tokens_ab, &merged, &byte_ids).expect("ab merges");
+        let doubled = Pairs::from_list(&[(0, 0, 0, 2)]);
+        let tokens_aa: Vec<Option<String>> = ["a", "b", "aa"].into_iter().map(|text| Some(text.to_string())).collect();
+        let scan_aa = Scan::build(&tokens_aa, &doubled, &byte_ids).expect("aa merges");
+        let piece = b"ab".repeat(40);
+        let mut expect_ab: Vec<u32> = piece.iter().map(|byte| byte_ids[*byte as usize]).collect();
+        merge_ids(&mut expect_ab, &merged);
+        let mut expect_aa: Vec<u32> = piece.iter().map(|byte| byte_ids[*byte as usize]).collect();
+        merge_ids(&mut expect_aa, &doubled);
+        assert_ne!(expect_ab, expect_aa);
+
+        let mut walked = Vec::new();
+        assert!(scan_ab.try_encode(&merged, &piece, &mut walked));
+        assert_eq!(walked, expect_ab);
+        walked.clear();
+        assert!(scan_aa.try_encode(&doubled, &piece, &mut walked));
+        assert_eq!(walked, expect_aa);
+        walked.clear();
+        assert!(scan_ab.try_encode(&merged, &piece, &mut walked));
+        assert_eq!(walked, expect_ab);
+    }
+
+    #[test]
+    fn a_deep_spine_is_not_stored_as_illegal() {
+        let pairs = Pairs::from_list(&[]);
+        let merges = super::MergeBits::from_pairs(&pairs);
+        let mut split = Vec::with_capacity(200);
+        for id in 0..200u32 {
+            split.push(super::Split { left: id, right: id });
+        }
+        for id in 1..200u32 {
+            split[id as usize].right = id - 1;
+        }
+        let stable = vec![u64::MAX; split.len()];
+        assert_eq!(
+            super::valid_pair(&pairs, &split, &merges, &stable, 199, 0),
+            None
+        );
+        let mut memo = super::Memo {
+            key: vec![0; super::MEMO_LEN],
+            bit: vec![0; super::MEMO_LEN / 64],
+            owner: pairs.stamp(),
+            stuck: false,
+        };
+        assert!(!super::memo_probe(
+            &mut memo,
+            &pairs,
+            &split,
+            &merges,
+            &stable,
+            199,
+            0
+        ));
+        assert!(memo.stuck);
+        assert!(memo.key.iter().all(|slot| *slot == 0));
+        memo.stuck = false;
+        assert!(!super::memo_probe(
+            &mut memo,
+            &pairs,
+            &split,
+            &merges,
+            &stable,
+            199,
+            0
+        ));
+        assert!(memo.stuck);
+        assert!(memo.key.iter().all(|slot| *slot == 0));
     }
 }
