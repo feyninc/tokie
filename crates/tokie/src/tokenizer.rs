@@ -648,7 +648,11 @@ impl Tokenizer {
 
     fn batch_here(&mut self, texts: &[&str], ids: &mut Vec<u32>, ends: &mut Vec<usize>) -> Result<(), Error> {
         for text in texts {
-            self.encode(text, ids)?;
+            let at = ids.len();
+            if let Err(err) = self.encode(text, ids) {
+                ids.truncate(at);
+                return Err(err);
+            }
             ends.push(ids.len());
         }
         Ok(())
@@ -2314,6 +2318,8 @@ fn fill_region(tokenizer: &mut Tokenizer, texts: &[&str], region: &mut [std::mem
             let done = ends.len();
             for text in texts.iter().skip(done) {
                 if let Err(err) = tokenizer.encode(text, &mut spill) {
+                    // A failed text can leave a partial tail. Keep finished texts only.
+                    spill.truncate(ends.last().copied().unwrap_or(0));
                     return Fill { written: 0, ends, spill: Some(spill), error: Some(err.to_string()) };
                 }
                 ends.push(spill.len());
@@ -2367,21 +2373,32 @@ fn place(ids: &mut Vec<u32>, ends: &mut Vec<usize>, base: usize, budgets: &[usiz
 }
 
 fn place_spilled(ids: &mut Vec<u32>, ends: &mut Vec<usize>, base: usize, budgets: &[usize], fills: &[Fill]) -> Result<(), Error> {
+    // Copy region output out before `ids` grows. A spill is longer than its
+    // budget, so appending it at `ids.len()` overwrites the next region, and a
+    // reallocation keeps only `ids.len()` elements.
+    let mut saved = Vec::with_capacity(fills.len());
     let mut read = base;
     for (fill, budget) in fills.iter().zip(budgets) {
+        let mut tmp = Vec::new();
+        if fill.spill.is_none() && fill.written > 0 {
+            tmp = vec![0u32; fill.written];
+            // SAFETY: `read..read+written` was initialized in the reserved tail,
+            // and `ids` has not been resized yet.
+            unsafe { std::ptr::copy_nonoverlapping(ids.as_ptr().add(read), tmp.as_mut_ptr(), fill.written) };
+        }
+        saved.push(tmp);
+        read += budget;
+    }
+    for (fill, part) in fills.iter().zip(&saved) {
         let cursor = ids.len();
         if let Some(spill) = &fill.spill {
             ids.extend_from_slice(spill);
-        } else if fill.written > 0 {
-            let mut tmp = vec![0u32; fill.written];
-            // SAFETY: `read..read+written` was initialized in the reserved tail.
-            unsafe { std::ptr::copy_nonoverlapping(ids.as_ptr().add(read), tmp.as_mut_ptr(), fill.written) };
-            ids.extend_from_slice(&tmp);
+        } else {
+            ids.extend_from_slice(part);
         }
         for &end in &fill.ends {
             ends.push(cursor + end);
         }
-        read += budget;
         if let Some(err) = &fill.error {
             return Err(Error::new(err.clone()));
         }
@@ -2756,6 +2773,60 @@ mod tests {
         let n = ids.len();
         tok.batch(&[], &mut ids, &mut ends).unwrap();
         assert_eq!(ids.len(), n);
+
+        // The long text is its own chunk and spills. The next chunk is a single
+        // vocab piece, so a clobber of that region cannot look like the right ids.
+        let spilled = [long.as_str(), ".:.:"];
+        let (expect_spill, expect_spill_ends) = sequential(&mut tok, &spilled);
+        tok.threads(2);
+        ids.clear();
+        ends.clear();
+        tok.batch(&spilled, &mut ids, &mut ends).unwrap();
+        assert_eq!(ids, expect_spill);
+        assert_eq!(ends, expect_spill_ends);
+
+        ids = vec![99];
+        ends.clear();
+        tok.batch(&spilled, &mut ids, &mut ends).unwrap();
+        assert_eq!(ids[0], 99);
+        assert_eq!(&ids[1..], expect_spill.as_slice());
+        assert_eq!(ends, expect_spill_ends.iter().map(|end| end + 1).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn batch_error_keeps_finished_texts_only() {
+        const SPLIT: &str = r#"{
+            "model": {
+                "type": "BPE",
+                "ignore_merges": true,
+                "vocab": {".": 0, ":": 1, ".:": 2, ".:.:": 3},
+                "merges": [". :"]
+            },
+            "pre_tokenizer": {"type": "WhitespaceSplit"}
+        }"#;
+        let mut tok = Tokenizer::json(SPLIT).unwrap();
+        let mut alone = Vec::new();
+        let failed = tok.encode(".:.: x", &mut alone);
+        assert!(failed.is_err(), "ids {alone:?}");
+
+        let mut ids = vec![7];
+        let mut ends = Vec::new();
+        tok.threads(1);
+        let err = tok.batch(&[".:.:", ".:.: x"], &mut ids, &mut ends);
+        assert!(err.is_err());
+        assert_eq!(ids, vec![7, 3]);
+        assert_eq!(ends, vec![2]);
+
+        // The long text spills, then the failed text is in that same chunk.
+        let long = ".".repeat(300);
+        tok.threads(2);
+        ids = vec![7];
+        ends.clear();
+        let err = tok.batch(&[long.as_str(), ".:.: x", ".:.:"], &mut ids, &mut ends);
+        assert!(err.is_err());
+        assert_eq!(ids[0], 7);
+        assert_eq!(&ids[1..], vec![0u32; 300].as_slice(), "partial {ids:?} ends {ends:?}");
+        assert_eq!(ends, vec![301]);
     }
 }
 
