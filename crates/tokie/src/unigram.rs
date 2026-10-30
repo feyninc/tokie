@@ -91,6 +91,11 @@ struct Slot {
     set: bool,
 }
 
+std::thread_local! {
+    static SEG_ENDS: std::cell::RefCell<Vec<Slot>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SEG_PATH: std::cell::RefCell<Vec<(usize, usize, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Vocabulary trie used by [`crate::model::Model`].
 pub(crate) struct Lattice {
     nodes: Vec<Node>,
@@ -211,15 +216,27 @@ impl Lattice {
         if n == 0 {
             return;
         }
-        let mut ends = vec![
-            Slot {
-                start: 0,
-                id: 0,
-                score: 0.0,
-                set: false,
-            };
-            n + 1
-        ];
+        // One buffer per thread. A piece is a word, and the next piece of
+        // this worker would otherwise allocate the lattice again.
+        SEG_ENDS.with(|ends| {
+            SEG_PATH.with(|path| {
+                self.segment_in(text, out, &mut ends.borrow_mut(), &mut path.borrow_mut());
+            });
+        });
+    }
+
+    fn segment_in(&self, text: &[u8], out: &mut Vec<u32>, ends: &mut Vec<Slot>, path: &mut Vec<(usize, usize, u32)>) {
+        let n = text.len();
+        let fresh = Slot {
+            start: 0,
+            id: 0,
+            score: 0.0,
+            set: false,
+        };
+        ends.resize(n + 1, fresh);
+        for slot in ends.iter_mut() {
+            *slot = fresh;
+        }
         let mut starts = 0usize;
         while starts < n {
             let till = ends[starts].score;
@@ -267,7 +284,7 @@ impl Lattice {
             }
             starts += mblen;
         }
-        let mut path = Vec::new();
+        path.clear();
         let mut at = n;
         while at > 0 {
             let slot = &ends[at];

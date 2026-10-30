@@ -213,6 +213,16 @@ fn every_bmp_character_matches_the_regex() {
 }
 
 #[test]
+fn a_final_window_matches_the_regex() {
+    let res = regexes();
+    let tail = "Justice.\n\nSessions and his aides";
+    let pad = 64 - (tail.len() % 64);
+    let text = format!("{}{tail}", "a".repeat(pad % 64));
+    assert_eq!(text.len() % 64, 0);
+    assert_matches(&res, &text);
+}
+
+#[test]
 fn generated_text_matches_the_regex() {
     let res = regexes();
     let mut state = 0x1234_5678_u32;

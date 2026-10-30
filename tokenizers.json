@@ -477,7 +477,7 @@
     "encoder": "SentencePiece",
     "pretokenizer": "None",
     "normalizer": "Metaspace",
-    "supported": true,
+    "supported": false,
     "performance": null
   },
   {
@@ -551,15 +551,8 @@
     "encoder": "SentencePiece",
     "pretokenizer": "None",
     "normalizer": "Metaspace",
-    "supported": true,
-    "performance": {
-      "tokie_load_ms": 10.4,
-      "hf_load_ms": 29.7,
-      "load_speedup": 2.9,
-      "tokie_throughput_mbps": 20.3,
-      "hf_throughput_mbps": 2.0,
-      "throughput_speedup": 10.2
-    }
+    "supported": false,
+    "performance": null
   },
   {
     "provider": "Mistral",
@@ -1079,6 +1072,46 @@
     "encoder": "SentencePiece",
     "pretokenizer": "None",
     "normalizer": "Metaspace",
+    "supported": false,
+    "performance": null
+  },
+  {
+    "provider": "Google",
+    "model": "Gemma 3",
+    "vocab_size": 262144,
+    "encoder": "SentencePiece",
+    "pretokenizer": "None",
+    "normalizer": "Replace",
+    "supported": false,
+    "performance": null
+  },
+  {
+    "provider": "BAAI",
+    "model": "BGE M3",
+    "vocab_size": 250002,
+    "encoder": "Unigram",
+    "pretokenizer": "Metaspace",
+    "normalizer": "Precompiled",
+    "supported": false,
+    "performance": null
+  },
+  {
+    "provider": "Snowflake",
+    "model": "Arctic Embed v2",
+    "vocab_size": 250002,
+    "encoder": "Unigram",
+    "pretokenizer": "Metaspace",
+    "normalizer": "Precompiled",
+    "supported": false,
+    "performance": null
+  },
+  {
+    "provider": "MinishLab",
+    "model": "potion multilingual 128M",
+    "vocab_size": 500353,
+    "encoder": "Unigram",
+    "pretokenizer": "Metaspace",
+    "normalizer": "Precompiled",
     "supported": false,
     "performance": null
   }

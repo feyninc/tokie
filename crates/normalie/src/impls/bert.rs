@@ -126,28 +126,57 @@ fn push_island<const CLEAN: bool, const CJK: bool, const ACCENTS: bool, const LO
     island: &str,
     out: &mut String,
 ) {
-    let mut cleaned = String::with_capacity(island.len() + 8);
+    // An ideograph is never a control, a mark, or a lowercase mapping, and
+    // NFD does not decompose it. Emitting it directly skips the category
+    // search and the normalizer, which are the whole cost of a CJK island.
+    let mut pending = String::new();
     for c in island.chars() {
+        if CJK && is_cjk(c) {
+            finish::<ACCENTS, LOWER>(&mut pending, out);
+            out.push(' ');
+            out.push(c);
+            out.push(' ');
+            continue;
+        }
+        // Voiced kana decomposes to a base plus a mark, and uncased BERT drops
+        // the mark. The result is the base. Doing that here keeps a Japanese
+        // run off the normalizer, which was one call per voiced character.
+        if ACCENTS && LOWER && CLEAN && let Some(stripped) = kana_stripped(c) {
+            finish::<ACCENTS, LOWER>(&mut pending, out);
+            if let Some(base) = stripped {
+                out.push(base);
+            }
+            continue;
+        }
+        // A starter that NFD and lowercase leave alone is emitted as itself.
+        // The category search and the normalizer stay on the characters that
+        // actually change: marks, decompositions, and case folds.
+        if ACCENTS && LOWER && CLEAN && is_stable(c) {
+            finish::<ACCENTS, LOWER>(&mut pending, out);
+            out.push(c);
+            continue;
+        }
         if CLEAN && removes(c) {
             continue;
         }
         let c = if CLEAN && c.is_whitespace() { ' ' } else { c };
-        if CJK && is_cjk(c) {
-            cleaned.push(' ');
-            cleaned.push(c);
-            cleaned.push(' ');
+        if ACCENTS || LOWER {
+            pending.push(c);
         } else {
-            cleaned.push(c);
+            out.push(c);
         }
     }
-    if !ACCENTS && !LOWER {
-        out.push_str(&cleaned);
+    finish::<ACCENTS, LOWER>(&mut pending, out);
+}
+
+fn finish<const ACCENTS: bool, const LOWER: bool>(pending: &mut String, out: &mut String) {
+    if pending.is_empty() {
         return;
     }
     let source = if ACCENTS {
-        DecomposingNormalizerBorrowed::new_nfd().normalize(&cleaned)
+        DecomposingNormalizerBorrowed::new_nfd().normalize(pending)
     } else {
-        std::borrow::Cow::Borrowed(cleaned.as_str())
+        std::borrow::Cow::Borrowed(pending.as_str())
     };
     for c in source.chars() {
         if ACCENTS && c.is_mark_nonspacing() {
@@ -161,10 +190,110 @@ fn push_island<const CLEAN: bool, const CJK: bool, const ACCENTS: bool, const LO
             out.push(c);
         }
     }
+    pending.clear();
+}
+
+fn is_stable(c: char) -> bool {
+    let cp = c as u32;
+    if cp >= 0x10000 {
+        return false;
+    }
+    let rows = stable_rows();
+    (rows[(cp >> 6) as usize] >> (cp & 63)) & 1 == 1
+}
+
+fn stable_rows() -> &'static [u64; 1024] {
+    use std::sync::OnceLock;
+    static ROWS: OnceLock<[u64; 1024]> = OnceLock::new();
+    ROWS.get_or_init(|| {
+        let normalizer = DecomposingNormalizerBorrowed::new_nfd();
+        let mut rows = [0u64; 1024];
+        for cp in 0u32..0x10000 {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            if is_cjk(c) || removes(c) || c.is_whitespace() || c.is_mark_nonspacing() {
+                continue;
+            }
+            let mut buf = [0u8; 4];
+            let raw = c.encode_utf8(&mut buf);
+            if normalizer.normalize(raw) != raw as &str {
+                continue;
+            }
+            let mut lower = c.to_lowercase();
+            if lower.next() != Some(c) || lower.next().is_some() {
+                continue;
+            }
+            rows[(cp >> 6) as usize] |= 1u64 << (cp & 63);
+        }
+        rows
+    })
 }
 
 fn removes(c: char) -> bool {
     c == '\u{FFFD}' || (c != '\t' && c != '\n' && c != '\r' && c.is_other())
+}
+
+/// Hiragana and katakana under uncased BERT. `None` is not in the block.
+/// `Some(None)` is a combining mark, which the uncased pass drops. Anything
+/// else is the character NFD plus mark-stripping plus lowercase would emit.
+fn kana_stripped(c: char) -> Option<Option<char>> {
+    let cp = c as u32;
+    if !(0x3040..=0x30FF).contains(&cp) {
+        return None;
+    }
+    Some(match cp {
+        0x3099 | 0x309A => None,
+        0x304C => Some('\u{304B}'),
+        0x304E => Some('\u{304D}'),
+        0x3050 => Some('\u{304F}'),
+        0x3052 => Some('\u{3051}'),
+        0x3054 => Some('\u{3053}'),
+        0x3056 => Some('\u{3055}'),
+        0x3058 => Some('\u{3057}'),
+        0x305A => Some('\u{3059}'),
+        0x305C => Some('\u{305B}'),
+        0x305E => Some('\u{305D}'),
+        0x3060 => Some('\u{305F}'),
+        0x3062 => Some('\u{3061}'),
+        0x3065 => Some('\u{3064}'),
+        0x3067 => Some('\u{3066}'),
+        0x3069 => Some('\u{3068}'),
+        0x3070 | 0x3071 => Some('\u{306F}'),
+        0x3073 | 0x3074 => Some('\u{3072}'),
+        0x3076 | 0x3077 => Some('\u{3075}'),
+        0x3079 | 0x307A => Some('\u{3078}'),
+        0x307C | 0x307D => Some('\u{307B}'),
+        0x3094 => Some('\u{3046}'),
+        0x309E => Some('\u{309D}'),
+        0x30AC => Some('\u{30AB}'),
+        0x30AE => Some('\u{30AD}'),
+        0x30B0 => Some('\u{30AF}'),
+        0x30B2 => Some('\u{30B1}'),
+        0x30B4 => Some('\u{30B3}'),
+        0x30B6 => Some('\u{30B5}'),
+        0x30B8 => Some('\u{30B7}'),
+        0x30BA => Some('\u{30B9}'),
+        0x30BC => Some('\u{30BB}'),
+        0x30BE => Some('\u{30BD}'),
+        0x30C0 => Some('\u{30BF}'),
+        0x30C2 => Some('\u{30C1}'),
+        0x30C5 => Some('\u{30C4}'),
+        0x30C7 => Some('\u{30C6}'),
+        0x30C9 => Some('\u{30C8}'),
+        0x30D0 | 0x30D1 => Some('\u{30CF}'),
+        0x30D3 | 0x30D4 => Some('\u{30D2}'),
+        0x30D6 | 0x30D7 => Some('\u{30D5}'),
+        0x30D9 | 0x30DA => Some('\u{30D8}'),
+        0x30DC | 0x30DD => Some('\u{30DB}'),
+        0x30F4 => Some('\u{30A6}'),
+        0x30F7 => Some('\u{30EF}'),
+        0x30F8 => Some('\u{30F0}'),
+        0x30F9 => Some('\u{30F1}'),
+        0x30FA => Some('\u{30F2}'),
+        0x30FE => Some('\u{30FD}'),
+        _ => Some(c),
+    })
 }
 
 fn is_cjk(c: char) -> bool {

@@ -135,6 +135,12 @@ fn kind(ch: char) -> Kind {
     if ch.is_whitespace() {
         return Kind::Whitespace;
     }
+    // Unified ideographs are Other_Letter, so they never consult the category
+    // table. Chinese text is mostly this block.
+    let cp = u32::from(ch);
+    if (0x4E00..=0x9FFF).contains(&cp) {
+        return Kind::Caseless;
+    }
     match get_general_category(ch) {
         GeneralCategory::UppercaseLetter | GeneralCategory::TitlecaseLetter => Kind::Upper,
         GeneralCategory::LowercaseLetter => Kind::Lower,
@@ -510,10 +516,42 @@ fn decode(bytes: &[u8], i: usize) -> (char, usize) {
     } else {
         4
     };
+    if i + width <= bytes.len()
+        && let Some(cp) = scalar(bytes, i, width)
+        && let Some(ch) = char::from_u32(cp)
+        && ch.len_utf8() == width
+    {
+        return (ch, width);
+    }
     let end = (i + width).min(bytes.len());
     let rest = std::str::from_utf8(&bytes[i..end]).expect("piece boundary is a char boundary");
     let ch = rest.chars().next().expect("i is inside bytes");
     (ch, ch.len_utf8())
+}
+
+fn scalar(bytes: &[u8], i: usize, width: usize) -> Option<u32> {
+    let b0 = bytes[i] as u32;
+    let b1 = bytes[i + 1];
+    if b1 & 0xC0 != 0x80 {
+        return None;
+    }
+    let b1 = b1 as u32 & 0x3F;
+    if width == 2 {
+        return Some(((b0 & 0x1F) << 6) | b1);
+    }
+    let b2 = bytes[i + 2];
+    if b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let b2 = b2 as u32 & 0x3F;
+    if width == 3 {
+        return Some(((b0 & 0x0F) << 12) | (b1 << 6) | b2);
+    }
+    let b3 = bytes[i + 3];
+    if b3 & 0xC0 != 0x80 {
+        return None;
+    }
+    Some(((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | (b3 as u32 & 0x3F))
 }
 
 #[inline(always)]
@@ -747,7 +785,9 @@ fn bits<const CONTRACTIONS: bool, const DIGITS3: bool, const SLASH: bool, const 
         | ((leads & uni.lead2) & (seen_nonws >> 2))
         | ((leads & uni.lead3) & (seen_nonws >> 3))
         | ((leads & uni.lead4) & (seen_nonws >> 4));
-    if !next_ws {
+    // The byte after this window is content only when a byte is there.
+    // A run that reaches the end of the text stays one piece.
+    if !next_ws && !eof {
         split_ok |= (ws_lead1 & (1u64 << 63))
             | ((leads & uni.lead2) & (1u64 << 62))
             | ((leads & uni.lead3) & (1u64 << 61))
@@ -774,7 +814,13 @@ fn bits<const CONTRACTIONS: bool, const DIGITS3: bool, const SLASH: bool, const 
             let tail_bits = run & mask_from(q + 1);
             let tail_leads = tail_bits & leads;
             if tail_leads != 0 {
-                b_ws |= 1u64 << (63 - tail_leads.leading_zeros());
+                let last = 63 - tail_leads.leading_zeros();
+                // The last whitespace byte is its own piece when content
+                // follows. A run that reaches the end of the text stays whole.
+                let run_ends_text = eof && e >= 64 && !(tail_nonws && stop < 64);
+                if !run_ends_text {
+                    b_ws |= 1u64 << last;
+                }
             }
         }
         runs_n &= !run;

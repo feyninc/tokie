@@ -4,7 +4,9 @@
 pub mod bpe;
 pub mod cache;
 pub mod cut;
+mod fold;
 pub mod norm;
+mod scan;
 pub mod unigram;
 pub mod wordpiece;
 

@@ -36,8 +36,11 @@ fn roundtrip(json: &Path) {
 }
 
 fn temp_path() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let mut path = std::env::temp_dir();
-    path.push(format!("tokie-roundtrip-{}.tokie", std::process::id()));
+    path.push(format!("tokie-roundtrip-{}-{id}.tokie", std::process::id()));
     path
 }
 

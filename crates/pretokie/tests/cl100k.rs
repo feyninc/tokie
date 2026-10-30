@@ -151,6 +151,35 @@ fn every_bmp_character_matches_the_regex() {
 }
 
 #[test]
+fn a_final_window_matches_the_regex() {
+    let re = regex();
+    let tail = "Justice.\n\nSessions and his aides";
+    let pad = 64 - (tail.len() % 64);
+    let text = format!("{}{tail}", "a".repeat(pad % 64));
+    assert_eq!(text.len() % 64, 0);
+    assert_matches(&re, &text);
+}
+
+#[test]
+fn a_trailing_run_at_the_final_window_stays_whole() {
+    let re = regex();
+    let tail = "end\n\t   ";
+    let pad = (64 - (tail.len() % 64)) % 64;
+    let text = format!("{}{tail}", "a".repeat(pad));
+    assert_eq!(text.len() % 64, 0);
+    assert!(text.ends_with(' '));
+    assert_matches(&re, &text);
+}
+
+#[test]
+fn a_space_before_the_next_window_still_splits() {
+    let re = regex();
+    let text = format!("{} b", "a".repeat(63));
+    assert_eq!(text.len(), 65);
+    assert_matches(&re, &text);
+}
+
+#[test]
 fn generated_text_matches_the_regex() {
     let re = regex();
     let mut state = 0x1234_5678_u32;

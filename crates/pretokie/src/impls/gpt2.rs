@@ -347,9 +347,11 @@ fn ws_multibyte_splits<const SINGLE_DIGITS: bool>(
             | (w3 & (digit >> 3))
             | (w4 & (digit >> 4)));
     }
-    // A lead whose next byte sits past the window all look at `pos + 64`.
+    // A lead whose next byte sits past the window looks at `pos + 64`.
+    // At the end of the text there is no such byte. A run that reaches
+    // the end stays whole; a run with content after it already split above.
     let edge = (w1 & (1u64 << 63)) | (w2 & (1u64 << 62)) | (w3 & (1u64 << 61)) | (w4 & (1u64 << 60));
-    if edge != 0 {
+    if edge != 0 && pos + 64 < bytes.len() {
         let next_is_ws = byte_is_whitespace(bytes, pos + 64);
         let next_is_number = SINGLE_DIGITS && byte_is_number(bytes, pos + 64);
         if !next_is_ws && !next_is_number {
@@ -447,23 +449,29 @@ pub(crate) fn window<const ISA: u8, const SINGLE_DIGITS: bool>(
     };
     let content_start = !whitespace & !cont_same & !prefixed;
 
-    let split_ok = if eof || whitespace == 0 {
+    // Peel the last byte of a whitespace run when content follows it. That
+    // includes the final window: the end of the text only means there is
+    // no byte past the window to consult. A run that reaches the end stays
+    // whole, because nothing inside the window follows it.
+    let split_ok = if whitespace == 0 {
         0
     } else if cont == 0 {
         let mut split = whitespace & (!whitespace >> 1);
         if SINGLE_DIGITS {
             split &= !(digit >> 1);
         }
-        // SAFETY: `eof` is false, so `pos + 64` is inside `bytes`.
-        let next = unsafe { *bytes.get_unchecked(pos + 64) };
-        let next_is_ws = if next < 0x80 {
-            is_ascii_ws(next)
-        } else {
-            byte_is_whitespace(bytes, pos + 64)
-        };
-        let next_is_number = SINGLE_DIGITS && byte_is_number(bytes, pos + 64);
-        if !next_is_ws && !next_is_number {
-            split |= whitespace & (1u64 << 63);
+        if !eof {
+            // SAFETY: `eof` is false, so `pos + 64` is inside `bytes`.
+            let next = unsafe { *bytes.get_unchecked(pos + 64) };
+            let next_is_ws = if next < 0x80 {
+                is_ascii_ws(next)
+            } else {
+                byte_is_whitespace(bytes, pos + 64)
+            };
+            let next_is_number = SINGLE_DIGITS && byte_is_number(bytes, pos + 64);
+            if !next_is_ws && !next_is_number {
+                split |= whitespace & (1u64 << 63);
+            }
         }
         split
     } else {
@@ -581,6 +589,7 @@ mod tests {
         assert_pieces("  hello", &[" ", " hello"]);
         assert_pieces("   hello", &["  ", " hello"]);
         assert_pieces("hello\n\n", &["hello", "\n\n"]);
+        assert_pieces(".\n\nSessions", &[".", "\n", "\n", "Sessions"]);
         assert_pieces("hello  ", &["hello", "  "]);
         assert_pieces("a  b", &["a", " ", " b"]);
         assert_pieces("a\tb", &["a", "\t", "b"]);
@@ -655,6 +664,27 @@ mod tests {
             }
         }
         assert_eq!(n, Gpt2::count(&text));
+    }
+
+    #[test]
+    fn a_newline_run_in_the_final_window_still_peels() {
+        let tail = "Justice.\n\nSessions and his aides";
+        let pad = 64 - (tail.len() % 64);
+        let text = format!("{}{tail}", "a".repeat(pad % 64));
+        assert_eq!(text.len() % 64, 0);
+        let mut expected = Vec::new();
+        let bytes = text.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let end = advance::<false>(bytes, pos);
+            expected.push(&text[pos..end]);
+            pos = end;
+        }
+        assert_pieces(&text, &expected);
+        assert!(
+            expected.windows(2).any(|pair| pair == ["\n", "\n"]),
+            "the newline run must stay two pieces: {expected:?}"
+        );
     }
 
     #[test]

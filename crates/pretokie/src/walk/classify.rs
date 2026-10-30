@@ -44,6 +44,11 @@ pub(crate) fn class_of(c: char) -> Class {
     if c.is_whitespace() {
         return Class::Whitespace;
     }
+    // Unified ideographs are Other_Letter. Chinese text never searches the table.
+    let cp = c as u32;
+    if (0x4E00..=0x9FFF).contains(&cp) {
+        return Class::Letter;
+    }
     match get_general_category(c) {
         GeneralCategory::UppercaseLetter
         | GeneralCategory::LowercaseLetter

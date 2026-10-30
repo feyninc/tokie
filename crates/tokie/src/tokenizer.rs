@@ -1,16 +1,17 @@
 //! A loaded `tokenizer.json`. Encode appends ids. It does not clear them.
 
-use crate::bpe::{Pair, merge_ids};
+use crate::bpe::{Pairs, merge_ids};
+use crate::fold::{CharFold, seed as fold_seed};
+use crate::wordpiece::VocabTrie;
 use crate::cache::{Cache, Prep, ProbeView, mix, pack, pack_bounds, pack_spans};
 use crate::cut::Cut;
 use crate::norm::Norm;
 use crate::unigram::Lattice;
-use crate::wordpiece::wordpiece;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 
 /// Whether [`Tokenizer::decode`] writes special tokens.
@@ -97,10 +98,15 @@ enum Kind {
     Bpe {
         /// Vocab id of each raw byte after the GPT-2 byte map. `u32::MAX` is missing.
         byte_ids: [u32; 256],
-        pairs: FxHashMap<(u32, u32), Pair>,
+        pairs: Pairs,
+        /// Characters whose byte assembly cannot lose to a neighbour.
+        fold: Option<CharFold>,
+        /// A pretok piece whose byte-level spelling is one vocab token is that
+        /// token. Merges run only when the spelling is absent.
+        ignore_merges: bool,
     },
     WordPiece {
-        vocab: FxHashMap<String, u32>,
+        trie: VocabTrie,
         unk: u32,
         prefix: String,
         max_chars: usize,
@@ -113,28 +119,33 @@ enum Kind {
     Spm {
         chars: FxHashMap<char, u32>,
         bytes: [u32; 256],
-        pairs: FxHashMap<(u32, u32), Pair>,
+        pairs: Pairs,
     },
 }
 
 struct Scratch {
     a: String,
+    /// Prefix-space and metaspace text for the piece loop. The capacity stays
+    /// across calls.
+    view: String,
     syms: Vec<u32>,
-    marked: String,
     piece: Vec<u32>,
     raw_parts: Vec<Part>,
     norm_parts: Vec<Part>,
+    /// Byte-level spelling of the current piece, for `ignore_merges`.
+    mapped: String,
 }
 
 impl Scratch {
     fn new() -> Self {
         Self {
             a: String::new(),
+            view: String::new(),
             syms: Vec::new(),
-            marked: String::new(),
             piece: Vec::new(),
             raw_parts: Vec::new(),
             norm_parts: Vec::new(),
+            mapped: String::new(),
         }
     }
 }
@@ -172,6 +183,9 @@ struct Tables {
     /// Specials the single-sequence template adds around the encoded ids.
     post: Post,
     vocab: Vocab,
+    /// Longest-match walk for a long unfolded piece. Empty until the first
+    /// such piece, so an English encode never builds it.
+    scan: OnceLock<Option<crate::scan::Scan>>,
 }
 
 struct Worker {
@@ -260,9 +274,10 @@ impl Tokenizer {
         let (raw_added, norm_added, raw_rows, norm_rows) = added_of(root.get("added_tokens"))?;
         let post = post_of(root.get("post_processor"))?;
         let model = root.get("model").and_then(|v| v.as_object()).ok_or("missing model")?;
-        let kind = kind_of(model)?;
+        let mut kind = kind_of(model)?;
         let vocab = vocab_of(model, root.get("added_tokens"), root.get("decoder"), &kind)?;
-        Ok(Self {
+        attach_fold(&mut kind, &vocab.tokens);
+        let mut tok = Self {
             cache: Cache::new(),
             scratch: Scratch::new(),
             cut,
@@ -279,10 +294,13 @@ impl Tokenizer {
                 kind,
                 post,
                 vocab,
+                scan: OnceLock::new(),
             }),
             threads: default_threads(),
             pool: Pool::new(),
-        })
+        };
+        warm_bpe_cache(&mut tok);
+        Ok(tok)
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
@@ -321,7 +339,7 @@ impl Tokenizer {
             return;
         }
         self.scratch.piece.clear();
-        if self.encode_piece(piece).is_err() {
+        if self.encode_piece(piece, false).is_err() {
             return;
         }
         let encoded = std::mem::take(&mut self.scratch.piece);
@@ -339,6 +357,7 @@ impl Tokenizer {
         let mut unk_score = 0.0;
         let mut pairs = Vec::new();
         let mut byte_ids = None;
+        let mut ignore_merges = false;
         let mut spm_bytes = None;
         let mut spm_chars = Vec::new();
         let mut nodes = Vec::new();
@@ -348,16 +367,16 @@ impl Tokenizer {
             Kind::Bpe {
                 byte_ids: ids,
                 pairs: map,
+                ignore_merges: skip,
+                ..
             } => {
                 model = Model::Bpe;
                 byte_ids = Some(*ids);
-                pairs = map
-                    .iter()
-                    .map(|(&(left, right), pair)| (left, right, pair.rank, pair.id))
-                    .collect();
+                pairs = map.rows().to_vec();
+                ignore_merges = *skip;
             }
             Kind::WordPiece {
-                vocab,
+                trie,
                 unk: unk_id,
                 prefix: pre,
                 max_chars: max,
@@ -366,7 +385,7 @@ impl Tokenizer {
                 unk = *unk_id;
                 max_chars = *max as u32;
                 prefix = pre.clone();
-                wp = vocab.iter().map(|(token, id)| (token.clone(), *id)).collect();
+                wp = trie.rows().to_vec();
             }
             Kind::Unigram { lattice } => {
                 model = Model::Unigram;
@@ -383,10 +402,7 @@ impl Tokenizer {
                 model = Model::Spm;
                 spm_bytes = Some(*bytes);
                 spm_chars = chars.iter().map(|(&ch, &id)| (ch as u32, id)).collect();
-                pairs = map
-                    .iter()
-                    .map(|(&(left, right), pair)| (left, right, pair.rank, pair.id))
-                    .collect();
+                pairs = map.rows().to_vec();
             }
         }
         let mut steps = Vec::new();
@@ -430,6 +446,7 @@ impl Tokenizer {
             prefix_space: self.prefix_space,
             mark: self.mark,
             strip_space: vocab.strip_space,
+            ignore_merges,
             unk,
             max_chars,
             vocab_len: slots.len() as u32,
@@ -702,36 +719,37 @@ impl Tokenizer {
         let prefix_space = self.prefix_space;
         let mark = self.mark;
         let cut = self.cut;
-        let owned = if prefix_space && !text.is_empty() && !text.starts_with(' ') {
-            let mut prefixed = String::with_capacity(text.len() + 1);
-            prefixed.push(' ');
-            prefixed.push_str(text);
-            Some(prefixed)
-        } else {
-            None
-        };
-        let view = owned.as_deref().unwrap_or(text);
-        let marked = if mark {
-            Some(mark_words(view))
-        } else {
-            None
-        };
-        let view = marked.as_deref().unwrap_or(view);
-        match cut {
+        let mut buf = std::mem::take(&mut self.scratch.view);
+        buf.clear();
+        let prefixed = prefix_space && !text.is_empty() && !text.starts_with(' ');
+        if prefixed {
+            buf.push(' ');
+            buf.push_str(text);
+        }
+        if mark {
+            let mut marked = std::mem::take(&mut self.scratch.a);
+            marked.clear();
+            let src = if prefixed { buf.as_str() } else { text };
+            mark_words(src, &mut marked);
+            self.scratch.a = std::mem::replace(&mut buf, marked);
+        }
+        let view = if prefixed || mark { buf.as_str() } else { text };
+        let result = match cut {
             Cut::None => {
                 if view.is_empty() {
-                    return Ok(());
-                }
+                    Ok(())
+                } else {
                 let batch = [pretokie::Span {
                     start: 0,
                     end: u32::try_from(view.len()).expect("text is longer than 4 GiB"),
                 }];
                 let mut prep = [Prep { key: 0, hash: 0 }; 80];
-                let piece = view.as_bytes();
-                let key = pack(piece).unwrap_or(0);
-                let hash = if key == 0 { 0 } else { mix::<CRC>(key) };
-                prep[0] = Prep { key, hash };
-                self.emit_chunk::<CRC>(&prep, &batch, view, ids)
+                    let piece = view.as_bytes();
+                    let key = pack(piece).unwrap_or(0);
+                    let hash = if key == 0 { 0 } else { mix::<CRC>(key) };
+                    prep[0] = Prep { key, hash };
+                    self.emit_chunk::<CRC>(&prep, &batch, view, ids)
+                }
             }
             Cut::Gpt2 => {
                 let mut walk = pretokie::Gpt2::walk(view);
@@ -781,7 +799,9 @@ impl Tokenizer {
                 let mut walk = pretokie::T5::walk(view);
                 self.drive::<CRC>(|out| walk.fill(out), view, ids)
             }
-        }
+        };
+        self.scratch.view = buf;
+        result
     }
 
     /// Fill a batch, pack and prefetch it, then probe before the next fill.
@@ -956,48 +976,131 @@ impl Tokenizer {
             return Ok(());
         }
         self.scratch.piece.clear();
-        self.encode_piece(piece)?;
-        let encoded = std::mem::take(&mut self.scratch.piece);
-        self.cache.insert(piece.as_bytes(), &encoded);
-        ids.extend_from_slice(&encoded);
+        self.encode_piece(piece, true)?;
+        // Keep the buffer. `admit` copies the ids, and the next miss would
+        // otherwise allocate a new one from empty. A medium Han piece waits
+        // for a second sight so unique pieces do not grow the map.
+        self.cache.admit(piece.as_bytes(), &self.scratch.piece);
+        ids.extend_from_slice(&self.scratch.piece);
         Ok(())
     }
 
     #[cold]
     #[inline(never)]
-    fn encode_piece(&mut self, piece: &str) -> Result<(), String> {
-        let kind = &self.tables.kind;
-        let scratch = &mut self.scratch;
-        match kind {
-            Kind::Bpe { byte_ids, pairs } => {
-                scratch.syms.clear();
+    fn encode_piece(&mut self, piece: &str, walk: bool) -> Result<(), String> {
+        if matches!(self.tables.kind, Kind::Bpe { ignore_merges: true, .. }) {
+            let map = byte_chars();
+            self.scratch.mapped.clear();
+            for &byte in piece.as_bytes() {
+                self.scratch.mapped.push(map[byte as usize]);
+            }
+            if let Some(&id) = self.tables.vocab.ids.get(&self.scratch.mapped) {
+                self.scratch.piece.push(id);
+                return Ok(());
+            }
+        }
+        let mut seeded = false;
+        if walk && matches!(self.tables.kind, Kind::Bpe { .. }) {
+            // The walk does not read the folded symbols. Once it exists, a
+            // Thai piece of 16 bytes or more skips the fold, and so does a
+            // medium Han piece when the Han fold is too sparse to shrink it.
+            // This does not build the walk. Kana stays on the fold.
+            let raw = piece.as_bytes();
+            let ready = matches!(self.tables.scan.get(), Some(Some(_)));
+            let sparse = match &self.tables.kind {
+                Kind::Bpe { fold: Some(fold), .. } => fold.sparse_han(),
+                _ => false,
+            };
+            let gate = ready
+                && (crate::scan::worth_direct(raw, true)
+                    || crate::scan::worth_sparse_han(raw, true, sparse));
+            if gate {
+                let took = match (self.tables.scan.get(), &self.tables.kind) {
+                    (Some(Some(scan)), Kind::Bpe { pairs, .. }) => {
+                        if raw.len() <= 64 {
+                            scan.try_short(pairs, raw, &mut self.scratch.piece)
+                        } else {
+                            scan.try_encode(pairs, raw, &mut self.scratch.piece)
+                        }
+                    }
+                    _ => false,
+                };
+                if took {
+                    return Ok(());
+                }
+            }
+        }
+        if walk
+            && let Kind::Bpe { byte_ids, fold, .. } = &self.tables.kind
+        {
+            self.scratch.syms.clear();
+            if let Some(fold) = fold {
+                fold_seed(fold, byte_ids, piece.as_bytes(), |id| self.scratch.syms.push(id));
+            } else {
                 for &byte in piece.as_bytes() {
                     let id = byte_ids[byte as usize];
                     if id == u32::MAX {
                         return Err(format!("no vocab id for byte {byte:#04x}"));
                     }
-                    scratch.syms.push(id);
+                    self.scratch.syms.push(id);
+                }
+            }
+            seeded = true;
+            let symbols = self.scratch.syms.len();
+            let bytes = piece.len();
+            // Build only for a long unfolded piece, so English and OpenWebText
+            // never allocate the automaton. Once it exists, pieces past the
+            // stack merge reuse it, including a sparse model's piece that
+            // folded and still has too many symbols for the stack. A dense
+            // Han fold keeps the queue.
+            let ready = matches!(self.tables.scan.get(), Some(Some(_)));
+            let sparse = fold.as_ref().is_some_and(|fold| fold.sparse_han());
+            if crate::scan::worth_walking(symbols, bytes)
+                || (ready && crate::scan::worth_reusing(symbols, bytes))
+                || crate::scan::worth_folded_walk(symbols, bytes, ready, sparse)
+            {
+                if !ready {
+                    self.ensure_scan();
+                }
+                let took = match (self.tables.scan.get(), &self.tables.kind) {
+                    (Some(Some(scan)), Kind::Bpe { pairs, .. }) => {
+                        scan.try_encode(pairs, piece.as_bytes(), &mut self.scratch.piece)
+                    }
+                    _ => false,
+                };
+                if took {
+                    return Ok(());
+                }
+            }
+        }
+        let kind = &self.tables.kind;
+        let scratch = &mut self.scratch;
+        match kind {
+            Kind::Bpe { byte_ids, pairs, fold, .. } => {
+                if !seeded {
+                    scratch.syms.clear();
+                    if let Some(fold) = fold {
+                        fold_seed(fold, byte_ids, piece.as_bytes(), |id| scratch.syms.push(id));
+                    } else {
+                        for &byte in piece.as_bytes() {
+                            let id = byte_ids[byte as usize];
+                            if id == u32::MAX {
+                                return Err(format!("no vocab id for byte {byte:#04x}"));
+                            }
+                            scratch.syms.push(id);
+                        }
+                    }
                 }
                 merge_ids(&mut scratch.syms, pairs);
                 scratch.piece.extend_from_slice(&scratch.syms);
             }
             Kind::WordPiece {
-                vocab,
+                trie,
                 unk,
                 prefix,
                 max_chars,
             } => {
-                let unk = *unk;
-                let max_chars = *max_chars;
-                wordpiece(
-                    piece,
-                    unk,
-                    max_chars,
-                    prefix,
-                    &mut scratch.marked,
-                    |token| vocab.get(token).copied(),
-                    &mut scratch.piece,
-                );
+                trie.encode(piece, *unk, *max_chars, prefix, &mut scratch.piece);
             }
             Kind::Unigram { lattice } => {
                 lattice.segment(piece.as_bytes(), &mut scratch.piece);
@@ -1019,6 +1122,21 @@ impl Tokenizer {
             }
         }
         Ok(())
+    }
+
+    /// Build the long-piece walk once. A vocab the heap still wins on stores
+    /// `None`, so later long pieces do not try again.
+    fn ensure_scan(&self) {
+        if self.tables.scan.get().is_some() {
+            return;
+        }
+        let built = match &self.tables.kind {
+            Kind::Bpe { pairs, byte_ids, .. } if self.tables.vocab.tokens.len() > (1 << 16) => {
+                crate::scan::Scan::build(&self.tables.vocab.tokens, pairs, byte_ids)
+            }
+            _ => None,
+        };
+        let _ = self.tables.scan.set(built);
     }
 }
 
@@ -1473,13 +1591,15 @@ fn post_of(value: Option<&Value>) -> Result<Post, String> {
 
 fn from_image(image: crate::file::Image) -> Result<Tokenizer, Error> {
     use crate::file::{Model, StepRec};
-    let kind = match image.model {
+    let mut kind = match image.model {
         Model::Bpe => Kind::Bpe {
             byte_ids: image.byte_ids.ok_or("bpe file has no byte ids")?,
-            pairs: pair_map(&image.pairs),
+            pairs: Pairs::from_list(&image.pairs),
+            fold: None,
+            ignore_merges: image.ignore_merges,
         },
         Model::WordPiece => Kind::WordPiece {
-            vocab: string_map(&image.wp),
+            trie: VocabTrie::from_rows(image.wp.clone()),
             unk: image.unk,
             prefix: image.prefix.clone(),
             max_chars: image.max_chars as usize,
@@ -1493,7 +1613,7 @@ fn from_image(image: crate::file::Image) -> Result<Tokenizer, Error> {
         Model::Spm => Kind::Spm {
             chars: char_map(&image.spm_chars)?,
             bytes: image.spm_bytes.ok_or("sentencepiece file has no byte tokens")?,
-            pairs: pair_map(&image.pairs),
+            pairs: Pairs::from_list(&image.pairs),
         },
     };
     let mut steps = Vec::with_capacity(image.steps.len());
@@ -1525,13 +1645,14 @@ fn from_image(image: crate::file::Image) -> Result<Tokenizer, Error> {
         });
     }
     let vocab = vocab_from_slots(&image)?;
+    attach_fold(&mut kind, &vocab.tokens);
     let raw_added = needles_of(image.added_raw.clone())?;
     let norm_added = needles_of(image.added_norm.clone())?;
     let mut cache = Cache::new();
     for (piece, ids) in &image.pieces {
         cache.insert(piece, ids);
     }
-    Ok(Tokenizer {
+    let mut tok = Tokenizer {
         cache,
         scratch: Scratch::new(),
         cut: image.cut,
@@ -1551,26 +1672,77 @@ fn from_image(image: crate::file::Image) -> Result<Tokenizer, Error> {
                 suffix: image.post_suffix,
             },
             vocab,
+            scan: OnceLock::new(),
         }),
         threads: default_threads(),
         pool: Pool::new(),
-    })
+    };
+    warm_bpe_cache(&mut tok);
+    Ok(tok)
 }
 
-fn pair_map(pairs: &[(u32, u32, u32, u32)]) -> FxHashMap<(u32, u32), Pair> {
-    let mut map = FxHashMap::with_capacity_and_hasher(pairs.len(), Default::default());
-    for &(left, right, rank, id) in pairs {
-        map.insert((left, right), Pair { rank, id });
+fn attach_fold(kind: &mut Kind, tokens: &[Option<String>]) {
+    let Kind::Bpe { fold: None, .. } = kind else {
+        return;
+    };
+    let map = unicode_to_byte();
+    let raws: Vec<(u32, Vec<u8>)> = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(id, token)| {
+            let token = token.as_ref()?;
+            Some((id as u32, byte_token_bytes(token, &map)?))
+        })
+        .collect();
+    let built = match kind {
+        Kind::Bpe { byte_ids, pairs, .. } => {
+            CharFold::build(byte_ids, pairs, raws.iter().map(|(id, raw)| (*id, raw.as_slice())))
+        }
+        _ => return,
+    };
+    if let Kind::Bpe { fold, .. } = kind {
+        *fold = built;
     }
-    map
 }
 
-fn string_map(rows: &[(String, u32)]) -> FxHashMap<String, u32> {
-    let mut map = FxHashMap::with_capacity_and_hasher(rows.len(), Default::default());
-    for (token, id) in rows {
-        map.insert(token.clone(), *id);
+/// Raw bytes of a byte-level vocab token. `None` when a character is outside
+/// the GPT-2 byte alphabet, which is how special tokens are spelled.
+fn byte_token_bytes(token: &str, map: &FxHashMap<char, u8>) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(token.chars().count());
+    for ch in token.chars() {
+        out.push(*map.get(&ch)?);
     }
-    map
+    Some(out)
+}
+
+/// How many lowest-id vocab tokens to merge once at load. A 10 KiB slice is
+/// mostly these tokens the first time it is seen, and the piece cache
+/// otherwise starts empty.
+const SEED_MAX: usize = 1 << 16;
+
+fn warm_bpe_cache(tok: &mut Tokenizer) {
+    if !matches!(tok.tables.kind, Kind::Bpe { .. }) {
+        return;
+    }
+    let map = unicode_to_byte();
+    let n = tok.tables.vocab.tokens.len().min(SEED_MAX);
+    for id in 0..n {
+        let Some(token) = tok.tables.vocab.tokens[id].clone() else {
+            continue;
+        };
+        let Some(raw) = byte_token_bytes(&token, &map) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&raw) else {
+            continue;
+        };
+        tok.scratch.piece.clear();
+        if tok.encode_piece(text, false).is_err() {
+            continue;
+        }
+        let ids = std::mem::take(&mut tok.scratch.piece);
+        tok.cache.insert(&raw, &ids);
+    }
 }
 
 fn char_map(rows: &[(u32, u32)]) -> Result<FxHashMap<char, u32>, String> {
@@ -1741,7 +1913,8 @@ fn kind_of(model: &serde_json::Map<String, Value>) -> Result<Kind, String> {
         if byte_fallback {
             return spm_of(model, vocab_obj, merges);
         }
-        return bpe_of(vocab_obj, merges);
+        let ignore_merges = model.get("ignore_merges").and_then(|v| v.as_bool()) == Some(true);
+        return bpe_of(vocab_obj, merges, ignore_merges);
     }
     if byte_fallback {
         return Err("byte_fallback without merges is not loaded yet".to_string());
@@ -1786,6 +1959,7 @@ fn unigram_of(model: &serde_json::Map<String, Value>, list: &[Value]) -> Result<
 fn bpe_of(
     vocab_obj: &serde_json::Map<String, Value>,
     merges: &[Value],
+    ignore_merges: bool,
 ) -> Result<Kind, String> {
     let mut vocab: FxHashMap<&str, u32> = FxHashMap::with_capacity_and_hasher(vocab_obj.len(), Default::default());
     let mut singles: FxHashMap<char, u32> = FxHashMap::default();
@@ -1803,7 +1977,7 @@ fn bpe_of(
             byte_ids[byte] = *id;
         }
     }
-    let mut pairs = FxHashMap::with_capacity_and_hasher(merges.len(), Default::default());
+    let mut rows = Vec::with_capacity(merges.len());
     for (rank, merge) in merges.iter().enumerate() {
         let (left, right) = merge_sides(merge)?;
         let left_id = *vocab.get(left).ok_or_else(|| format!("merge left {left:?} is not in the vocab"))?;
@@ -1812,15 +1986,15 @@ fn bpe_of(
         joined.push_str(left);
         joined.push_str(right);
         let id = *vocab.get(joined.as_str()).ok_or_else(|| format!("merge result {joined:?} is not in the vocab"))?;
-        pairs.insert(
-            (left_id, right_id),
-            Pair {
-                rank: u32::try_from(rank).map_err(|_| "too many merges".to_string())?,
-                id,
-            },
-        );
+        let rank = u32::try_from(rank).map_err(|_| "too many merges".to_string())?;
+        rows.push((left_id, right_id, rank, id));
     }
-    Ok(Kind::Bpe { byte_ids, pairs })
+    Ok(Kind::Bpe {
+        byte_ids,
+        pairs: Pairs::from_list(&rows),
+        fold: None,
+        ignore_merges,
+    })
 }
 
 fn spm_of(
@@ -1860,7 +2034,7 @@ fn spm_of(
     if bytes.contains(&u32::MAX) {
         return Err("byte_fallback vocab is missing a <0xHH> token".to_string());
     }
-    let mut pairs = FxHashMap::with_capacity_and_hasher(merges.len(), Default::default());
+    let mut rows = Vec::with_capacity(merges.len());
     for (rank, merge) in merges.iter().enumerate() {
         let (left, right) = merge_sides(merge)?;
         let left_id = *vocab
@@ -1875,19 +2049,24 @@ fn spm_of(
         let id = *vocab
             .get(joined.as_str())
             .ok_or_else(|| format!("merge result {joined:?} is not in the vocab"))?;
-        pairs.insert(
-            (left_id, right_id),
-            Pair {
-                rank: u32::try_from(rank).map_err(|_| "too many merges".to_string())?,
-                id,
-            },
-        );
+        let rank = u32::try_from(rank).map_err(|_| "too many merges".to_string())?;
+        rows.push((left_id, right_id, rank, id));
     }
-    Ok(Kind::Spm { chars, bytes, pairs })
+    Ok(Kind::Spm {
+        chars,
+        bytes,
+        pairs: Pairs::from_list(&rows),
+    })
 }
 
 /// GPT-2 bytes-to-unicode. Printable ASCII and the latin-1 run stay themselves.
 /// Every other byte is assigned the next scalar from U+0100.
+fn byte_chars() -> &'static [char; 256] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[char; 256]> = OnceLock::new();
+    TABLE.get_or_init(bytes_to_unicode)
+}
+
 fn bytes_to_unicode() -> [char; 256] {
     let mut seen = [false; 256];
     let mut bs = Vec::with_capacity(256);
@@ -1923,15 +2102,19 @@ fn wordpiece_of(
     model: &serde_json::Map<String, Value>,
     vocab_obj: &serde_json::Map<String, Value>,
 ) -> Result<Kind, String> {
-    let mut vocab = FxHashMap::with_capacity_and_hasher(vocab_obj.len(), Default::default());
+    let mut rows = Vec::with_capacity(vocab_obj.len());
     for (token, id) in vocab_obj {
-        vocab.insert(token.clone(), id_of(id)?);
+        rows.push((token.clone(), id_of(id)?));
     }
     let unk_token = model
         .get("unk_token")
         .and_then(|v| v.as_str())
         .ok_or("wordpiece has no unk_token")?;
-    let unk = *vocab.get(unk_token).ok_or_else(|| format!("unk {unk_token} is not in the vocab"))?;
+    let unk = rows
+        .iter()
+        .find(|(token, _)| token == unk_token)
+        .map(|(_, id)| *id)
+        .ok_or_else(|| format!("unk {unk_token} is not in the vocab"))?;
     let prefix = model
         .get("continuing_subword_prefix")
         .and_then(|v| v.as_str())
@@ -1942,7 +2125,7 @@ fn wordpiece_of(
         .and_then(|v| v.as_u64())
         .unwrap_or(100) as usize;
     Ok(Kind::WordPiece {
-        vocab,
+        trie: VocabTrie::from_rows(rows),
         unk,
         prefix,
         max_chars,
@@ -1970,8 +2153,8 @@ fn merge_sides(value: &Value) -> Result<(&str, &str), String> {
 
 /// Whitespace pieces with `▁` in front of each one, separated by a space
 /// the T5 cut drops.
-fn mark_words(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + text.len() / 8 + 3);
+fn mark_words(text: &str, out: &mut String) {
+    out.reserve(text.len() + text.len() / 8 + 3);
     let mut gap = false;
     let mut in_word = false;
     for ch in text.chars() {
@@ -1991,7 +2174,6 @@ fn mark_words(text: &str) -> String {
         }
         out.push(ch);
     }
-    out
 }
 
 fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
@@ -2205,7 +2387,7 @@ fn wordpiece_cleanup(token: &str) -> String {
         .replace(" 're", "'re")
 }
 
-fn unicode_to_byte() -> FxHashMap<char, u8> {
+pub(crate) fn unicode_to_byte() -> FxHashMap<char, u8> {
     let mut map = FxHashMap::default();
     for (byte, ch) in bytes_to_unicode().into_iter().enumerate() {
         map.insert(ch, byte as u8);
@@ -2340,6 +2522,52 @@ fn added_entries(value: Option<&Value>) -> Result<Vec<(String, u32, bool)>, Stri
         out.push((content.to_string(), id, special));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tokenizer;
+
+    const WITH: &str = r#"{
+        "model": {
+            "type": "BPE",
+            "ignore_merges": true,
+            "vocab": {".": 0, ":": 1, ".:": 2, ".:.:": 3},
+            "merges": [". :"]
+        }
+    }"#;
+
+    const WITHOUT: &str = r#"{
+        "model": {
+            "type": "BPE",
+            "vocab": {".": 0, ":": 1, ".:": 2, ".:.:": 3},
+            "merges": [". :"]
+        }
+    }"#;
+
+    #[test]
+    fn ignore_merges_keeps_a_vocab_piece_whole() {
+        let mut tok = Tokenizer::json(WITH).unwrap();
+        let mut ids = Vec::new();
+        tok.encode(".:.:", &mut ids).unwrap();
+        assert_eq!(ids, [3]);
+        ids.clear();
+        tok.encode(".:.", &mut ids).unwrap();
+        assert_eq!(ids, [2, 0]);
+
+        let mut plain = Tokenizer::json(WITHOUT).unwrap();
+        ids.clear();
+        plain.encode(".:.:", &mut ids).unwrap();
+        assert_eq!(ids, [2, 2]);
+
+        let path = std::env::temp_dir().join(format!("tokie-ignore-{}.tokie", std::process::id()));
+        tok.save(&path).unwrap();
+        let mut loaded = Tokenizer::open(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        ids.clear();
+        loaded.encode(".:.:", &mut ids).unwrap();
+        assert_eq!(ids, [3]);
+    }
 }
 
 const _: fn() = || {

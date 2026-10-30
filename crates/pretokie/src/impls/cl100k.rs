@@ -207,10 +207,44 @@ fn decode_char(bytes: &[u8], i: usize) -> (char, usize) {
     } else {
         4
     };
+    // The piece is already valid UTF-8. Assembling the scalar skips the
+    // validating copy that `from_utf8` does on every CJK character.
+    if i + width <= bytes.len()
+        && let Some(cp) = scalar(bytes, i, width)
+        && let Some(ch) = char::from_u32(cp)
+        && ch.len_utf8() == width
+    {
+        return (ch, width);
+    }
     let end = (i + width).min(bytes.len());
     let rest = std::str::from_utf8(&bytes[i..end]).expect("piece boundary is a char boundary");
     let ch = rest.chars().next().expect("i is inside bytes");
     (ch, ch.len_utf8())
+}
+
+fn scalar(bytes: &[u8], i: usize, width: usize) -> Option<u32> {
+    let b0 = bytes[i] as u32;
+    let b1 = bytes[i + 1];
+    if b1 & 0xC0 != 0x80 {
+        return None;
+    }
+    let b1 = b1 as u32 & 0x3F;
+    if width == 2 {
+        return Some(((b0 & 0x1F) << 6) | b1);
+    }
+    let b2 = bytes[i + 2];
+    if b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let b2 = b2 as u32 & 0x3F;
+    if width == 3 {
+        return Some(((b0 & 0x0F) << 12) | (b1 << 6) | b2);
+    }
+    let b3 = bytes[i + 3];
+    if b3 & 0xC0 != 0x80 {
+        return None;
+    }
+    Some(((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | (b3 as u32 & 0x3F))
 }
 
 fn is_prefix(ch: &Char) -> bool {
@@ -525,7 +559,9 @@ fn bits<const DIGITS3: bool, const MARKS: bool>(
         | ((leads & lead2) & (seen_nonws >> 2))
         | ((leads & lead3) & (seen_nonws >> 3))
         | ((leads & lead4) & (seen_nonws >> 4));
-    if !next_ws {
+    // The byte after this window is content only when a byte is there.
+    // A run that reaches the end of the text stays one piece.
+    if !next_ws && !eof {
         split_ok |= (ws_lead1 & (1u64 << 63))
             | ((leads & lead2) & (1u64 << 62))
             | ((leads & lead3) & (1u64 << 61))
@@ -551,11 +587,17 @@ fn bits<const DIGITS3: bool, const MARKS: bool>(
         let q = 63 - (nl & run).leading_zeros();
         if q + 1 < e {
             b_ws |= 1u64 << (q + 1);
-        let tail = run & mask_from(q + 1);
-        let tail_leads = tail & leads;
-        if tail_leads != 0 {
-            b_ws |= 1u64 << (63 - tail_leads.leading_zeros());
-        }
+            let tail = run & mask_from(q + 1);
+            let tail_leads = tail & leads;
+            if tail_leads != 0 {
+                let last = 63 - tail_leads.leading_zeros();
+                // The last whitespace byte is its own piece when content
+                // follows. A run that reaches the end of the text stays whole.
+                let run_ends_text = eof && e >= 64 && !(tail_nonws && stop < 64);
+                if !run_ends_text {
+                    b_ws |= 1u64 << last;
+                }
+            }
         }
         runs_n &= !run;
     }
