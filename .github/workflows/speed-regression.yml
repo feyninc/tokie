@@ -23,7 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The pinned gigatoken crate gates portable_simd.
+      - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
 
@@ -41,6 +42,7 @@ jobs:
 
       - name: Time GPT-2
         run: |
+          set -o pipefail
           cargo run --manifest-path bench/tokie/Cargo.toml --release -- \
             --file benches/data/owt_sample.txt \
             --row gpt2 \

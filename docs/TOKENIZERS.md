@@ -43,7 +43,8 @@ This document lists tokenizers and their compatibility with that tokie.
 | Google | Gemini | ~256,000 | SentencePiece | - | - | - | - |
 | Google | Gemini 2 | ~256,000 | SentencePiece | - | - | - | - |
 | Google | Gemma | 256,000 | SentencePiece | ✅ | - | - | - |
-| Google | Gemma 2 | 256,000 | SentencePiece | ✅ | - | - | - |
+| Google | Gemma 2 | 256,000 | SentencePiece | ❌ | - | - | - |
+| Google | Gemma 3 | 262,144 | SentencePiece | ❌ | - | - | - |
 | Google | ModernBERT | 50,280 | Backtracking | ✅ | 5ms | 127 MB/s | ~20x |
 | Google | mT5 | 250,000 | Unigram | ✅ | - | - | - |
 | Google | PaLM | 256,000 | SentencePiece | ⚠️ | - | - | - |
@@ -65,7 +66,7 @@ This document lists tokenizers and their compatibility with that tokie.
 | Meta | XLM-RoBERTa | 250,002 | Unigram | ✅ | 23ms | 54 MB/s | ~15x |
 | Microsoft | Phi-1/2 | 51,200 | Backtracking | ✅ | 5ms | 282 MB/s | ~50x |
 | Microsoft | Phi-3 | 32,064 | SentencePiece | ✅ | 2ms | 85 MB/s | ~15x |
-| Mistral | Mistral 7B | 32,000 | SentencePiece | ✅ | 2ms | 85 MB/s | ~15x |
+| Mistral | Mistral 7B | 32,000 | SentencePiece | ❌ | - | - | - |
 | Mistral | Mistral Large | 32,768 | Simple | ✅ | - | - | - |
 | Mistral | Mistral Nemo | 131,072 | Simple | ✅ | 39ms | 324 MB/s | ~50x |
 | Mistral | Mixtral 8x7B | 32,000 | SentencePiece | ✅ | 2ms | 86 MB/s | ~15x |
@@ -101,8 +102,19 @@ This document lists tokenizers and their compatibility with that tokie.
 | Zhipu AI | ChatGLM | 65,024 | SentencePiece | - | - | - | - |
 | Zhipu AI | ChatGLM 2/3 | 64,794 | SentencePiece | - | - | - | - |
 | BAAI | BGE | 30,522 | WordPiece | ✅ | 3ms | 310 MB/s | ~50x |
+| BAAI | BGE M3 | 250,002 | Unigram | ❌ | - | - | - |
+| Snowflake | Arctic Embed v2 | 250,002 | Unigram | ❌ | - | - | - |
+| MinishLab | potion multilingual 128M | 500,353 | Unigram | ❌ | - | - | - |
 
 ## Known Issues
+
+### Refused by tokie 0.2
+
+These `tokenizer.json` files do not load:
+
+- **Mistral-7B-v0.1.** The metaspace prepend scheme is `first`.
+- **gemma-2-2b** and **gemma-3-4b-it.** The pretokenizer splits on a space.
+- **bge-m3**, **snowflake-arctic-embed-l-v2.0**, and **potion-multilingual-128M.** A replace pattern is the regex ` {2,}`. Only a literal replace is loaded.
 
 ### Yi (❌ Not Supported)
 

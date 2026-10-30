@@ -15,6 +15,23 @@ if [[ ! -f ../gigatoken/Cargo.toml ]]; then
   git -C ../gigatoken checkout --detach FETCH_HEAD
 fi
 
+# The pin opts into profile-rustflags for a profiling profile. The bench
+# builds release and test, so those lines are removed and stable Cargo can
+# parse the manifest.
+python3 - <<'PY'
+from pathlib import Path
+path = Path("../gigatoken/Cargo.toml")
+kept = []
+for line in path.read_text().splitlines(keepends=True):
+    stripped = line.strip()
+    if stripped == 'cargo-features = ["profile-rustflags"]':
+        continue
+    if stripped == 'rustflags = ["-C", "force-frame-pointers=yes"]':
+        continue
+    kept.append(line)
+path.write_text("".join(kept))
+PY
+
 if [[ ! -f ../tokenizers-v1/tokenizers/tk-encode/Cargo.toml ]]; then
   git clone https://github.com/huggingface/tokenizers.git ../tokenizers-v1
   git -C ../tokenizers-v1 fetch --depth 1 origin f8f41813f4bf8f3e2a467e31637c8837373b8dfa
@@ -42,7 +59,6 @@ fetch "https://huggingface.co/Qwen/Qwen2-7B/resolve/453ed1575b739b5b03ce3758b23b
 fetch "https://huggingface.co/Qwen/Qwen3.5-4B/resolve/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a/tokenizer.json" qwen.json
 fetch "https://huggingface.co/allenai/OLMo-2-1124-7B/resolve/main/tokenizer.json" olmo.json
 fetch "https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2/resolve/main/tokenizer.json" nemotron.json
-fetch "https://huggingface.co/moonshotai/Kimi-K2-Instruct/resolve/main/tokenizer.json" kimi.json
 fetch "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B/resolve/effd688a12921b4cc83e3312b6feb579f70f9c71/tokenizer.json" smollm.json
 fetch "https://huggingface.co/deepseek-ai/DeepSeek-V3/resolve/e815299b0bcbac849fa540c768ef21845365c9eb/tokenizer.json" deepseek.json
 fetch "https://huggingface.co/google-bert/bert-base-uncased/resolve/86b5e0934494bd15c9632b12f734a8a67f723594/tokenizer.json" bert-uncased.json

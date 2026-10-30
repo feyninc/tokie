@@ -87,6 +87,15 @@ enum Kind {
 }
 
 fn kind(ch: char) -> Kind {
+    let cp = ch as u32;
+    // Every ideograph in the CJK run is a letter. The Thai block is closed
+    // too, so neither consults the category table.
+    if (0x4E00..=0x9FA5).contains(&cp) {
+        return Kind::Letter;
+    }
+    if (0x0E00..0x0E80).contains(&cp) {
+        return thai_kind(cp);
+    }
     if ch.is_whitespace() {
         return Kind::Whitespace;
     }
@@ -113,6 +122,16 @@ fn kind(ch: char) -> Kind {
         | GeneralCategory::CurrencySymbol
         | GeneralCategory::ModifierSymbol
         | GeneralCategory::OtherSymbol => Kind::PunctSym,
+        _ => Kind::Other,
+    }
+}
+
+fn thai_kind(cp: u32) -> Kind {
+    match cp {
+        0x0E01..=0x0E30 | 0x0E32..=0x0E33 | 0x0E40..=0x0E46 => Kind::Letter,
+        0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E => Kind::Mark,
+        0x0E3F | 0x0E4F | 0x0E5A..=0x0E5B => Kind::PunctSym,
+        0x0E50..=0x0E59 => Kind::Number,
         _ => Kind::Other,
     }
 }
@@ -274,11 +293,23 @@ fn lm_end(bytes: &[u8], pos: usize, cjk: bool) -> Option<usize> {
 fn scan_lm(bytes: &[u8], mut pos: usize, cjk: bool) -> usize {
     let len = bytes.len();
     loop {
-        if !cjk {
+        // A Thai lead is not an ASCII letter. Checking the letter table on
+        // every character of a Thai run was a third of this scan.
+        if !cjk && pos < len && bytes[pos] < 0x80 {
             pos = scan_ascii_letters(bytes, pos);
         }
         if pos >= len || bytes[pos] < 0x80 {
             return pos;
+        }
+        // A Thai letter or mark continues the run. Anything else in the
+        // block ends it. Both are three bytes, so this loop does not look
+        // the character up.
+        if !cjk && let Some(step) = thai_in_run(bytes, pos) {
+            if step == 0 {
+                return pos;
+            }
+            pos += step;
+            continue;
         }
         let (ch, n) = decode(bytes, pos);
         if is_cjk(ch) != cjk {
@@ -423,10 +454,61 @@ fn decode(bytes: &[u8], i: usize) -> (char, usize) {
     } else {
         4
     };
+    if i + width <= bytes.len()
+        && let Some(cp) = scalar(bytes, i, width)
+        && let Some(ch) = char::from_u32(cp)
+        && ch.len_utf8() == width
+    {
+        return (ch, width);
+    }
     let end = (i + width).min(bytes.len());
     let rest = std::str::from_utf8(&bytes[i..end]).expect("piece boundary is a char boundary");
     let ch = rest.chars().next().expect("i is inside bytes");
     (ch, ch.len_utf8())
+}
+
+fn scalar(bytes: &[u8], i: usize, width: usize) -> Option<u32> {
+    let b0 = bytes[i] as u32;
+    let b1 = bytes[i + 1];
+    if b1 & 0xC0 != 0x80 {
+        return None;
+    }
+    let b1 = b1 as u32 & 0x3F;
+    if width == 2 {
+        return Some(((b0 & 0x1F) << 6) | b1);
+    }
+    let b2 = bytes[i + 2];
+    if b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let b2 = b2 as u32 & 0x3F;
+    if width == 3 {
+        return Some(((b0 & 0x0F) << 12) | (b1 << 6) | b2);
+    }
+    let b3 = bytes[i + 3];
+    if b3 & 0xC0 != 0x80 {
+        return None;
+    }
+    Some(((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | (b3 as u32 & 0x3F))
+}
+
+/// `Some(3)` when this Thai character continues a letter or mark run.
+/// `Some(0)` when it is in the Thai block and the run stops.
+/// `None` otherwise.
+fn thai_in_run(bytes: &[u8], pos: usize) -> Option<usize> {
+    if bytes[pos] != 0xE0 || pos + 3 > bytes.len() {
+        return None;
+    }
+    let b1 = bytes[pos + 1];
+    let b2 = bytes[pos + 2];
+    if (b1 != 0xB8 && b1 != 0xB9) || b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let cp = ((b1 as u32 & 0x3F) << 6) | (b2 as u32 & 0x3F);
+    match thai_kind(cp) {
+        Kind::Letter | Kind::Mark => Some(3),
+        _ => Some(0),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

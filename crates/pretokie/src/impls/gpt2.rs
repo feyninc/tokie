@@ -121,6 +121,32 @@ pub(crate) fn byte_is_number(bytes: &[u8], at: usize) -> bool {
     class_of(ch) == Class::Number
 }
 
+/// Class of a Thai character at `at`, U+0E00..=U+0E7F. `None` is not that block.
+///
+/// Letters are U+0E01..=U+0E30, U+0E32..=U+0E33, and U+0E40..=U+0E46.
+/// Digits are U+0E50..=U+0E59. Marks, punctuation, and unassigned scalars
+/// are other. Nothing in the block is whitespace.
+fn thai_class(bytes: &[u8], at: usize) -> Option<Class> {
+    if at + 3 > bytes.len() {
+        return None;
+    }
+    let b0 = bytes[at];
+    let b1 = bytes[at + 1];
+    let b2 = bytes[at + 2];
+    if b0 != 0xE0 || b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let class = match b1 {
+        0xB8 if (0x81..=0xB0).contains(&b2) || (0xB2..=0xB3).contains(&b2) => Class::Letter,
+        0xB8 => Class::Other,
+        0xB9 if (0x80..=0x86).contains(&b2) => Class::Letter,
+        0xB9 if (0x90..=0x99).contains(&b2) => Class::Number,
+        0xB9 => Class::Other,
+        _ => return None,
+    };
+    Some(class)
+}
+
 /// `bytes[i..]` is valid UTF-8 and `i` is a character boundary.
 ///
 /// Only the bytes of this character are checked. Validating the rest of
@@ -347,9 +373,11 @@ fn ws_multibyte_splits<const SINGLE_DIGITS: bool>(
             | (w3 & (digit >> 3))
             | (w4 & (digit >> 4)));
     }
-    // A lead whose next byte sits past the window all look at `pos + 64`.
+    // A lead whose next byte sits past the window looks at `pos + 64`.
+    // At the end of the text there is no such byte. A run that reaches
+    // the end stays whole; a run with content after it already split above.
     let edge = (w1 & (1u64 << 63)) | (w2 & (1u64 << 62)) | (w3 & (1u64 << 61)) | (w4 & (1u64 << 60));
-    if edge != 0 {
+    if edge != 0 && pos + 64 < bytes.len() {
         let next_is_ws = byte_is_whitespace(bytes, pos + 64);
         let next_is_number = SINGLE_DIGITS && byte_is_number(bytes, pos + 64);
         if !next_is_ws && !next_is_number {
@@ -378,6 +406,23 @@ fn absorb_non_ascii(bytes: &[u8], pos: usize, masks: &Masks) -> (u64, u64, u64, 
         let b = bytes[pos + i];
         if b & 0xC0 == 0x80 {
             return (letter, digit, whitespace, cont, i as u32);
+        }
+        // Thai is three bytes and its class is fixed by the block. Decoding
+        // it and searching the category table was most of a Thai window.
+        if let Some(class) = thai_class(bytes, pos + i) {
+            let marked = 3.min(64 - i);
+            let char_bits = ((1u64 << marked) - 1) << i;
+            bits &= !char_bits;
+            if marked > 1 {
+                cont |= char_bits ^ (1u64 << i);
+            }
+            match class {
+                Class::Letter => letter |= char_bits,
+                Class::Number => digit |= char_bits,
+                Class::Whitespace => whitespace |= char_bits,
+                Class::Other => {}
+            }
+            continue;
         }
         let width = if b < 0xE0 {
             2
@@ -447,23 +492,29 @@ pub(crate) fn window<const ISA: u8, const SINGLE_DIGITS: bool>(
     };
     let content_start = !whitespace & !cont_same & !prefixed;
 
-    let split_ok = if eof || whitespace == 0 {
+    // Peel the last byte of a whitespace run when content follows it. That
+    // includes the final window: the end of the text only means there is
+    // no byte past the window to consult. A run that reaches the end stays
+    // whole, because nothing inside the window follows it.
+    let split_ok = if whitespace == 0 {
         0
     } else if cont == 0 {
         let mut split = whitespace & (!whitespace >> 1);
         if SINGLE_DIGITS {
             split &= !(digit >> 1);
         }
-        // SAFETY: `eof` is false, so `pos + 64` is inside `bytes`.
-        let next = unsafe { *bytes.get_unchecked(pos + 64) };
-        let next_is_ws = if next < 0x80 {
-            is_ascii_ws(next)
-        } else {
-            byte_is_whitespace(bytes, pos + 64)
-        };
-        let next_is_number = SINGLE_DIGITS && byte_is_number(bytes, pos + 64);
-        if !next_is_ws && !next_is_number {
-            split |= whitespace & (1u64 << 63);
+        if !eof {
+            // SAFETY: `eof` is false, so `pos + 64` is inside `bytes`.
+            let next = unsafe { *bytes.get_unchecked(pos + 64) };
+            let next_is_ws = if next < 0x80 {
+                is_ascii_ws(next)
+            } else {
+                byte_is_whitespace(bytes, pos + 64)
+            };
+            let next_is_number = SINGLE_DIGITS && byte_is_number(bytes, pos + 64);
+            if !next_is_ws && !next_is_number {
+                split |= whitespace & (1u64 << 63);
+            }
         }
         split
     } else {
@@ -581,6 +632,7 @@ mod tests {
         assert_pieces("  hello", &[" ", " hello"]);
         assert_pieces("   hello", &["  ", " hello"]);
         assert_pieces("hello\n\n", &["hello", "\n\n"]);
+        assert_pieces(".\n\nSessions", &[".", "\n", "\n", "Sessions"]);
         assert_pieces("hello  ", &["hello", "  "]);
         assert_pieces("a  b", &["a", " ", " b"]);
         assert_pieces("a\tb", &["a", "\t", "b"]);
@@ -655,6 +707,27 @@ mod tests {
             }
         }
         assert_eq!(n, Gpt2::count(&text));
+    }
+
+    #[test]
+    fn a_newline_run_in_the_final_window_still_peels() {
+        let tail = "Justice.\n\nSessions and his aides";
+        let pad = 64 - (tail.len() % 64);
+        let text = format!("{}{tail}", "a".repeat(pad % 64));
+        assert_eq!(text.len() % 64, 0);
+        let mut expected = Vec::new();
+        let bytes = text.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let end = advance::<false>(bytes, pos);
+            expected.push(&text[pos..end]);
+            pos = end;
+        }
+        assert_pieces(&text, &expected);
+        assert!(
+            expected.windows(2).any(|pair| pair == ["\n", "\n"]),
+            "the newline run must stay two pieces: {expected:?}"
+        );
     }
 
     #[test]

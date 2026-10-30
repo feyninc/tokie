@@ -238,12 +238,12 @@ Loading `tokenizer.json` parses the JSON, builds the vocabulary, and, for BPE, b
 
 ## Verified tokenizers
 
-Every tokenizer below is tested against the Hugging Face tokenizer on 1 MB of [enwik8](https://mattmahoney.net/dc/textdata.html), about 300,000 tokens, in [CI](../../actions/workflows/tokenizer-accuracy.yml). Pass means every token matches.
+A passing tokenizer is tested against the Hugging Face tokenizer on 1 MB of [enwik8](https://mattmahoney.net/dc/textdata.html), about 300,000 tokens, in [CI](../../actions/workflows/tokenizer-accuracy.yml). Pass means every token matches. Not supported means tokie 0.2 refuses the file.
 
 The full matrix is in [docs/TOKENIZERS.md](docs/TOKENIZERS.md).
 
 <details>
-<summary>Full accuracy table, 74 models</summary>
+<summary>Full accuracy table, 75 models</summary>
 
 | Model | Type | Status |
 |-------|------|--------|
@@ -257,11 +257,11 @@ The full matrix is in [docs/TOKENIZERS.md](docs/TOKENIZERS.md).
 | [CodeLlama 7B](https://huggingface.co/tokiers/CodeLlama-7b-hf) | BPE | Pass |
 | [DeepSeek-V3](https://huggingface.co/tokiers/DeepSeek-V3) | BPE | Pass |
 | [DeepSeek-R1](https://huggingface.co/tokiers/DeepSeek-R1) | BPE | Pass |
-| [Gemma 2 2B](https://huggingface.co/tokiers/gemma-2-2b) | SentencePiece BPE | Pass |
-| [Gemma 3 4B](https://huggingface.co/tokiers/gemma-3-4b-it) | SentencePiece BPE | Pass |
+| [Gemma 2 2B](https://huggingface.co/tokiers/gemma-2-2b) | SentencePiece BPE | Not supported, splits on a space |
+| [Gemma 3 4B](https://huggingface.co/tokiers/gemma-3-4b-it) | SentencePiece BPE | Not supported, splits on a space |
 | [Llama 3.2 1B](https://huggingface.co/tokiers/Llama-3.2-1B) | BPE | Pass |
 | [Llama 4 Scout](https://huggingface.co/tokiers/Llama-4-Scout-17B-16E) | BPE | Pass |
-| [Mistral 7B](https://huggingface.co/tokiers/Mistral-7B-v0.1) | BPE | Pass |
+| [Mistral 7B](https://huggingface.co/tokiers/Mistral-7B-v0.1) | BPE | Not supported, metaspace prepend is first |
 | [Mistral Nemo](https://huggingface.co/tokiers/Mistral-Nemo-Base-2407) | BPE | Pass |
 | [Mixtral 8x7B](https://huggingface.co/tokiers/Mixtral-8x7B-v0.1) | BPE | Pass |
 | [NV-Embed-v2](https://huggingface.co/tokiers/NV-Embed-v2) | SentencePiece BPE | Pass |
@@ -285,7 +285,7 @@ The full matrix is in [docs/TOKENIZERS.md](docs/TOKENIZERS.md).
 | [BGE large en v1.5](https://huggingface.co/tokiers/bge-large-en-v1.5) | WordPiece | Pass |
 | [BGE small en v1.5](https://huggingface.co/tokiers/bge-small-en-v1.5) | WordPiece | Pass |
 | [BGE en ICL](https://huggingface.co/tokiers/bge-en-icl) | BPE | Pass |
-| [BGE M3](https://huggingface.co/tokiers/bge-m3) | SentencePiece BPE | Pass |
+| [BGE M3](https://huggingface.co/tokiers/bge-m3) | SentencePiece BPE | Not supported, regex replace |
 | [E5 base v2](https://huggingface.co/tokiers/e5-base-v2) | WordPiece | Pass |
 | [E5 large v2](https://huggingface.co/tokiers/e5-large-v2) | WordPiece | Pass |
 | [E5 small v2](https://huggingface.co/tokiers/e5-small-v2) | WordPiece | Pass |
@@ -318,13 +318,14 @@ The full matrix is in [docs/TOKENIZERS.md](docs/TOKENIZERS.md).
 | [Voyage Law 2](https://huggingface.co/tokiers/voyage-law-2) | BPE | Pass |
 | [Voyage Multilingual 2](https://huggingface.co/tokiers/voyage-multilingual-2) | BPE | Pass |
 | [Voyage Multimodal 3](https://huggingface.co/tokiers/voyage-multimodal-3) | BPE | Pass |
-| [Snowflake Arctic Embed v2](https://huggingface.co/tokiers/snowflake-arctic-embed-l-v2.0) | SentencePiece BPE | Pass |
+| [Snowflake Arctic Embed v2](https://huggingface.co/tokiers/snowflake-arctic-embed-l-v2.0) | SentencePiece BPE | Not supported, regex replace |
+| [potion multilingual 128M](https://huggingface.co/tokiers/potion-multilingual-128M) | Unigram | Not supported, regex replace |
 | [T5 base](https://huggingface.co/tokiers/t5-base) | Unigram | Pass |
 | [XLM-RoBERTa](https://huggingface.co/tokiers/xlm-roberta-base) | SentencePiece BPE | Pass |
 
 </details>
 
-**74 pass, 0 fail, out of 74 tested.** Every tokenizer's ids match Hugging Face tokenizers.
+**69 pass. 6 are not supported, out of 75 listed.** The passing tokenizers' ids match Hugging Face tokenizers.
 
 ## Why tokie?
 

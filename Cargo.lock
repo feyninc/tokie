@@ -225,6 +225,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "daggrs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d1092288af9ecfd5378565a17df11a13dbe172d4a71abe9b55a9689f1336b8e"
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1144,6 +1150,7 @@ name = "tokie"
 version = "0.2.0"
 dependencies = [
  "aho-corasick",
+ "daggrs",
  "hf-hub",
  "memchr",
  "normalie",

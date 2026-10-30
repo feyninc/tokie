@@ -136,6 +136,78 @@ fn kind<const MARKS: bool>(ch: char) -> Class {
     }
 }
 
+/// Class of a hiragana or katakana scalar at `i`, U+3040..=U+30FF.
+/// `None` is outside that block.
+///
+/// Letters stay letters. U+3099 and U+309A are marks, so they are letters
+/// only when `MARKS` is set. The two punctuation marks, the two modifier
+/// symbols, and the unassigned scalars are other. Nothing here is whitespace
+/// or a number.
+fn kana_kind<const MARKS: bool>(bytes: &[u8], i: usize) -> Option<Class> {
+    if i + 3 > bytes.len() || bytes[i] != 0xE3 {
+        return None;
+    }
+    let b1 = bytes[i + 1];
+    let b2 = bytes[i + 2];
+    if b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let class = match b1 {
+        0x81 => {
+            if b2 == 0x80 {
+                Class::Other
+            } else {
+                Class::Letter
+            }
+        }
+        0x82 => match b2 {
+            0x80..=0x96 | 0x9D..=0x9F | 0xA1..=0xBF => Class::Letter,
+            0x99 | 0x9A if MARKS => Class::Letter,
+            _ => Class::Other,
+        },
+        0x83 => {
+            if b2 == 0xBB {
+                Class::Other
+            } else {
+                Class::Letter
+            }
+        }
+        _ => return None,
+    };
+    Some(class)
+}
+
+/// Class of a Thai scalar at `i`, U+0E00..=U+0E7F. `None` is outside that block.
+///
+/// Letters are U+0E01..=U+0E30, U+0E32..=U+0E33, and U+0E40..=U+0E46.
+/// The vowel and tone marks are letters only when `MARKS` is set. Digits
+/// are U+0E50..=U+0E59. Nothing in the block is whitespace.
+fn thai_kind<const MARKS: bool>(bytes: &[u8], i: usize) -> Option<Class> {
+    if i + 3 > bytes.len() || bytes[i] != 0xE0 {
+        return None;
+    }
+    let b1 = bytes[i + 1];
+    let b2 = bytes[i + 2];
+    if b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let class = match b1 {
+        0xB8 => match b2 {
+            0x81..=0xB0 | 0xB2..=0xB3 => Class::Letter,
+            0xB1 | 0xB4..=0xBA if MARKS => Class::Letter,
+            _ => Class::Other,
+        },
+        0xB9 => match b2 {
+            0x80..=0x86 => Class::Letter,
+            0x87..=0x8E if MARKS => Class::Letter,
+            0x90..=0x99 => Class::Number,
+            _ => Class::Other,
+        },
+        _ => return None,
+    };
+    Some(class)
+}
+
 fn is_mark(ch: char) -> bool {
     matches!(
         get_general_category(ch),
@@ -186,6 +258,18 @@ fn char_at<const MARKS: bool>(bytes: &[u8], i: usize) -> Char {
             whitespace,
         };
     }
+    // Hiragana and katakana have a fixed class. Decoding them and searching
+    // the category table was the pretok cost of a Japanese run.
+    if let Some(class) = kana_kind::<MARKS>(bytes, i).or_else(|| thai_kind::<MARKS>(bytes, i)) {
+        return Char {
+            len: 3,
+            letter: class == Class::Letter,
+            number: class == Class::Number,
+            space: false,
+            crlf: false,
+            whitespace: false,
+        };
+    }
     let (ch, len) = decode_char(bytes, i);
     let class = kind::<MARKS>(ch);
     Char {
@@ -207,10 +291,44 @@ fn decode_char(bytes: &[u8], i: usize) -> (char, usize) {
     } else {
         4
     };
+    // The piece is already valid UTF-8. Assembling the scalar skips the
+    // validating copy that `from_utf8` does on every CJK character.
+    if i + width <= bytes.len()
+        && let Some(cp) = scalar(bytes, i, width)
+        && let Some(ch) = char::from_u32(cp)
+        && ch.len_utf8() == width
+    {
+        return (ch, width);
+    }
     let end = (i + width).min(bytes.len());
     let rest = std::str::from_utf8(&bytes[i..end]).expect("piece boundary is a char boundary");
     let ch = rest.chars().next().expect("i is inside bytes");
     (ch, ch.len_utf8())
+}
+
+fn scalar(bytes: &[u8], i: usize, width: usize) -> Option<u32> {
+    let b0 = bytes[i] as u32;
+    let b1 = bytes[i + 1];
+    if b1 & 0xC0 != 0x80 {
+        return None;
+    }
+    let b1 = b1 as u32 & 0x3F;
+    if width == 2 {
+        return Some(((b0 & 0x1F) << 6) | b1);
+    }
+    let b2 = bytes[i + 2];
+    if b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let b2 = b2 as u32 & 0x3F;
+    if width == 3 {
+        return Some(((b0 & 0x0F) << 12) | (b1 << 6) | b2);
+    }
+    let b3 = bytes[i + 3];
+    if b3 & 0xC0 != 0x80 {
+        return None;
+    }
+    Some(((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | (b3 as u32 & 0x3F))
 }
 
 fn is_prefix(ch: &Char) -> bool {
@@ -402,8 +520,14 @@ fn absorb<const MARKS: bool>(bytes: &[u8], pos: usize, mut bits: u64) -> Absorbe
                 tail_nonws: false,
             };
         }
-        let (ch, n) = decode_char(bytes, pos + i);
-        let class = kind::<MARKS>(ch);
+        let (n, class) = if let Some(class) =
+            kana_kind::<MARKS>(bytes, pos + i).or_else(|| thai_kind::<MARKS>(bytes, pos + i))
+        {
+            (3, class)
+        } else {
+            let (ch, n) = decode_char(bytes, pos + i);
+            (n, kind::<MARKS>(ch))
+        };
         // The character starts in this window and continues past it. Its
         // class still decides whether the whitespace run in front splits.
         if i + n > 64 {
@@ -525,7 +649,9 @@ fn bits<const DIGITS3: bool, const MARKS: bool>(
         | ((leads & lead2) & (seen_nonws >> 2))
         | ((leads & lead3) & (seen_nonws >> 3))
         | ((leads & lead4) & (seen_nonws >> 4));
-    if !next_ws {
+    // The byte after this window is content only when a byte is there.
+    // A run that reaches the end of the text stays one piece.
+    if !next_ws && !eof {
         split_ok |= (ws_lead1 & (1u64 << 63))
             | ((leads & lead2) & (1u64 << 62))
             | ((leads & lead3) & (1u64 << 61))
@@ -551,11 +677,17 @@ fn bits<const DIGITS3: bool, const MARKS: bool>(
         let q = 63 - (nl & run).leading_zeros();
         if q + 1 < e {
             b_ws |= 1u64 << (q + 1);
-        let tail = run & mask_from(q + 1);
-        let tail_leads = tail & leads;
-        if tail_leads != 0 {
-            b_ws |= 1u64 << (63 - tail_leads.leading_zeros());
-        }
+            let tail = run & mask_from(q + 1);
+            let tail_leads = tail & leads;
+            if tail_leads != 0 {
+                let last = 63 - tail_leads.leading_zeros();
+                // The last whitespace byte is its own piece when content
+                // follows. A run that reaches the end of the text stays whole.
+                let run_ends_text = eof && e >= 64 && !(tail_nonws && stop < 64);
+                if !run_ends_text {
+                    b_ws |= 1u64 << last;
+                }
+            }
         }
         runs_n &= !run;
     }

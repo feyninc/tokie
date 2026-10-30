@@ -58,12 +58,18 @@ fn cache_roundtrip_for_short_and_long_pieces() {
     assert!(cache.lookup(b"Hello", &mut out));
     assert_eq!(out, [1, 2]);
 
-    let long = b"this piece is longer than fifteen bytes";
-    assert!(pack(long).is_none());
-    cache.insert(long, &[9, 8, 7, 6, 5]);
+    let long = vec![b'a'; 32];
+    assert!(pack(&long).is_none());
+    cache.insert(&long, &[9, 8, 7, 6, 5]);
     out.clear();
-    assert!(cache.lookup(long, &mut out));
+    assert!(cache.lookup(&long, &mut out));
     assert_eq!(out, [9, 8, 7, 6, 5]);
+
+    let past = vec![b'a'; 33];
+    cache.insert(&past, &[1]);
+    out.clear();
+    assert!(!cache.lookup(&past, &mut out));
+    assert!(out.is_empty());
 }
 
 #[test]

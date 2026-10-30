@@ -52,6 +52,7 @@ const STEP_LITERAL: u16 = 3;
 const FLAG_PREFIX: u8 = 1;
 const FLAG_MARK: u8 = 2;
 const FLAG_STRIP: u8 = 4;
+const FLAG_IGNORE: u8 = 8;
 const SLOT_PRESENT: u32 = 1;
 const SLOT_SPECIAL: u32 = 2;
 
@@ -90,6 +91,8 @@ pub(crate) struct Image {
     pub prefix_space: bool,
     pub mark: bool,
     pub strip_space: bool,
+    /// A whole pretok piece that is one vocab token skips the merge list.
+    pub ignore_merges: bool,
     pub unk: u32,
     pub max_chars: u32,
     pub vocab_len: u32,
@@ -381,6 +384,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Image, String> {
         prefix_space: flags & FLAG_PREFIX != 0,
         mark: flags & FLAG_MARK != 0,
         strip_space: flags & FLAG_STRIP != 0,
+        ignore_merges: flags & FLAG_IGNORE != 0,
         unk,
         max_chars,
         vocab_len,
@@ -788,6 +792,9 @@ fn meta_blob(image: &Image, tab: &mut Tab) -> Result<Blob, String> {
     }
     if image.strip_space {
         meta[1] |= FLAG_STRIP;
+    }
+    if image.ignore_merges {
+        meta[1] |= FLAG_IGNORE;
     }
     meta[2..4].copy_from_slice(&cut_code(image.cut).to_le_bytes());
     meta[4..8].copy_from_slice(&image.unk.to_le_bytes());

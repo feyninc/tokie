@@ -120,6 +120,11 @@ fn advance(bytes: &[u8], pos: usize) -> usize {
         }
         return scan_word(bytes, pos + 1);
     }
+    // Kana and unified ideographs are not punctuation, so they stay in the
+    // word and never consult the category table.
+    if let Some(n) = kana_span(bytes, pos).or_else(|| han_span(bytes, pos)) {
+        return scan_word(bytes, pos + n);
+    }
     let (ch, n) = decode(bytes, pos);
     if is_unicode_punct(ch) {
         return pos + n;
@@ -137,6 +142,10 @@ fn scan_word(bytes: &[u8], mut pos: usize) -> usize {
             pos += 1;
             continue;
         }
+        if let Some(n) = kana_span(bytes, pos).or_else(|| han_span(bytes, pos)) {
+            pos += n;
+            continue;
+        }
         let (ch, n) = decode(bytes, pos);
         if ch.is_whitespace() || is_unicode_punct(ch) {
             return pos;
@@ -144,6 +153,44 @@ fn scan_word(bytes: &[u8], mut pos: usize) -> usize {
         pos += n;
     }
     pos
+}
+
+/// Three bytes of hiragana or katakana, excluding the two punctuation marks.
+/// U+30A0 is a dash and U+30FB is a middle dot. Everything else in
+/// U+3040..=U+30FF stays in the word, including the combining voicing marks.
+fn kana_span(bytes: &[u8], pos: usize) -> Option<usize> {
+    if pos + 3 > bytes.len() {
+        return None;
+    }
+    let b0 = bytes[pos];
+    let b1 = bytes[pos + 1];
+    let b2 = bytes[pos + 2];
+    if b0 != 0xE3 || b1 & 0xC0 != 0x80 || b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let word = match b1 {
+        0x81 => true,
+        0x82 => b2 != 0xA0,
+        0x83 => b2 != 0xBB,
+        _ => false,
+    };
+    word.then_some(3)
+}
+
+/// Three bytes of a unified ideograph, U+4E00..=U+9FFF. Those are
+/// Other_Letter: not whitespace and not punctuation.
+fn han_span(bytes: &[u8], pos: usize) -> Option<usize> {
+    if pos + 3 > bytes.len() {
+        return None;
+    }
+    let b0 = bytes[pos];
+    let b1 = bytes[pos + 1];
+    let b2 = bytes[pos + 2];
+    if b1 & 0xC0 != 0x80 || b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let han = matches!(b0, 0xE5..=0xE8) || (b0 == 0xE4 && b1 >= 0xB8) || b0 == 0xE9;
+    han.then_some(3)
 }
 
 fn decode(bytes: &[u8], i: usize) -> (char, usize) {
@@ -171,6 +218,9 @@ fn continues_word(bytes: &[u8], at: usize) -> bool {
     if b < 0x80 {
         return !is_ascii_ws(b) && !is_ascii_punct(b);
     }
+    if kana_span(bytes, at).is_some() || han_span(bytes, at).is_some() {
+        return true;
+    }
     let (ch, _) = decode(bytes, at);
     !ch.is_whitespace() && !is_unicode_punct(ch)
 }
@@ -178,6 +228,12 @@ fn continues_word(bytes: &[u8], at: usize) -> bool {
 #[inline(always)]
 fn window<const ISA: u8>(bytes: &[u8], pos: usize) -> Option<Window> {
     if pos + 64 > bytes.len() {
+        return None;
+    }
+    // A non-ASCII lead makes the window empty: the classifier stops at byte 0.
+    // Chinese text starts almost every piece on an ideograph, so the 64-byte
+    // classify would be discarded.
+    if bytes[pos] >= 0x80 {
         return None;
     }
     let masks = masks_for::<ISA>(bytes, pos);

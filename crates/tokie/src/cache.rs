@@ -3,14 +3,20 @@
 //! A piece of 15 bytes or fewer packs into one `u128`. The short table is
 //! open addressing over 32-byte entries, two to a cache line. Encodings of
 //! four ids or fewer sit in the entry when the first id fits in 24 bits.
-//! The rest sit in an arena. A longer piece uses a second table.
+//! The rest sit in an arena. A piece of 16 to 32 bytes uses a second table.
+//! One that contains a unified ideograph is stored on its second sight:
+//! the first sight is almost always the last, and keeping it grows that
+//! table until the encode rehashes it. A longer piece is not stored.
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::ptr::NonNull;
 
 /// Bit 7 of the packed value. The low 7 bits are the token count.
 const SPILL: u64 = 0x80;
+/// Bits in the first-sight filter for 16 to 32 byte pieces.
+const SEEN_BITS: usize = 1 << 18;
+const SEEN_WORDS: usize = SEEN_BITS / 64;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -72,7 +78,10 @@ pub struct Cache {
     /// lookups in one process must agree, so this is fixed at construction.
     crc: bool,
     arena: Vec<u32>,
-    long: HashMap<Vec<u8>, Vec<u32>>,
+    /// Pieces of 16 to 32 bytes. Longer pieces are not stored.
+    long: FxHashMap<Vec<u8>, Vec<u32>>,
+    /// First sights of a 16 to 32 byte piece. The second sight stores it.
+    seen: Box<[u64]>,
 }
 
 impl Cache {
@@ -84,7 +93,8 @@ impl Cache {
             len: 0,
             crc: crc_available(),
             arena: Vec::new(),
-            long: HashMap::new(),
+            long: FxHashMap::default(),
+            seen: vec![0; SEEN_WORDS].into_boxed_slice(),
         }
     }
 
@@ -109,6 +119,7 @@ impl Cache {
             crc: self.crc,
             arena: self.arena.clone(),
             long: self.long.clone(),
+            seen: self.seen.clone(),
         }
     }
 
@@ -144,6 +155,11 @@ impl Cache {
     #[inline(always)]
     pub fn probe<const CRC: bool>(&self, piece: &[u8], out: &mut Vec<u32>) -> bool {
         let Some(key) = pack(piece) else {
+            // Past 32 bytes the next miss is almost always a new piece, and
+            // storing it allocates a key. English stays at or under 27 bytes.
+            if piece.len() > 32 {
+                return false;
+            }
             let Some(ids) = self.long.get(piece) else {
                 return false;
             };
@@ -170,12 +186,46 @@ impl Cache {
         }
     }
 
+/// Remember `ids` for `piece`. A 16 to 32 byte piece that contains a
+/// unified ideograph waits for a second sight: those pieces do not
+/// repeat, and storing each one rehashes the map during encode. Thai,
+/// kana, and ASCII in that length are stored immediately. A loaded or
+/// warmed piece uses [`Self::insert`] and does not wait.
+    pub fn admit(&mut self, piece: &[u8], ids: &[u32]) {
+        if piece.is_empty() || ids.is_empty() {
+            return;
+        }
+        if pack(piece).is_none() {
+            if piece.len() > 32 || (han_piece(piece) && !self.mark(piece)) {
+                return;
+            }
+        }
+        self.insert(piece, ids);
+    }
+
+    /// True when `piece` was marked by an earlier miss.
+    fn mark(&mut self, piece: &[u8]) -> bool {
+        let mut hash = 0x9E37_79B9_7F4A_7C15u64;
+        for &byte in piece {
+            hash = hash.wrapping_mul(0x100_0000_01B3).wrapping_add(u64::from(byte));
+        }
+        let one = (hash as usize) & (SEEN_BITS - 1);
+        let two = (hash.wrapping_mul(0xBF58_476D_1CE4_E5B9) as usize) & (SEEN_BITS - 1);
+        let again = seen_bit(&self.seen, one) && seen_bit(&self.seen, two);
+        set_seen(&mut self.seen, one);
+        set_seen(&mut self.seen, two);
+        again
+    }
+
     /// Remember `ids` for `piece`. An empty piece is ignored.
     pub fn insert(&mut self, piece: &[u8], ids: &[u32]) {
         if piece.is_empty() || ids.is_empty() {
             return;
         }
         let Some(key) = pack(piece) else {
+            if piece.len() > 32 {
+                return;
+            }
             self.long.insert(piece.to_vec(), ids.to_vec());
             return;
         };
@@ -541,6 +591,18 @@ fn advise(ptr: *mut u8, bytes: usize, advice: i32) {
     let _ = (ptr, bytes, advice);
 }
 
+fn han_piece(piece: &[u8]) -> bool {
+    piece.iter().any(|&byte| (0xE4..=0xE9).contains(&byte))
+}
+
+fn seen_bit(words: &[u64], bit: usize) -> bool {
+    (words[bit / 64] >> (bit % 64)) & 1 == 1
+}
+
+fn set_seen(words: &mut [u64], bit: usize) {
+    words[bit / 64] |= 1u64 << (bit % 64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Cache, Prep, Table, mix, pack, pack_spans};
@@ -639,9 +701,10 @@ mod tests {
     ///
     /// Covers every one-byte piece, every two-byte piece whose bytes are
     /// below 16, every three-byte piece whose bytes are below 8, every
-    /// inline id below 2^24, the first spilled id, and pieces longer than
-    /// 15 bytes. Insertion order is forward, reversed, and a fixed scramble.
-    /// The short pieces share one table, so growth and open addressing both run.
+    /// inline id below 2^24, the first spilled id, and pieces of 16 and 32
+    /// bytes. A longer piece is not stored. Insertion order is forward,
+    /// reversed, and a fixed scramble. The short pieces share one table, so
+    /// growth and open addressing both run.
     #[test]
     fn cache_roundtrip_returns_inserted_ids() {
         let mut samples: Vec<(Vec<u8>, Vec<u32>)> = Vec::new();
@@ -690,6 +753,11 @@ mod tests {
                 cache.insert(piece, ids);
             }
             check_samples(&cache, &samples);
+            let piece = vec![0x20; 33];
+            cache.insert(&piece, &[9]);
+            let mut out = Vec::new();
+            assert!(!cache.lookup(&piece, &mut out), "a piece past 32 bytes is not stored");
+            assert!(out.is_empty());
         }
 
         let mut cache = Cache::new();
@@ -714,6 +782,24 @@ mod tests {
         let mut out = Vec::new();
         assert!(cache.lookup(b"z", &mut out));
         assert_eq!(out, vec![2, 3]);
+
+        let mut cache = Cache::new();
+        let medium = vec![0xE4, 0xBD, 0xA0].repeat(8);
+        cache.admit(&medium, &[4, 5]);
+        let mut out = Vec::new();
+        assert!(!cache.lookup(&medium, &mut out));
+        cache.admit(&medium, &[4, 5]);
+        assert!(cache.lookup(&medium, &mut out));
+        assert_eq!(out, vec![4, 5]);
+        let thai = vec![0xE0, 0xB8, 0x81].repeat(8);
+        cache.admit(&thai, &[6]);
+        out.clear();
+        assert!(cache.lookup(&thai, &mut out));
+        assert_eq!(out, vec![6]);
+        cache.admit(b"hi", &[8]);
+        out.clear();
+        assert!(cache.lookup(b"hi", &mut out));
+        assert_eq!(out, vec![8]);
     }
 
     fn check_samples(cache: &Cache, samples: &[(Vec<u8>, Vec<u32>)]) {

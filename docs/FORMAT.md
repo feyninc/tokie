@@ -102,7 +102,7 @@ After sorting entries by offset, the first offset is `blob_base`, each next offs
 | 20 | wp | WordPiece string span plus id |
 | 21 | pieces | piece bytes plus the ids |
 
-`meta` holds the model, the cut code, three flags (`prefix_space`, `mark`, `strip_space`), the unk id, WordPiece `max_chars`, vocab length, the WordPiece prefix span, and the unigram unk score as `f64` bits. The model byte is 1 for BPE, 2 for WordPiece, 3 for Unigram, and 4 for SentencePiece BPE. Cut codes are fixed numbers in the file module, not the order of the Rust enum. The match that writes them is exhaustive, so a new cut fails to compile until it has a code.
+`meta` holds the model, the cut code, four flags (`prefix_space`, `mark`, `strip_space`, `ignore_merges`), the unk id, WordPiece `max_chars`, vocab length, the WordPiece prefix span, and the unigram unk score as `f64` bits. `ignore_merges` is bit 3 of the flag byte. A set bit means a pretok piece whose byte-level spelling is one vocab token is emitted as that token, and the merge list runs only when that spelling is absent. An old file leaves the bit clear, so every piece still merges. The model byte is 1 for BPE, 2 for WordPiece, 3 for Unigram, and 4 for SentencePiece BPE. Cut codes are fixed numbers in the file module, not the order of the Rust enum. The match that writes them is exhaustive, so a new cut fails to compile until it has a code.
 
 A slot stores the lead span, the next span, the token span, and a present bit plus a special bit. A hole uses `u32::MAX` for the offsets and length 0. `pairs` stores rank and id separately because rank is the merge index.
 
