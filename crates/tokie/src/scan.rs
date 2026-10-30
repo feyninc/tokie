@@ -51,9 +51,16 @@ struct Scratch {
 /// run asks the same token boundary many times, and each miss walks the
 /// split tree through the pair table. The walk is never built for English
 /// or OpenWebText, so this table stays empty there.
+///
+/// `owner` is [`Pairs::stamp`]. A second model on the same thread has
+/// different token ids in the same slots, so the table is dropped when the
+/// stamp changes. The hit path is still one slot compare. `stuck` means the
+/// split walk gave up; that answer is not stored.
 struct Memo {
     key: Vec<u64>,
     bit: Vec<u64>,
+    owner: u64,
+    stuck: bool,
 }
 
 const MEMO_BITS: u32 = 16;
@@ -67,7 +74,19 @@ thread_local! {
     static PAIR_MEMO: RefCell<Memo> = RefCell::new(Memo {
         key: Vec::new(),
         bit: Vec::new(),
+        owner: 0,
+        stuck: false,
     });
+}
+
+fn bind_memo(memo: &mut Memo, pairs: &Pairs) {
+    memo.stuck = false;
+    let owner = pairs.stamp();
+    if memo.owner == owner {
+        return;
+    }
+    memo.owner = owner;
+    memo.key.fill(0);
 }
 
 impl Scan {
@@ -155,6 +174,7 @@ impl Scan {
         // times, and taking the memo on each check cost more than the hit.
         PAIR_MEMO.with(|memo| {
             let memo = &mut *memo.borrow_mut();
+            bind_memo(memo, pairs);
             SCRATCH.with(|scratch| {
                 let mut scratch = scratch.borrow_mut();
                 let Scratch { tokens, bits } = &mut *scratch;
@@ -192,6 +212,8 @@ impl Scan {
                                 next_match(&self.matcher, &text[pos..])
                             };
                             break;
+                        } else if memo.stuck {
+                            return false;
                         } else if let Some(shorter) = self.prefix(token) {
                             token = shorter;
                         } else {
@@ -220,6 +242,7 @@ impl Scan {
     pub(crate) fn try_short(&self, pairs: &Pairs, text: &[u8], out: &mut Vec<u32>) -> bool {
         PAIR_MEMO.with(|memo| {
             let memo = &mut *memo.borrow_mut();
+            bind_memo(memo, pairs);
             self.try_short_memo(pairs, text, out, memo)
         })
     }
@@ -266,6 +289,8 @@ impl Scan {
                         next_match(&self.matcher, &text[pos..])
                     };
                     break;
+                } else if memo.stuck {
+                    return false;
                 } else if let Some(shorter) = self.prefix(token) {
                     token = shorter;
                 } else {
@@ -507,13 +532,22 @@ fn memo_probe(
     let packed = ((left as u64) << 32) | right as u64;
     let stored = packed.wrapping_add(1);
     if stored == 0 {
-        return valid_pair(pairs, split, merges, left, right);
+        return match valid_pair(pairs, split, merges, left, right) {
+            Some(ok) => ok,
+            None => {
+                memo.stuck = true;
+                false
+            }
+        };
     }
     let slot = (packed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - MEMO_BITS)) as usize;
     if memo.key[slot] == stored {
         return (memo.bit[slot / 64] >> (slot % 64)) & 1 == 1;
     }
-    let ok = valid_pair(pairs, split, merges, left, right);
+    let Some(ok) = valid_pair(pairs, split, merges, left, right) else {
+        memo.stuck = true;
+        return false;
+    };
     memo.key[slot] = stored;
     let word = slot / 64;
     let mask = 1u64 << (slot % 64);
@@ -531,14 +565,14 @@ fn valid_pair(
     merges: &MergeBits,
     mut left: u32,
     mut right: u32,
-) -> bool {
+) -> Option<bool> {
     let mut limit = u32::MAX;
     for _ in 0..128 {
         if merges.may_hold(left, right)
             && let Some(pair) = pairs.lookup(left, right)
             && pair.id < limit
         {
-            return false;
+            return Some(false);
         }
         if left > right {
             limit = left;
@@ -547,7 +581,7 @@ fn valid_pair(
                 limit = right + 1;
                 let side = split.get(right as usize).map(|row| row.left).unwrap_or(right);
                 if side + 1 == limit {
-                    return true;
+                    return Some(true);
                 }
                 right = side;
             } else {
@@ -560,7 +594,7 @@ fn valid_pair(
                 limit = left;
                 let side = split.get(left as usize).map(|row| row.right).unwrap_or(left);
                 if side == limit {
-                    return true;
+                    return Some(true);
                 }
                 left = side;
             } else {
@@ -568,7 +602,7 @@ fn valid_pair(
             }
         }
     }
-    false
+    None
 }
 
 #[cfg(test)]
@@ -687,5 +721,26 @@ mod tests {
         let mut prefixed = vec![0xEF, 0xBC, 0x8C];
         prefixed.extend(han[..24].iter().copied());
         assert!(super::worth_sparse_han(&prefixed, true, true));
+    }
+
+    #[test]
+    fn the_pair_memo_follows_the_merge_table() {
+        let mut memo = super::Memo {
+            key: vec![1; super::MEMO_LEN],
+            bit: vec![0; super::MEMO_LEN / 64],
+            owner: 0,
+            stuck: true,
+        };
+        let first = rules();
+        super::bind_memo(&mut memo, &first);
+        assert!(!memo.stuck);
+        assert!(memo.key.iter().all(|slot| *slot == 0));
+        memo.key[3] = 9;
+        super::bind_memo(&mut memo, &first);
+        assert_eq!(memo.key[3], 9);
+        let second = rules();
+        super::bind_memo(&mut memo, &second);
+        assert_eq!(memo.key[3], 0);
+        assert_ne!(first.stamp(), second.stamp());
     }
 }

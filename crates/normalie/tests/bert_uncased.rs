@@ -25,4 +25,13 @@ fn bert_uncased_is_one_pass() {
     assert_eq!(apply("\n"), " ");
     assert_eq!(apply("\u{7f}"), "");
     assert_eq!(apply("\u{378}"), "\u{378}");
+    // U+F900 decomposes to U+8C48. The spaces are the CJK padding.
+    assert_eq!(apply("\u{F900}"), " \u{8C48} ");
+    assert_eq!(apply("\u{2F800}"), " \u{4E3D} ");
+    assert_eq!(apply("\u{3040}"), "");
+    assert_eq!(apply("\u{3097}"), "");
+    assert_eq!(apply("\u{3098}"), "");
+    let mut cased = String::new();
+    assert!(normalie::BertCased::write("\u{F900}", true, &mut cased));
+    assert_eq!(cased, " \u{F900} ");
 }

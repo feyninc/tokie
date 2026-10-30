@@ -74,6 +74,9 @@ pub struct Pairs {
     /// Every use of a merged id has a worse rank than the merge that made it.
     /// Long pieces can then apply every copy of the winning pair in one pass.
     batch: bool,
+    /// Identity of this table for the walk's pair memo. A new table gets a
+    /// new stamp, including when an old allocation is reused.
+    stamp: u64,
 }
 
 /// Bloom filter of wide merge pairs. False positives still probe `slots`.
@@ -129,6 +132,12 @@ fn wide_on(words: &[u64], bit: usize) -> bool {
     (words[bit / 64] >> (bit % 64)) & 1 == 1
 }
 
+fn next_stamp() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Pairs {
     pub fn from_list(rows: &[(u32, u32, u32, u32)]) -> Self {
         let mut max_id = 0u32;
@@ -160,6 +169,7 @@ impl Pairs {
             merged_by_rank: vec![0; max_rank as usize + 1].into_boxed_slice(),
             rows: rows.to_vec(),
             batch: batches(rows),
+            stamp: next_stamp(),
         };
         for &(left, right, rank, id) in rows {
             pairs.place(left, right, rank, id);
@@ -170,6 +180,10 @@ impl Pairs {
     /// `(left, right, rank, id)` in insertion order.
     pub fn rows(&self) -> &[(u32, u32, u32, u32)] {
         &self.rows
+    }
+
+    pub(crate) fn stamp(&self) -> u64 {
+        self.stamp
     }
 
     #[inline(always)]

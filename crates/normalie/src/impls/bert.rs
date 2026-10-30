@@ -126,15 +126,33 @@ fn push_island<const CLEAN: bool, const CJK: bool, const ACCENTS: bool, const LO
     island: &str,
     out: &mut String,
 ) {
-    // An ideograph is never a control, a mark, or a lowercase mapping, and
-    // NFD does not decompose it. Emitting it directly skips the category
+    // A unified ideograph is never a control, a mark, or a lowercase mapping,
+    // and NFD leaves it in place. Emitting it directly skips the category
     // search and the normalizer, which are the whole cost of a CJK island.
+    // A compatibility ideograph is still spaced here, then NFD runs on that
+    // one character: U+F900 is U+8C48 after NFD, and the fast emit would
+    // have kept the compatibility form.
     let mut pending = String::new();
     for c in island.chars() {
-        if CJK && is_cjk(c) {
+        // The basic ideograph block is the whole CJK island in real text.
+        // Its body is the direct emit: no normalizer, no second range check.
+        let cp = c as u32;
+        if CJK && cp >= 0x4E00 && cp <= 0x9FFF {
             finish::<ACCENTS, LOWER>(&mut pending, out);
             out.push(' ');
             out.push(c);
+            out.push(' ');
+            continue;
+        }
+        if CJK && cp >= 0x3400 && other_cjk(c) {
+            finish::<ACCENTS, LOWER>(&mut pending, out);
+            out.push(' ');
+            if ACCENTS && compat_ideograph(c) {
+                pending.push(c);
+                finish::<ACCENTS, LOWER>(&mut pending, out);
+            } else {
+                out.push(c);
+            }
             out.push(' ');
             continue;
         }
@@ -243,7 +261,7 @@ fn kana_stripped(c: char) -> Option<Option<char>> {
         return None;
     }
     Some(match cp {
-        0x3099 | 0x309A => None,
+        0x3040 | 0x3097 | 0x3098 | 0x3099 | 0x309A => None,
         0x304C => Some('\u{304B}'),
         0x304E => Some('\u{304D}'),
         0x3050 => Some('\u{304F}'),
@@ -297,10 +315,18 @@ fn kana_stripped(c: char) -> Option<Option<char>> {
 }
 
 fn is_cjk(c: char) -> bool {
+    let cp = c as u32;
+    (0x4E00..=0x9FFF).contains(&cp) || other_cjk(c)
+}
+
+/// Ideographs outside the basic block, including compatibility ideographs.
+/// The basic block is handled before this, so a Latin letter fails one
+/// compare and then these ranges.
+#[inline(always)]
+fn other_cjk(c: char) -> bool {
     matches!(
         c as u32,
-        0x4E00..=0x9FFF
-            | 0x3400..=0x4DBF
+        0x3400..=0x4DBF
             | 0x20000..=0x2A6DF
             | 0x2A700..=0x2B73F
             | 0x2B740..=0x2B81F
@@ -308,4 +334,9 @@ fn is_cjk(c: char) -> bool {
             | 0xF900..=0xFAFF
             | 0x2F800..=0x2FA1F
     )
+}
+
+/// Compatibility ideographs. NFD maps these onto unified ideographs.
+fn compat_ideograph(c: char) -> bool {
+    matches!(c as u32, 0xF900..=0xFAFF | 0x2F800..=0x2FA1F)
 }

@@ -161,12 +161,22 @@ impl VocabTrie {
         let bytes = word.as_bytes();
         let cont = if prefix.is_empty() {
             0
-        } else {
-            let Some(node) = self.walk(0, prefix.as_bytes()) else {
-                out.push(unk);
-                return;
-            };
+        } else if let Some(node) = self.walk(0, prefix.as_bytes()) {
             node
+        } else {
+            // No continuation entry starts with the prefix. A word that is
+            // itself a vocab token still resolves from the root. Anything
+            // that would need a second piece is `unk`.
+            let mark = out.len();
+            if let Some((end, id)) = self.longest(0, bytes, 0)
+                && end == bytes.len()
+            {
+                out.push(id);
+                return;
+            }
+            out.truncate(mark);
+            out.push(unk);
+            return;
         };
         let mark = out.len();
         let mut start = 0usize;
@@ -257,6 +267,24 @@ mod tests {
             map.insert(token.clone(), *id);
         }
         for word in ["你好", "hello", "你", "xyz", "cats", "a", "j"] {
+            let mut slow = Vec::new();
+            let mut scratch = String::new();
+            wordpiece(word, 99, 100, "##", &mut scratch, |token| map.get(token).copied(), &mut slow);
+            let mut fast = Vec::new();
+            trie.encode(word, 99, 100, "##", &mut fast);
+            assert_eq!(fast, slow, "{word}");
+        }
+    }
+
+    #[test]
+    fn a_missing_prefix_still_resolves_a_whole_word() {
+        let rows = vec![("hello".to_string(), 4), ("hel".to_string(), 5)];
+        let trie = VocabTrie::from_rows(rows.clone());
+        let mut map = std::collections::HashMap::new();
+        for (token, id) in &rows {
+            map.insert(token.clone(), *id);
+        }
+        for word in ["hello", "hel", "hello!", "lo"] {
             let mut slow = Vec::new();
             let mut scratch = String::new();
             wordpiece(word, 99, 100, "##", &mut scratch, |token| map.get(token).copied(), &mut slow);
