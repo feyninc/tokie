@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 /// Whether [`Tokenizer::decode`] writes special tokens.
@@ -188,38 +188,20 @@ struct Tables {
     scan: OnceLock<Option<crate::scan::Scan>>,
 }
 
-struct Worker {
-    tx: mpsc::Sender<Job>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-enum Job {
-    Batch(Vec<String>, mpsc::Sender<Chunk>),
-    Stop,
-}
-
-struct Chunk {
-    ids: Vec<u32>,
-    ends: Vec<usize>,
-    error: Option<String>,
-}
-
+/// Worker tokenizers kept across `batch` calls so their piece caches stay warm.
+/// Each `batch` borrows the caller's texts for the scope of that call, so the
+/// documents are not copied into `String`s.
 struct Pool {
-    workers: Vec<Worker>,
+    kids: Vec<Tokenizer>,
 }
 
 impl Pool {
     fn new() -> Self {
-        Self { workers: Vec::new() }
+        Self { kids: Vec::new() }
     }
 
     fn stop(&mut self) {
-        for worker in self.workers.drain(..) {
-            let _ = worker.tx.send(Job::Stop);
-            if let Some(thread) = worker.thread {
-                let _ = thread.join();
-            }
-        }
+        self.kids.clear();
     }
 }
 
@@ -630,30 +612,38 @@ impl Tokenizer {
         if workers == 1 || texts.len() == 1 {
             return self.batch_here(texts, ids, ends);
         }
-        self.start_workers(workers);
-        let ranges = chunk_ranges(texts.len(), self.pool.workers.len());
-        let mut replies = Vec::with_capacity(ranges.len());
-        for (worker, (start, end)) in self.pool.workers.iter().zip(ranges) {
-            let (tx, rx) = mpsc::channel();
-            let owned: Vec<String> = texts[start..end].iter().map(|text| (*text).to_string()).collect();
-            worker
-                .tx
-                .send(Job::Batch(owned, tx))
-                .map_err(|_| Error::new("batch worker stopped"))?;
-            replies.push(rx);
+        self.ensure_kids(workers);
+        let ranges = chunk_ranges(texts.len(), self.pool.kids.len());
+        // One token per 3 input bytes over-allocates GPT-2 on OpenWebText
+        // (about one per 4.4 bytes) and still covers every BPE corpus we ship.
+        // Each worker writes at the front of its region. A spill means that
+        // guess was short and that chunk owns its ids instead.
+        let mut budgets = Vec::with_capacity(ranges.len());
+        for &(start, end) in &ranges {
+            let bytes: usize = texts[start..end].iter().map(|text| text.len()).sum();
+            let docs = end - start;
+            budgets.push(bytes / 3 + docs * 8 + 8);
         }
-        for rx in replies {
-            let chunk = rx.recv().map_err(|_| Error::new("batch worker stopped"))?;
-            let base = ids.len();
-            ids.extend_from_slice(&chunk.ids);
-            for end in chunk.ends {
-                ends.push(base + end);
+        let est: usize = budgets.iter().sum();
+        let base = ids.len();
+        ids.reserve(est);
+        let fills = thread::scope(|scope| {
+            let spare = &mut ids.spare_capacity_mut()[..est];
+            let mut rest = spare;
+            let mut regions = Vec::with_capacity(budgets.len());
+            for budget in &budgets {
+                let (region, tail) = rest.split_at_mut(*budget);
+                rest = tail;
+                regions.push(region);
             }
-            if let Some(error) = chunk.error {
-                return Err(Error::new(error));
+            let mut joins = Vec::with_capacity(ranges.len());
+            for ((kid, (start, end)), region) in self.pool.kids.iter_mut().zip(ranges).zip(regions) {
+                let slice = &texts[start..end];
+                joins.push(scope.spawn(move || fill_region(kid, slice, region)));
             }
-        }
-        Ok(())
+            joins.into_iter().map(|join| join.join().expect("batch worker")).collect::<Vec<_>>()
+        });
+        place(ids, ends, base, &budgets, &fills)
     }
 
     fn batch_here(&mut self, texts: &[&str], ids: &mut Vec<u32>, ends: &mut Vec<usize>) -> Result<(), Error> {
@@ -664,20 +654,12 @@ impl Tokenizer {
         Ok(())
     }
 
-    fn start_workers(&mut self, n: usize) {
-        if self.pool.workers.len() == n {
+    fn ensure_kids(&mut self, n: usize) {
+        if self.pool.kids.len() == n {
             return;
         }
-        self.pool.stop();
-        for _ in 0..n {
-            let tokenizer = self.fork();
-            let (tx, rx) = mpsc::channel();
-            let thread = thread::spawn(move || serve(tokenizer, rx));
-            self.pool.workers.push(Worker {
-                tx,
-                thread: Some(thread),
-            });
-        }
+        let kids = (0..n).map(|_| self.fork()).collect();
+        self.pool.kids = kids;
     }
 
     fn encode_general(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), String> {
@@ -2304,25 +2286,107 @@ fn chunk_ranges(len: usize, n: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn serve(mut tokenizer: Tokenizer, rx: mpsc::Receiver<Job>) {
-    while let Ok(job) = rx.recv() {
-        match job {
-            Job::Stop => break,
-            Job::Batch(texts, tx) => {
-                let mut ids = Vec::new();
-                let mut ends = Vec::new();
-                let mut error = None;
-                for text in &texts {
-                    if let Err(err) = tokenizer.encode(text, &mut ids) {
-                        error = Some(err.to_string());
-                        break;
-                    }
-                    ends.push(ids.len());
+struct Fill {
+    /// Ids written at the front of this worker's region.
+    written: usize,
+    /// `ends[i]` is the id count after document `i`, relative to `written`.
+    ends: Vec<usize>,
+    /// Set when `written` did not fit in the region. Holds every id for the chunk.
+    spill: Option<Vec<u32>>,
+    error: Option<String>,
+}
+
+fn fill_region(tokenizer: &mut Tokenizer, texts: &[&str], region: &mut [std::mem::MaybeUninit<u32>]) -> Fill {
+    let mut scratch = Vec::new();
+    let mut ends = Vec::with_capacity(texts.len());
+    let mut at = 0usize;
+    for text in texts {
+        scratch.clear();
+        if let Err(err) = tokenizer.encode(text, &mut scratch) {
+            return Fill { written: at, ends, spill: None, error: Some(err.to_string()) };
+        }
+        if at + scratch.len() > region.len() {
+            let mut spill = Vec::with_capacity(at + scratch.len());
+            // SAFETY: `region[..at]` was initialized by earlier copies.
+            spill.extend_from_slice(unsafe { std::slice::from_raw_parts(region.as_ptr().cast::<u32>(), at) });
+            spill.extend_from_slice(&scratch);
+            ends.push(spill.len());
+            let done = ends.len();
+            for text in texts.iter().skip(done) {
+                if let Err(err) = tokenizer.encode(text, &mut spill) {
+                    return Fill { written: 0, ends, spill: Some(spill), error: Some(err.to_string()) };
                 }
-                let _ = tx.send(Chunk { ids, ends, error });
+                ends.push(spill.len());
+            }
+            return Fill { written: 0, ends, spill: Some(spill), error: None };
+        }
+        if !scratch.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    scratch.as_ptr(),
+                    region.as_mut_ptr().add(at).cast::<u32>(),
+                    scratch.len(),
+                );
             }
         }
+        at += scratch.len();
+        ends.push(at);
     }
+    Fill { written: at, ends, spill: None, error: None }
+}
+
+/// Slide each worker's ids to the front of `ids` and rebase document ends.
+/// Stops at the first error, after including that chunk's finished documents.
+fn place(ids: &mut Vec<u32>, ends: &mut Vec<usize>, base: usize, budgets: &[usize], fills: &[Fill]) -> Result<(), Error> {
+    let keep = fills.iter().position(|fill| fill.error.is_some()).map(|i| i + 1).unwrap_or(fills.len());
+    let any_spill = fills[..keep].iter().any(|fill| fill.spill.is_some());
+    if any_spill {
+        return place_spilled(ids, ends, base, budgets, &fills[..keep]);
+    }
+    let ptr = ids.as_mut_ptr();
+    let mut cursor = base;
+    let mut read = base;
+    for (fill, budget) in fills[..keep].iter().zip(budgets) {
+        if read != cursor && fill.written > 0 {
+            // SAFETY: both ranges sit in the reserved tail and contain `written`
+            // initialized ids. They can overlap, so this is a move.
+            unsafe { std::ptr::copy(ptr.add(read), ptr.add(cursor), fill.written) };
+        }
+        for &end in &fill.ends {
+            ends.push(cursor + end);
+        }
+        cursor += fill.written;
+        read += budget;
+    }
+    // SAFETY: `base..cursor` is initialized. The tail past `cursor` stays spare.
+    unsafe { ids.set_len(cursor) };
+    if let Some(err) = fills[..keep].iter().rev().find_map(|fill| fill.error.clone()) {
+        return Err(Error::new(err));
+    }
+    Ok(())
+}
+
+fn place_spilled(ids: &mut Vec<u32>, ends: &mut Vec<usize>, base: usize, budgets: &[usize], fills: &[Fill]) -> Result<(), Error> {
+    let mut read = base;
+    for (fill, budget) in fills.iter().zip(budgets) {
+        let cursor = ids.len();
+        if let Some(spill) = &fill.spill {
+            ids.extend_from_slice(spill);
+        } else if fill.written > 0 {
+            let mut tmp = vec![0u32; fill.written];
+            // SAFETY: `read..read+written` was initialized in the reserved tail.
+            unsafe { std::ptr::copy_nonoverlapping(ids.as_ptr().add(read), tmp.as_mut_ptr(), fill.written) };
+            ids.extend_from_slice(&tmp);
+        }
+        for &end in &fill.ends {
+            ends.push(cursor + end);
+        }
+        read += budget;
+        if let Some(err) = &fill.error {
+            return Err(Error::new(err.clone()));
+        }
+    }
+    Ok(())
 }
 
 enum Form {
@@ -2641,6 +2705,57 @@ mod tests {
         ids.clear();
         loaded.encode(".:.:", &mut ids).unwrap();
         assert_eq!(ids, [3]);
+    }
+
+    fn sequential(tok: &mut Tokenizer, docs: &[&str]) -> (Vec<u32>, Vec<usize>) {
+        let mut ids = Vec::new();
+        let mut ends = Vec::new();
+        for doc in docs {
+            tok.encode(doc, &mut ids).unwrap();
+            ends.push(ids.len());
+        }
+        (ids, ends)
+    }
+
+    #[test]
+    fn batch_matches_sequential_encode() {
+        let mut tok = Tokenizer::json(WITH).unwrap();
+        let long = ".".repeat(300);
+        let owned: Vec<String> = (0..40).map(|i| ".".repeat(i % 7 + 1)).collect();
+        let mut docs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        docs.push(long.as_str());
+        docs.push(".:.:");
+        docs.push("");
+
+        let (expect, expect_ends) = sequential(&mut tok, &docs);
+
+        tok.threads(4);
+        let mut ids = vec![99];
+        let mut ends = Vec::new();
+        tok.batch(&docs, &mut ids, &mut ends).unwrap();
+        assert_eq!(ids[0], 99);
+        assert_eq!(&ids[1..], expect.as_slice());
+        assert_eq!(ends.len(), docs.len());
+        for (end, expect_end) in ends.iter().zip(&expect_ends) {
+            assert_eq!(*end, expect_end + 1);
+        }
+
+        ids.clear();
+        ends.clear();
+        tok.batch(&docs, &mut ids, &mut ends).unwrap();
+        assert_eq!(ids, expect);
+        assert_eq!(ends, expect_ends);
+
+        tok.threads(1);
+        ids.clear();
+        ends.clear();
+        tok.batch(&docs, &mut ids, &mut ends).unwrap();
+        assert_eq!(ids, expect);
+        assert_eq!(ends, expect_ends);
+
+        let n = ids.len();
+        tok.batch(&[], &mut ids, &mut ends).unwrap();
+        assert_eq!(ids.len(), n);
     }
 }
 
