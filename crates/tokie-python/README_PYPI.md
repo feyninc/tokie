@@ -19,7 +19,7 @@ pip install tokie
 ```python
 import tokie
 
-tokenizer = tokie.Tokenizer.pretrained("openai-community/gpt2")
+tokenizer = tokie.Tokenizer.from_pretrained("openai-community/gpt2")
 ids = tokenizer.encode("Hello world")
 print(ids.tolist())
 print(tokenizer.decode(ids.tolist()))
@@ -31,7 +31,7 @@ flat, ends = tokenizer.batch(["Hello world", "a12b"])
 tokenizer.save("gpt2.tokie")
 ```
 
-`open` reads a `.tokie` file or a `tokenizer.json`. `json` parses the file contents. `decode(..., skip=True)` omits specials.
+`from_pretrained` opens the repo's `.tokie` file, whatever its name. A repo with no `.tokie` file is parsed from `tokenizer.json`. `open` reads either file from disk. `json` parses the file contents. `decode(..., skip=True)` omits specials.
 
 ## Benchmark
 
