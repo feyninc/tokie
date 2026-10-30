@@ -10,6 +10,10 @@ publish = false
 name = "tokie"
 crate-type = ["cdylib"]
 
+[features]
+default = ["hub"]
+hub = ["tokie-core/hub"]
+
 [dependencies]
 tokie-core = { package = "tokie", path = "../tokie" }
 pyo3 = { version = "0.29", features = ["extension-module"] }

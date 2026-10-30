@@ -8,10 +8,14 @@ repository = "https://github.com/chonkie-inc/tokie"
 keywords = ["tokenizer", "bpe", "wordpiece", "unigram", "nlp"]
 categories = ["text-processing"]
 
+[features]
+default = ["hub"]
+hub = ["dep:hf-hub"]
+
 [dependencies]
 aho-corasick = "1.1"
 daggrs = "0.1"
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+hf-hub = { version = "0.4", optional = true, default-features = false, features = ["ureq"] }
 memchr = "2.8"
 normalie = { path = "../normalie" }
 pretokie = { path = "../pretokie" }

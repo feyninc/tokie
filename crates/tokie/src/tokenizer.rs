@@ -475,14 +475,23 @@ impl Tokenizer {
     /// Download `tokenizer.json` for a Hub repo and parse it.
     ///
     /// The file stays in the Hub cache. A later call with the same repo reads that copy.
+    /// A build without the `hub` feature keeps the method and returns an error.
     pub fn pretrained(repo: &str) -> Result<Self, Error> {
-        let api = hf_hub::api::sync::Api::new().map_err(|err| Error::new(format!("hub: {err}")))?;
-        let path = api
-            .model(repo.to_string())
-            .get("tokenizer.json")
-            .map_err(|err| Error::new(format!("hub: {err}")))?;
-        let text = fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        Self::json(&text)
+        #[cfg(feature = "hub")]
+        {
+            let api = hf_hub::api::sync::Api::new().map_err(|err| Error::new(format!("hub: {err}")))?;
+            let path = api
+                .model(repo.to_string())
+                .get("tokenizer.json")
+                .map_err(|err| Error::new(format!("hub: {err}")))?;
+            let text = fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+            return Self::json(&text);
+        }
+        #[cfg(not(feature = "hub"))]
+        {
+            let _ = repo;
+            Err(Error::new("hub download was left out of this build"))
+        }
     }
 
     /// `(filled slots, capacity, table address)` after the encodes so far.

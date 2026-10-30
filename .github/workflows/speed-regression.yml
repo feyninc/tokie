@@ -41,6 +41,7 @@ jobs:
 
       - name: Time GPT-2
         run: |
+          set -o pipefail
           cargo run --manifest-path bench/tokie/Cargo.toml --release -- \
             --file benches/data/owt_sample.txt \
             --row gpt2 \

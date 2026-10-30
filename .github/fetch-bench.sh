@@ -15,6 +15,23 @@ if [[ ! -f ../gigatoken/Cargo.toml ]]; then
   git -C ../gigatoken checkout --detach FETCH_HEAD
 fi
 
+# The pin opts into profile-rustflags for a profiling profile. The bench
+# builds release and test, so those lines are removed and stable Cargo can
+# parse the manifest.
+python3 - <<'PY'
+from pathlib import Path
+path = Path("../gigatoken/Cargo.toml")
+kept = []
+for line in path.read_text().splitlines(keepends=True):
+    stripped = line.strip()
+    if stripped == 'cargo-features = ["profile-rustflags"]':
+        continue
+    if stripped == 'rustflags = ["-C", "force-frame-pointers=yes"]':
+        continue
+    kept.append(line)
+path.write_text("".join(kept))
+PY
+
 if [[ ! -f ../tokenizers-v1/tokenizers/tk-encode/Cargo.toml ]]; then
   git clone https://github.com/huggingface/tokenizers.git ../tokenizers-v1
   git -C ../tokenizers-v1 fetch --depth 1 origin f8f41813f4bf8f3e2a467e31637c8837373b8dfa
