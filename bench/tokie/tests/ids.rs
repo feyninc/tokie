@@ -96,31 +96,34 @@ fn every_tokenizer_matches_the_reference() {
         );
         checked.push(row.name);
     }
-    assert_eq!(
-        checked,
-        [
-            "gpt2",
-            "cl100k",
-            "o200k",
-            "qwen2",
-            "qwen",
-            "olmo",
-            "nemotron",
-            "kimi",
-            "deepseek",
-            "bert-uncased",
-            "t5",
-            "albert",
-            "llama",
-        ]
+    // The bench fetch omits Kimi K2. A file already on disk is still checked.
+    let kimi_here = ROWS
+        .iter()
+        .find(|row| row.name == "kimi")
+        .and_then(model_path)
+        .is_some();
+    let mut expect_checked = vec![
+        "gpt2",
+        "cl100k",
+        "o200k",
+        "qwen2",
+        "qwen",
+        "olmo",
+        "nemotron",
+    ];
+    let mut expect_skipped = Vec::new();
+    if kimi_here {
+        expect_checked.push("kimi");
+    } else {
+        expect_skipped.push("kimi: no tokenizer.json".to_string());
+    }
+    expect_checked.extend(["deepseek", "bert-uncased", "t5", "albert", "llama"]);
+    expect_skipped.push(
+        "smollm: tokenizers v1 and gigatoken both refused the file".to_string(),
     );
-    assert_eq!(
-        skipped,
-        [
-            "smollm: tokenizers v1 and gigatoken both refused the file".to_string(),
-            "bert-cased: no tokenizer.json".to_string(),
-        ]
-    );
+    expect_skipped.push("bert-cased: no tokenizer.json".to_string());
+    assert_eq!(checked, expect_checked);
+    assert_eq!(skipped, expect_skipped);
     eprintln!("checked: {}", checked.join(", "));
     if !skipped.is_empty() {
         eprintln!("skipped:\n{}", skipped.join("\n"));
