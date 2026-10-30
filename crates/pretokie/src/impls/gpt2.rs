@@ -121,6 +121,32 @@ pub(crate) fn byte_is_number(bytes: &[u8], at: usize) -> bool {
     class_of(ch) == Class::Number
 }
 
+/// Class of a Thai character at `at`, U+0E00..=U+0E7F. `None` is not that block.
+///
+/// Letters are U+0E01..=U+0E30, U+0E32..=U+0E33, and U+0E40..=U+0E46.
+/// Digits are U+0E50..=U+0E59. Marks, punctuation, and unassigned scalars
+/// are other. Nothing in the block is whitespace.
+fn thai_class(bytes: &[u8], at: usize) -> Option<Class> {
+    if at + 3 > bytes.len() {
+        return None;
+    }
+    let b0 = bytes[at];
+    let b1 = bytes[at + 1];
+    let b2 = bytes[at + 2];
+    if b0 != 0xE0 || b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let class = match b1 {
+        0xB8 if (0x81..=0xB0).contains(&b2) || (0xB2..=0xB3).contains(&b2) => Class::Letter,
+        0xB8 => Class::Other,
+        0xB9 if (0x80..=0x86).contains(&b2) => Class::Letter,
+        0xB9 if (0x90..=0x99).contains(&b2) => Class::Number,
+        0xB9 => Class::Other,
+        _ => return None,
+    };
+    Some(class)
+}
+
 /// `bytes[i..]` is valid UTF-8 and `i` is a character boundary.
 ///
 /// Only the bytes of this character are checked. Validating the rest of
@@ -380,6 +406,23 @@ fn absorb_non_ascii(bytes: &[u8], pos: usize, masks: &Masks) -> (u64, u64, u64, 
         let b = bytes[pos + i];
         if b & 0xC0 == 0x80 {
             return (letter, digit, whitespace, cont, i as u32);
+        }
+        // Thai is three bytes and its class is fixed by the block. Decoding
+        // it and searching the category table was most of a Thai window.
+        if let Some(class) = thai_class(bytes, pos + i) {
+            let marked = 3.min(64 - i);
+            let char_bits = ((1u64 << marked) - 1) << i;
+            bits &= !char_bits;
+            if marked > 1 {
+                cont |= char_bits ^ (1u64 << i);
+            }
+            match class {
+                Class::Letter => letter |= char_bits,
+                Class::Number => digit |= char_bits,
+                Class::Whitespace => whitespace |= char_bits,
+                Class::Other => {}
+            }
+            continue;
         }
         let width = if b < 0xE0 {
             2

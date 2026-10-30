@@ -7,7 +7,9 @@
 //!
 //! It is built on the first piece that needs it. English and OpenWebText
 //! never ask: their longest piece is under 64 bytes. A model at or below
-//! 65536 tokens keeps the heap at every length, which is the faster one there.
+//! 65536 tokens keeps the heap, which is the faster one on that text, except
+//! a Thai piece of 16 bytes or more. Those pieces are the heap's slow case,
+//! so the first one builds the walk.
 
 use crate::bpe::{Pairs, merge_ids};
 use daggrs::{DoubleArrayAhoCorasick, MatchKind, Trie};
@@ -297,6 +299,14 @@ pub(crate) fn worth_walking(symbols: usize, bytes: usize) -> bool {
     unfolded(symbols, bytes) && symbols > MIN_SYMBOLS
 }
 
+/// A model at or below 65536 tokens does not otherwise build the walk.
+/// A long piece still should. Unfolded bytes are the heap's slow case, and
+/// so is a sparse fold that leaves more than 64 symbols. A dense Han fold
+/// stays on the queue. English never reaches 64 symbols.
+pub(crate) fn worth_small_long(symbols: usize, bytes: usize, sparse: bool) -> bool {
+    symbols > MIN_SYMBOLS && (unfolded(symbols, bytes) || sparse)
+}
+
 /// The walk already exists. The stack merge still handles a short piece.
 /// Anything longer that the fold did not collapse reuses the walk instead of
 /// the heap. OpenWebText never builds the walk, so its 53-byte piece stays
@@ -357,7 +367,7 @@ fn thai_or_ascii(bytes: &[u8]) -> bool {
     true
 }
 
-fn thai_piece(bytes: &[u8]) -> bool {
+pub(crate) fn thai_piece(bytes: &[u8]) -> bool {
     for &byte in bytes {
         if byte < 0x80 {
             continue;
@@ -635,6 +645,14 @@ mod tests {
         assert!(!super::worth_folded_walk(40, 160, true, false));
         assert!(!super::worth_folded_walk(40, 160, false, true));
         assert!(!super::worth_folded_walk(32, 160, true, true));
+    }
+
+    #[test]
+    fn a_small_vocab_builds_for_a_long_piece() {
+        assert!(super::worth_small_long(65, 65, false));
+        assert!(super::worth_small_long(65, 200, true));
+        assert!(!super::worth_small_long(65, 200, false));
+        assert!(!super::worth_small_long(27, 27, true));
     }
 
     #[test]

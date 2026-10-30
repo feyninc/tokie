@@ -1006,7 +1006,14 @@ impl Tokenizer {
             // medium Han piece when the Han fold is too sparse to shrink it.
             // This does not build the walk. Kana stays on the fold.
             let raw = piece.as_bytes();
-            let ready = matches!(self.tables.scan.get(), Some(Some(_)));
+            // GPT-2 stays under 65536 tokens, so the heap is the usual path.
+            // A Thai piece in that range is still a stack merge of raw bytes,
+            // and nothing else in the text is long enough to build the walk.
+            let mut ready = matches!(self.tables.scan.get(), Some(Some(_)));
+            if !ready && raw.len() >= 16 && crate::scan::thai_piece(raw) {
+                self.ensure_scan_for(true);
+                ready = matches!(self.tables.scan.get(), Some(Some(_)));
+            }
             let sparse = match &self.tables.kind {
                 Kind::Bpe { fold: Some(fold), .. } => fold.sparse_han(),
                 _ => false,
@@ -1055,12 +1062,16 @@ impl Tokenizer {
             // Han fold keeps the queue.
             let ready = matches!(self.tables.scan.get(), Some(Some(_)));
             let sparse = fold.as_ref().is_some_and(|fold| fold.sparse_han());
+            // GPT-2 is under 65536 tokens, so a long Japanese piece never
+            // builds the walk and stays on the heap.
+            let small = self.tables.vocab.tokens.len() <= (1 << 16);
             if crate::scan::worth_walking(symbols, bytes)
+                || (small && crate::scan::worth_small_long(symbols, bytes, sparse))
                 || (ready && crate::scan::worth_reusing(symbols, bytes))
                 || crate::scan::worth_folded_walk(symbols, bytes, ready, sparse)
             {
                 if !ready {
-                    self.ensure_scan();
+                    self.ensure_scan_for(small);
                 }
                 let took = match (self.tables.scan.get(), &self.tables.kind) {
                     (Some(Some(scan)), Kind::Bpe { pairs, .. }) => {
@@ -1126,12 +1137,17 @@ impl Tokenizer {
 
     /// Build the long-piece walk once. A vocab the heap still wins on stores
     /// `None`, so later long pieces do not try again.
-    fn ensure_scan(&self) {
+    ///
+    /// `allow_small` builds it for a vocab at or below 65536 tokens. That is
+    /// the Thai path and a long Japanese piece. English never asks.
+    fn ensure_scan_for(&self, allow_small: bool) {
         if self.tables.scan.get().is_some() {
             return;
         }
         let built = match &self.tables.kind {
-            Kind::Bpe { pairs, byte_ids, .. } if self.tables.vocab.tokens.len() > (1 << 16) => {
+            Kind::Bpe { pairs, byte_ids, .. }
+                if allow_small || self.tables.vocab.tokens.len() > (1 << 16) =>
+            {
                 crate::scan::Scan::build(&self.tables.vocab.tokens, pairs, byte_ids)
             }
             _ => None,
@@ -2155,9 +2171,35 @@ fn merge_sides(value: &Value) -> Result<(&str, &str), String> {
 /// the T5 cut drops.
 fn mark_words(text: &str, out: &mut String) {
     out.reserve(text.len() + text.len() / 8 + 3);
+    let bytes = text.as_bytes();
+    let mut i = 0;
     let mut gap = false;
     let mut in_word = false;
-    for ch in text.chars() {
+    while i < bytes.len() {
+        let b = bytes[i];
+        // English is ASCII. The Unicode whitespace test and the char
+        // decoder were most of the metaspace pass on that text.
+        if b < 0x80 {
+            if b == b' ' || b.wrapping_sub(9) < 5 {
+                if in_word {
+                    gap = true;
+                    in_word = false;
+                }
+            } else {
+                if !in_word {
+                    if gap {
+                        out.push(' ');
+                    }
+                    out.push('▁');
+                    in_word = true;
+                }
+                out.push(b as char);
+            }
+            i += 1;
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("i is a char boundary");
+        i += ch.len_utf8();
         if ch.is_whitespace() {
             if in_word {
                 gap = true;

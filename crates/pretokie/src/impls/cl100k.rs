@@ -136,6 +136,78 @@ fn kind<const MARKS: bool>(ch: char) -> Class {
     }
 }
 
+/// Class of a hiragana or katakana scalar at `i`, U+3040..=U+30FF.
+/// `None` is outside that block.
+///
+/// Letters stay letters. U+3099 and U+309A are marks, so they are letters
+/// only when `MARKS` is set. The two punctuation marks, the two modifier
+/// symbols, and the unassigned scalars are other. Nothing here is whitespace
+/// or a number.
+fn kana_kind<const MARKS: bool>(bytes: &[u8], i: usize) -> Option<Class> {
+    if i + 3 > bytes.len() || bytes[i] != 0xE3 {
+        return None;
+    }
+    let b1 = bytes[i + 1];
+    let b2 = bytes[i + 2];
+    if b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let class = match b1 {
+        0x81 => {
+            if b2 == 0x80 {
+                Class::Other
+            } else {
+                Class::Letter
+            }
+        }
+        0x82 => match b2 {
+            0x80..=0x96 | 0x9D..=0x9F | 0xA1..=0xBF => Class::Letter,
+            0x99 | 0x9A if MARKS => Class::Letter,
+            _ => Class::Other,
+        },
+        0x83 => {
+            if b2 == 0xBB {
+                Class::Other
+            } else {
+                Class::Letter
+            }
+        }
+        _ => return None,
+    };
+    Some(class)
+}
+
+/// Class of a Thai scalar at `i`, U+0E00..=U+0E7F. `None` is outside that block.
+///
+/// Letters are U+0E01..=U+0E30, U+0E32..=U+0E33, and U+0E40..=U+0E46.
+/// The vowel and tone marks are letters only when `MARKS` is set. Digits
+/// are U+0E50..=U+0E59. Nothing in the block is whitespace.
+fn thai_kind<const MARKS: bool>(bytes: &[u8], i: usize) -> Option<Class> {
+    if i + 3 > bytes.len() || bytes[i] != 0xE0 {
+        return None;
+    }
+    let b1 = bytes[i + 1];
+    let b2 = bytes[i + 2];
+    if b2 & 0xC0 != 0x80 {
+        return None;
+    }
+    let class = match b1 {
+        0xB8 => match b2 {
+            0x81..=0xB0 | 0xB2..=0xB3 => Class::Letter,
+            0xB1 | 0xB4..=0xBA if MARKS => Class::Letter,
+            _ => Class::Other,
+        },
+        0xB9 => match b2 {
+            0x80..=0x86 => Class::Letter,
+            0x87..=0x8E if MARKS => Class::Letter,
+            0x90..=0x99 => Class::Number,
+            _ => Class::Other,
+        },
+        _ => return None,
+    };
+    Some(class)
+}
+
 fn is_mark(ch: char) -> bool {
     matches!(
         get_general_category(ch),
@@ -184,6 +256,18 @@ fn char_at<const MARKS: bool>(bytes: &[u8], i: usize) -> Char {
             space,
             crlf,
             whitespace,
+        };
+    }
+    // Hiragana and katakana have a fixed class. Decoding them and searching
+    // the category table was the pretok cost of a Japanese run.
+    if let Some(class) = kana_kind::<MARKS>(bytes, i).or_else(|| thai_kind::<MARKS>(bytes, i)) {
+        return Char {
+            len: 3,
+            letter: class == Class::Letter,
+            number: class == Class::Number,
+            space: false,
+            crlf: false,
+            whitespace: false,
         };
     }
     let (ch, len) = decode_char(bytes, i);
@@ -436,8 +520,14 @@ fn absorb<const MARKS: bool>(bytes: &[u8], pos: usize, mut bits: u64) -> Absorbe
                 tail_nonws: false,
             };
         }
-        let (ch, n) = decode_char(bytes, pos + i);
-        let class = kind::<MARKS>(ch);
+        let (n, class) = if let Some(class) =
+            kana_kind::<MARKS>(bytes, pos + i).or_else(|| thai_kind::<MARKS>(bytes, pos + i))
+        {
+            (3, class)
+        } else {
+            let (ch, n) = decode_char(bytes, pos + i);
+            (n, kind::<MARKS>(ch))
+        };
         // The character starts in this window and continues past it. Its
         // class still decides whether the whitespace run in front splits.
         if i + n > 64 {

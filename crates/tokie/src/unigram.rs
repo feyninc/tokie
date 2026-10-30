@@ -88,18 +88,24 @@ struct Slot {
     start: u32,
     id: u32,
     score: f64,
-    set: bool,
+    /// Piece stamp. A slot from an earlier piece does not count.
+    stamp: u32,
 }
 
 std::thread_local! {
     static SEG_ENDS: std::cell::RefCell<Vec<Slot>> = const { std::cell::RefCell::new(Vec::new()) };
     static SEG_PATH: std::cell::RefCell<Vec<(usize, usize, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SEG_GEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Vocabulary trie used by [`crate::model::Model`].
 pub(crate) struct Lattice {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    /// Child of the root for each byte. `u32::MAX` means the byte starts no piece.
+    /// Every character begins here, and the root's edge list is the long one,
+    /// so a table replaces that binary search.
+    root: [u32; 256],
     unk: u32,
     unk_score: f64,
 }
@@ -159,9 +165,11 @@ impl Lattice {
                 score: node.score,
             });
         }
+        let root = root_table(&nodes, &edges);
         Self {
             nodes,
             edges,
+            root,
             unk,
             unk_score: min_score - UNK_PENALTY,
         }
@@ -191,20 +199,24 @@ impl Lattice {
         unk: u32,
         unk_score: f64,
     ) -> Self {
+        let nodes: Vec<Node> = nodes
+            .into_iter()
+            .map(|(edge_at, edge_n, id, score)| Node {
+                edge_at,
+                edge_n,
+                id,
+                score,
+            })
+            .collect();
+        let edges: Vec<Edge> = edges
+            .into_iter()
+            .map(|(byte, to)| Edge { byte, to })
+            .collect();
+        let root = root_table(&nodes, &edges);
         Self {
-            nodes: nodes
-                .into_iter()
-                .map(|(edge_at, edge_n, id, score)| Node {
-                    edge_at,
-                    edge_n,
-                    id,
-                    score,
-                })
-                .collect(),
-            edges: edges
-                .into_iter()
-                .map(|(byte, to)| Edge { byte, to })
-                .collect(),
+            nodes,
+            edges,
+            root,
             unk,
             unk_score,
         }
@@ -227,19 +239,45 @@ impl Lattice {
 
     fn segment_in(&self, text: &[u8], out: &mut Vec<u32>, ends: &mut Vec<Slot>, path: &mut Vec<(usize, usize, u32)>) {
         let n = text.len();
-        let fresh = Slot {
-            start: 0,
-            id: 0,
-            score: 0.0,
-            set: false,
-        };
-        ends.resize(n + 1, fresh);
-        for slot in ends.iter_mut() {
-            *slot = fresh;
-        }
+        // Clearing every slot of every word showed up inside the encode.
+        // A stamp makes an untouched slot look empty without that write.
+        let stamp = SEG_GEN.with(|cell| {
+            let next = cell.get().wrapping_add(1);
+            if next == 0 {
+                ends.fill(Slot {
+                    start: 0,
+                    id: 0,
+                    score: 0.0,
+                    stamp: 0,
+                });
+                cell.set(1);
+                1
+            } else {
+                cell.set(next);
+                next
+            }
+        });
+        ends.resize(
+            n + 1,
+            Slot {
+                start: 0,
+                id: 0,
+                score: 0.0,
+                stamp: 0,
+            },
+        );
         let mut starts = 0usize;
         while starts < n {
-            let till = ends[starts].score;
+            let till = if starts == 0 {
+                0.0
+            } else {
+                let prior = &ends[starts];
+                if prior.stamp == stamp {
+                    prior.score
+                } else {
+                    0.0
+                }
+            };
             let mblen = char_len(text[starts]);
             let mut has_single = false;
             let mut node = 0u32;
@@ -257,12 +295,12 @@ impl Lattice {
                 let end = starts + len;
                 let candidate = till + leaf.score;
                 let slot = &mut ends[end];
-                if !slot.set || candidate > slot.score {
+                if slot.stamp != stamp || candidate > slot.score {
                     *slot = Slot {
                         start: starts as u32,
                         id: leaf.id,
                         score: candidate,
-                        set: true,
+                        stamp,
                     };
                 }
                 if len == mblen {
@@ -273,12 +311,12 @@ impl Lattice {
                 let end = starts + mblen;
                 let candidate = till + self.unk_score;
                 let slot = &mut ends[end];
-                if !slot.set || candidate > slot.score {
+                if slot.stamp != stamp || candidate > slot.score {
                     *slot = Slot {
                         start: starts as u32,
                         id: self.unk,
                         score: candidate,
-                        set: true,
+                        stamp,
                     };
                 }
             }
@@ -288,7 +326,7 @@ impl Lattice {
         let mut at = n;
         while at > 0 {
             let slot = &ends[at];
-            debug_assert!(slot.set);
+            debug_assert!(slot.stamp == stamp);
             let start = slot.start as usize;
             path.push((start, at, slot.id));
             at = start;
@@ -312,6 +350,10 @@ impl Lattice {
     }
 
     fn step(&self, node: u32, byte: u8) -> Option<u32> {
+        if node == 0 {
+            let to = self.root[byte as usize];
+            return (to != u32::MAX).then_some(to);
+        }
         let node = &self.nodes[node as usize];
         let edges = &self.edges[node.edge_at as usize..node.edge_at as usize + node.edge_n as usize];
         let at = edges.binary_search_by_key(&byte, |edge| edge.byte).ok()?;
@@ -326,6 +368,19 @@ impl Lattice {
         let id = self.nodes[node as usize].id;
         (id != NO_ID).then_some(id)
     }
+}
+
+fn root_table(nodes: &[Node], edges: &[Edge]) -> [u32; 256] {
+    let mut root = [u32::MAX; 256];
+    let Some(node) = nodes.first() else {
+        return root;
+    };
+    let start = node.edge_at as usize;
+    let end = start + node.edge_n as usize;
+    for edge in &edges[start..end] {
+        root[edge.byte as usize] = edge.to;
+    }
+    root
 }
 
 fn char_len(byte: u8) -> usize {
