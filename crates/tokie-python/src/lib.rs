@@ -92,6 +92,29 @@ impl PyTokenizer {
         ids_array(py, &self.ids, ids)
     }
 
+    /// How many ids `encode` would return for `text`. The template stays off.
+    fn count_tokens(&self, py: Python<'_>, text: &str) -> PyResult<usize> {
+        py.detach(|| {
+            let mut tok = self.inner.lock().unwrap();
+            tok.count_tokens(text).map_err(|err| err.to_string())
+        })
+        .map_err(to_py_err)
+    }
+
+    /// One length per text, from `batch`. The template stays off.
+    fn count_tokens_batch(&self, py: Python<'_>, texts: Vec<Bound<'_, PyString>>) -> PyResult<Vec<usize>> {
+        let borrowed = texts
+            .iter()
+            .map(|text| text.to_str())
+            .collect::<PyResult<Vec<&str>>>()?;
+        py.detach(|| {
+            let mut tok = self.inner.lock().unwrap();
+            tok.count_tokens_batch(&borrowed)
+                .map_err(|err| err.to_string())
+        })
+        .map_err(to_py_err)
+    }
+
     /// Text for `ids`. `skip` omits specials.
     #[pyo3(signature = (ids, skip=false))]
     fn decode(&self, py: Python<'_>, ids: Vec<u32>, skip: bool) -> PyResult<String> {

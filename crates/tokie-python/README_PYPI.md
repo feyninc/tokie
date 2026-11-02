@@ -28,6 +28,8 @@ print(tokenizer.decode(ids.tolist()))
 print(tokenizer.encode_plus("Hello world").tolist())
 
 flat, ends = tokenizer.batch(["Hello world", "a12b"])
+print(tokenizer.count_tokens("Hello world"))
+print(tokenizer.count_tokens_batch(["Hello world", "a12b"]))
 tokenizer.save("gpt2.tokie")
 ```
 

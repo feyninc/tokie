@@ -66,9 +66,11 @@ print(plus.tolist())
 print(tokenizer.decode(plus.tolist(), skip=True))
 
 flat, ends = tokenizer.batch(["Hello!", "World"])
+print(tokenizer.count_tokens("Hello, world!"))
+print(tokenizer.count_tokens_batch(["Hello!", "World"]))
 ```
 
-`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the single-sequence template, so BERT uncased is `[CLS]`, the ids, `[SEP]`. `batch` returns one id array and `ends[i]`, the id count after text `i`.
+`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the single-sequence template, so BERT uncased is `[CLS]`, the ids, `[SEP]`. `batch` returns one id array and `ends[i]`, the id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off.
 
 ### Rust
 
@@ -84,9 +86,12 @@ tokenizer.encode_plus("Hello, world!", &mut ids)?;
 
 let mut text = String::new();
 tokenizer.decode(&ids, &mut text, Specials::Skip)?;
+
+let n = tokenizer.count_tokens("Hello, world!")?;
+let lengths = tokenizer.count_tokens_batch(&["Hello!", "World"])?;
 ```
 
-`encode` and `encode_plus` append into the `Vec` the caller owns. Clear it to start a new sequence.
+`encode` and `encode_plus` append into the `Vec` the caller owns. Clear it to start a new sequence. `count_tokens` and `count_tokens_batch` write ids into a buffer on the tokenizer and return the lengths. They leave the template off.
 
 ## Examples
 

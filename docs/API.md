@@ -13,8 +13,8 @@
 | `encode_ids` | The same append call. The caller passes the `Vec`. |
 | `encode_batch` | `batch`. One name. One id buffer and one `ends` entry per text. |
 | `encode_batch_flat` | `batch`. 0.1.4 returned per-document lengths. 0.2 `ends[i]` is the id count after text `i`. |
-| `count_tokens` | Planned. Not on the tokenizer yet. Encode into a tokenizer-owned buffer and return the length. No template. |
-| `count_tokens_batch` | Planned. Not on the tokenizer yet. `batch` into that buffer and return one length per text. |
+| `count_tokens` | `count_tokens`. Encode into a tokenizer-owned buffer and return the length. No template. |
+| `count_tokens_batch` | `count_tokens_batch`. `batch` into that buffer and return one length per text. |
 | `decode` | Already appends into a `String`. Python keeps returning a `str`. |
 | `id_to_token` / `token_to_id` | `token` / `id`. |
 | `from_file` | `open`. |
@@ -54,8 +54,6 @@
 
 ```rust
 pub fn encode_plus(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), Error>;
-
-// Planned. Not implemented.
 pub fn count_tokens(&mut self, text: &str) -> Result<usize, Error>;
 pub fn count_tokens_batch(&mut self, texts: &[&str]) -> Result<Vec<usize>, Error>;
 ```
@@ -70,7 +68,8 @@ pub fn count_tokens_batch(&mut self, texts: &[&str]) -> Result<Vec<usize>, Error
 tokenizer.encode("Hello")                  # template off
 tokenizer.encode_plus("Hello")             # [CLS], ids, [SEP] when the template says so
 tokenizer.batch(["Hello", "world"])         # (ids, ends), template off
-# count_tokens and count_tokens_batch are planned. They are not on the tokenizer yet.
+tokenizer.count_tokens("Hello")            # length of encode, template off
+tokenizer.count_tokens_batch(["Hello", "world"])
 ```
 
 `batch` returns one id array and one ends array. `token` and `id` are the vocab calls. `open` reads a path.
@@ -78,5 +77,5 @@ tokenizer.batch(["Hello", "world"])         # (ids, ends), template off
 ## Order
 
 1. `encode_plus` is in. `batch`, `token`, `id`, and `open` stay the only names for those jobs.
-2. Add both count methods. A test checks `count_tokens` against `encode` with an empty buffer, and `count_tokens_batch` against `batch` ends. The count buffer lives on the tokenizer.
+2. The count methods are on the tokenizer. A test checks `count_tokens` against `encode` with an empty buffer, and `count_tokens_batch` against `batch` ends. The count buffer is a field on the tokenizer.
 3. Leave padding, truncation, offsets, pairs, attention masks, and type ids on the Remaining list. `encode_plus` gains them later.
