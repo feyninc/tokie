@@ -87,7 +87,10 @@ BANNER_PATH = "assets/tokie-banner.png"
 ORG = "tokiers"
 
 
-def make_readme(repo_name, original_repo):
+def make_readme(repo_name, original_repo, files):
+    binary = ""
+    if "tokenizer.tokie" in files:
+        binary = "- `tokenizer.tokie` — tokie binary format\n"
     return f"""---
 tags:
 - tokie
@@ -112,30 +115,33 @@ pip install tokie
 import tokie
 
 tokenizer = tokie.Tokenizer.from_pretrained("tokiers/{repo_name}")
-encoding = tokenizer.encode("Hello, world!")
-print(encoding.ids)
-print(encoding.attention_mask)
+ids = tokenizer.encode("Hello, world!")
+plus = tokenizer.encode_plus("Hello, world!")
+print(plus.tolist())
+print(tokenizer.decode(plus.tolist(), skip=True))
 ```
 
 ## Quick Start (Rust)
 
 ```toml
 [dependencies]
-tokie = {{ version = "0.0.4", features = ["hf"] }}
+tokie = "0.2"
 ```
 
 ```rust
-use tokie::Tokenizer;
+use tokie::{{Specials, Tokenizer}};
 
-let tokenizer = Tokenizer::from_pretrained("tokiers/{repo_name}").unwrap();
-let encoding = tokenizer.encode("Hello, world!", true);
-println!("{{:?}}", encoding.ids);
+let mut tokenizer = Tokenizer::pretrained("tokiers/{repo_name}").unwrap();
+let mut ids = Vec::new();
+tokenizer.encode_plus("Hello, world!", &mut ids).unwrap();
+let mut text = String::new();
+tokenizer.decode(&ids, &mut text, Specials::Skip).unwrap();
+println!("{{text}}");
 ```
 
 ## Files
 
-- `tokenizer.tkz` — tokie binary format (~10x smaller, loads in ~5ms)
-- `tokenizer.json` — original HuggingFace tokenizer
+{binary}- `tokenizer.json` — original HuggingFace tokenizer
 
 ## About tokie
 
@@ -171,6 +177,7 @@ for repo_name, original_repo in sorted(NEW_REPOS.items()):
         print("OK")
 
         # 2. Download and upload tokenizer files from original repo
+        uploaded = []
         for fname in TOKENIZER_FILES:
             print(f"  Fetching {fname}...", end=" ", flush=True)
             try:
@@ -185,6 +192,7 @@ for repo_name, original_repo in sorted(NEW_REPOS.items()):
                     repo_type="model",
                     commit_message=f"Add {fname} from {original_repo}",
                 )
+                uploaded.append(fname)
                 print("OK")
             except Exception as e:
                 if "404" in str(e) or "EntryNotFound" in str(e) or "does not exist" in str(e).lower():
@@ -194,7 +202,7 @@ for repo_name, original_repo in sorted(NEW_REPOS.items()):
 
         # 3. Upload README
         print(f"  Uploading README...", end=" ", flush=True)
-        readme_content = make_readme(repo_name, original_repo)
+        readme_content = make_readme(repo_name, original_repo, uploaded)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(readme_content)
             f.flush()

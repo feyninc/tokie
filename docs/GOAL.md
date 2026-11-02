@@ -40,10 +40,10 @@ Most pieces are 15 bytes or fewer and repeat. Those pack into one `u128`. A hit 
 ## Remaining
 
 - GPT-2 on the whole OpenWebText file is still sometimes under gigatoken. GPT-2 and cl100k line rates sit a few percent under. WordPiece, Unigram, and unaffixed SentencePiece still need a timing against tokenizers v1 on this binary.
-- Pair encoding, padding, truncation, and offsets. `wrap` only wraps the single-sequence template.
+- Pair encoding, padding, truncation, and offsets. `encode_plus` only applies the single-sequence template.
 - Added-token `lstrip`, `rstrip`, and `single_word`. A `normalized` token is matched as written, and the normalizer does not rewrite that needle.
 - Affixed SentencePiece BPE. A continuing-subword prefix or an end-of-word suffix is refused. Llama 2, Mistral, and Gemma use that form.
 - These files are refused. Mistral-7B-v0.1 uses a metaspace prepend of `first`. gemma-2-2b and gemma-3-4b-it split on a space. bge-m3, snowflake-arctic-embed-l-v2.0, and potion-multilingual-128M replace with the regex ` {2,}`. Only a literal replace is loaded.
 - An unknown ByteLevel regex is encoded as GPT-2. `BertNormalizer` ignores `clean_text` and `handle_chinese_chars` in the file.
 - BERT cased has no `tokenizer.json` in the bench. SmolLM's byte vocab is missing bytes, so tokenizers v1 and gigatoken both refuse the file and the ids stay unchecked.
-- Qwen's encode matches gigatoken. Tokenizers v1 refuses that Split pattern, so `wrap` stays unchecked.
+- Qwen's encode matches gigatoken. Tokenizers v1 refuses that Split pattern, so `encode_plus` stays unchecked.

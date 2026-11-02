@@ -46,11 +46,11 @@ SAMPLES = [
 ]
 
 
-def rust_ids(path: Path, texts: list[str], wrap: bool = False) -> list[list[int]]:
+def rust_ids(path: Path, texts: list[str], encode_plus: bool = False) -> list[list[int]]:
     payload = b"".join(f"{len(text.encode())}\n".encode() + text.encode() + b"\n" for text in texts)
     cmd = CLI + [str(path)]
-    if wrap:
-        cmd.append("--wrap")
+    if encode_plus:
+        cmd.append("--encode-plus")
     proc = subprocess.run(cmd, input=payload, capture_output=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.decode())
@@ -80,18 +80,18 @@ def model(request):
 def test_encode_matches_rust(model):
     name, path, tok = model
     got = [tok.encode(text).tolist() for text in SAMPLES]
-    assert got == rust_ids(path, SAMPLES, wrap=False), name
+    assert got == rust_ids(path, SAMPLES), name
 
 
-def test_wrap_matches_rust(model):
+def test_encode_plus_matches_rust(model):
     name, path, tok = model
-    got = [tok.wrap(text).tolist() for text in SAMPLES]
-    assert got == rust_ids(path, SAMPLES, wrap=True), name
+    got = [tok.encode_plus(text).tolist() for text in SAMPLES]
+    assert got == rust_ids(path, SAMPLES, encode_plus=True), name
 
 
-def test_gpt2_wrap_matches_encode(gpt2):
+def test_gpt2_encode_plus_matches_encode(gpt2):
     for text in SAMPLES:
-        assert gpt2.wrap(text).tolist() == gpt2.encode(text).tolist()
+        assert gpt2.encode_plus(text).tolist() == gpt2.encode(text).tolist()
 
 
 def test_batch_matches_encode(model):

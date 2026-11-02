@@ -200,40 +200,23 @@ Cohere embedding models use a proprietary tokenizer format that hasn't been anal
 ### Loading Tokenizers
 
 ```rust
-use tokie::{Tokenizer, EncoderType, PretokType};
-use tokie::hf::from_json_with_options;
-
-// Auto-detect encoder type (recommended)
-let tokenizer = Tokenizer::from_json("tokenizer.json")?;
-
-// OpenAI-style (use Backtracking)
-let gpt4 = Tokenizer::from_json("cl100k_tokenizer.json")?;
-
-// Llama 3 style (use Simple for correctness)
-let llama3 = from_json_with_options(
-    "llama3_tokenizer.json",
-    EncoderType::Simple,
-    PretokType::Cl100k,
-)?;
-
-// Unigram models (auto-detected)
-let t5 = Tokenizer::from_json("t5_tokenizer.json")?;
-let albert = Tokenizer::from_json("albert_tokenizer.json")?;
+let mut tokenizer = Tokenizer::open("tokenizer.json")?;
+let mut ids = Vec::new();
+tokenizer.encode("Hello world", &mut ids)?;
+ids.clear();
+tokenizer.encode_plus("Hello world", &mut ids)?;
 ```
 
-### Binary Format
+`open` reads a `tokenizer.json` or a `.tokie` file. `pretrained` reads a Hub repo.
 
-Tokie can save/load tokenizers in a fast binary format (`.tkz`):
+### Binary format
 
 ```rust
-// Save
-tokenizer.to_file("model.tkz")?;
-
-// Load (instant, no parsing)
-let tokenizer = Tokenizer::from_file("model.tkz")?;
+tokenizer.save("model.tokie")?;
+let mut again = Tokenizer::open("model.tokie")?;
 ```
 
-Pre-built binary files are available in the `models/` directory:
+The loader refuses an old `.tkz` file. The names below are the previous catalog.
 
 **OpenAI / tiktoken-style (Backtracking):**
 - `gpt2.tkz` - GPT-2 (50K vocab)

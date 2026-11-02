@@ -12,7 +12,7 @@ let mut ids = Vec::new();
 tokenizer.encode("Hello world", &mut ids)?;
 ```
 
-`encode` appends. It does not clear `ids`. The tokenizer keeps the piece cache and the scratch. `wrap` adds the single-sequence template. `decode` writes text for ids. `batch` encodes many texts on forked tokenizers.
+`encode` appends. It does not clear `ids`. The tokenizer keeps the piece cache and the scratch. `encode_plus` adds the single-sequence template. `decode` writes text for ids. `batch` encodes many texts on forked tokenizers.
 
 ## Steps
 

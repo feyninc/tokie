@@ -41,8 +41,10 @@ pip install tokie
 
 ```toml
 [dependencies]
-tokie = { version = "0.0.8", features = ["hf"] }
+tokie = "0.2"
 ```
+
+This tree is 0.2. crates.io and PyPI still serve 0.1.4, which does not have these calls.
 
 Coming from Hugging Face `tokenizers`? See the [migration guide](docs/MIGRATION.md).
 
@@ -53,116 +55,83 @@ Coming from Hugging Face `tokenizers`? See the [migration guide](docs/MIGRATION.
 ```python
 import tokie
 
-# Load a Hugging Face tokenizer
-tokenizer = tokie.Tokenizer.from_pretrained("bert-base-uncased")
+tokenizer = tokie.Tokenizer.from_pretrained("google-bert/bert-base-uncased")
 
-# Encode. Returns an Encoding with ids, attention_mask, type_ids, and tokens.
-encoding = tokenizer("Hello, world!")  # or tokenizer.encode("Hello, world!")
-print(encoding.ids)             # [101, 7592, 1010, 2088, 999, 102]
-print(encoding.tokens)          # ['[CLS]', 'hello', ',', 'world', '!', '[SEP]']
-print(encoding.attention_mask)  # [1, 1, 1, 1, 1, 1]
+ids = tokenizer.encode("Hello, world!")
+print(ids.tolist())
 
-# Decode
-text = tokenizer.decode(encoding.ids)  # "hello , world !"
+plus = tokenizer.encode_plus("Hello, world!")
+print(plus.tolist())
 
-# Count tokens without allocating
-count = tokenizer.count_tokens("Hello, world!")  # 6
+print(tokenizer.decode(plus.tolist(), skip=True))
 
-# Batch encode (parallel across all cores)
-encodings = tokenizer.encode_batch(["Hello!", "World"], add_special_tokens=True)
+flat, ends = tokenizer.batch(["Hello!", "World"])
 ```
+
+`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the single-sequence template, so BERT uncased is `[CLS]`, the ids, `[SEP]`. `batch` returns one id array and `ends[i]`, the id count after text `i`.
 
 ### Rust
 
 ```rust
-use tokie::Tokenizer;
+use tokie::{Specials, Tokenizer};
 
-let tokenizer = Tokenizer::from_pretrained("bert-base-uncased")?;
-let encoding = tokenizer.encode("Hello, world!", true);
-println!("{:?}", encoding.ids);             // [101, 7592, 1010, 2088, 999, 102]
-println!("{:?}", encoding.attention_mask);  // [1, 1, 1, 1, 1, 1]
+let mut tokenizer = Tokenizer::pretrained("google-bert/bert-base-uncased")?;
+let mut ids = Vec::new();
+tokenizer.encode("Hello, world!", &mut ids)?;
 
-let text = tokenizer.decode(&encoding.ids).unwrap();
+ids.clear();
+tokenizer.encode_plus("Hello, world!", &mut ids)?;
+
+let mut text = String::new();
+tokenizer.decode(&ids, &mut text, Specials::Skip)?;
 ```
+
+`encode` and `encode_plus` append into the `Vec` the caller owns. Clear it to start a new sequence.
 
 ## Examples
 
-### Padding and truncation
-
-Model input is a fixed length. tokie pads and truncates the same way Hugging Face tokenizers does:
+### Batch
 
 ```python
-tokenizer = tokie.Tokenizer.from_pretrained("bert-base-uncased")
-
-# Truncate to max length
-tokenizer.enable_truncation(max_length=128)
-
-# Pad to fixed length (or use BatchLongest for dynamic padding)
-tokenizer.enable_padding(length=128, pad_id=0)
-
-# All outputs are now exactly 128 tokens
-results = tokenizer.encode_batch(["Short text", "A much longer piece of text for testing"])
-assert all(len(r) == 128 for r in results)
-
-# attention_mask shows which tokens are real (1) vs padding (0)
-print(results[0].attention_mask)  # [1, 1, 1, 1, 0, 0, 0, ...]
+tokenizer.threads(4)
+flat, ends = tokenizer.batch(["Short text", "A much longer piece of text"])
 ```
 
-### Cross-encoder pair encoding
+```rust
+tokenizer.threads(4);
+let lines = ["Short text", "A much longer piece of text"];
+let mut ids = Vec::new();
+let mut ends = Vec::new();
+tokenizer.batch(&lines, &mut ids, &mut ends)?;
+```
 
-Rerankers and cross-encoders take a sentence pair and token type ids:
+Text `i` is `ids[prev..ends[i]]`. `ends[i]` is `ids.len()` after that text.
+
+### Vocabulary
 
 ```python
-pair = tokenizer("How are you?", "I am fine.")  # or tokenizer.encode_pair(...)
-pair.ids               # [101, 2129, 2024, 2017, 1029, 102, 1045, 2572, 2986, 1012, 102]
-pair.attention_mask    # [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-pair.type_ids          # [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1]
-pair.special_tokens_mask  # [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+tokenizer.id("[SEP]")
+tokenizer.token(101)
 ```
 
-### Byte offsets
+```rust
+tokenizer.id("[SEP]");
+tokenizer.token(101);
+```
 
-Each token records the byte range it came from:
+### Save and load a `.tokie` file
 
 ```python
-enc = tokenizer.encode_with_offsets("Hello world")
-for token_id, (start, end) in zip(enc.ids, enc.offsets):
-    print(f"  token {token_id}: bytes [{start}:{end}]")
+tokenizer.save("model.tokie")
+again = tokie.Tokenizer.open("model.tokie")
 ```
 
-### Vocabulary access
-
-```python
-tokenizer.vocab_size          # 30522
-tokenizer.id_to_token(101)    # "[CLS]"
-tokenizer.token_to_id("[SEP]")  # 102
-vocab = tokenizer.get_vocab()   # {"[CLS]": 101, "[SEP]": 102, ...}
+```rust
+tokenizer.save("model.tokie")?;
+let mut again = Tokenizer::open("model.tokie")?;
 ```
 
-### Save and load `.tkz` files
-
-The `.tkz` file is about 10 times smaller than `tokenizer.json` and loads in about 5 ms:
-
-```python
-tokenizer.save("model.tkz")
-tokenizer = tokie.Tokenizer.from_file("model.tkz")
-```
-
-`from_pretrained()` tries `.tkz` first, then `tokenizer.json`.
-
-### Bulk file encoding
-
-`encode_files` reads the files in Rust, splits on a separator, and encodes every document on all cores. The text stays in Rust. It returns a flat `uint32` array of token ids and a `uint64` array of per-document offsets. NumPy reads both arrays without a copy:
-
-```python
-ids, offsets = tokenizer.encode_files(["corpus.txt"], separator=b"<|endoftext|>")
-# ids: np.ndarray[uint32], every token, concatenated
-# offsets: np.ndarray[uint64], length ndocs+1. Doc i is ids[offsets[i]:offsets[i+1]].
-
-n_tokens = tokenizer.count_tokens_files(["corpus.txt"], separator=b"<|endoftext|>")
-```
-
-The ids match `encode_batch_flat` on the same documents. Invalid UTF-8 is kept as bytes and does not raise.
+`from_pretrained` in Python, and `pretrained` in Rust, reads the repo's `.tokie` file and then `tokenizer.json`.
 
 ## Benchmarks
 

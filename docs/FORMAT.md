@@ -6,7 +6,7 @@
 
 A Hugging Face `tokenizer.json` is one JSON document. Opening it builds a tree of owned strings, joins every merge, copies every token into the decode tables, and, for a precompiled normalizer, walks all 65,536 BMP scalars. What remains is a shared set of tables and a piece cache that starts empty.
 
-`.tokie` stores those tables after that work is done. Version 1 is a directory of plain blobs. The header names every blob, each blob is checksummed, and the ranges cover the file with no gaps and no overlap. `Tokenizer::open` reads the file. `Tokenizer::save` writes it. The calls after open are the same calls a JSON load provides. `encode`, `wrap`, `decode`, `batch`, and `fork` do not care which path built the tokenizer.
+`.tokie` stores those tables after that work is done. Version 1 is a directory of plain blobs. The header names every blob, each blob is checksummed, and the ranges cover the file with no gaps and no overlap. `Tokenizer::open` reads the file. `Tokenizer::save` writes it. The calls after open are the same calls a JSON load provides. `encode`, `encode_plus`, `decode`, `batch`, and `fork` do not care which path built the tokenizer.
 
 The piece list is the part that changes encode speed. It holds the most frequent pieces for this cut and this vocabulary, up to 128 MiB. Load inserts them into the one piece cache. A miss still merges and inserts. The file keeps the original 128 MiB list, so a later save does not trade common pieces for the rare ones a single run just saw.
 

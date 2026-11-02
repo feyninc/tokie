@@ -80,12 +80,12 @@ impl PyTokenizer {
         ids_array(py, &self.ids, ids)
     }
 
-    /// `encode`, then the single-sequence template.
-    fn wrap<'py>(&self, py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyArray1<u32>>> {
+    /// `encode`, then the single-sequence template. Returns a `uint32` array.
+    fn encode_plus<'py>(&self, py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyArray1<u32>>> {
         let ids = py.detach(|| {
             let mut tok = self.inner.lock().unwrap();
             let mut ids = checkout(&self.ids, text.len() / 4 + 16);
-            tok.wrap(text, &mut ids).map_err(|err| err.to_string())?;
+            tok.encode_plus(text, &mut ids).map_err(|err| err.to_string())?;
             Ok::<Vec<u32>, String>(ids)
         })
         .map_err(to_py_err)?;

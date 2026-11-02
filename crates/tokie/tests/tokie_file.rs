@@ -18,9 +18,9 @@ fn roundtrip(json: &Path) {
         assert_eq!(left, right, "{sample:?}");
         let mut wrapped_left = Vec::new();
         let mut wrapped_right = Vec::new();
-        original.wrap(sample, &mut wrapped_left).unwrap();
-        loaded.wrap(sample, &mut wrapped_right).unwrap();
-        assert_eq!(wrapped_left, wrapped_right, "wrap {sample:?}");
+        original.encode_plus(sample, &mut wrapped_left).unwrap();
+        loaded.encode_plus(sample, &mut wrapped_right).unwrap();
+        assert_eq!(wrapped_left, wrapped_right, "encode_plus {sample:?}");
         let mut text_left = String::new();
         let mut text_right = String::new();
         original
