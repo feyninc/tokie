@@ -67,29 +67,33 @@ pip install tokie
 import tokie
 
 tokenizer = tokie.Tokenizer.from_pretrained("tokiers/{repo_name}")
-encoding = tokenizer.encode("Hello, world!")
-print(encoding.ids)
-print(encoding.attention_mask)
+ids = tokenizer.encode("Hello, world!")
+plus = tokenizer.encode_plus("Hello, world!")
+print(plus.tolist())
+print(tokenizer.decode(plus.tolist()))
 ```
 
 ## Quick Start (Rust)
 
 ```toml
 [dependencies]
-tokie = {{ version = "0.0.4", features = ["hf"] }}
+tokie = "0.2"
 ```
 
 ```rust
-use tokie::Tokenizer;
+use tokie::{{Specials, Tokenizer}};
 
-let tokenizer = Tokenizer::from_pretrained("tokiers/{repo_name}").unwrap();
-let encoding = tokenizer.encode("Hello, world!", true);
-println!("{{:?}}", encoding.ids);
+let mut tokenizer = Tokenizer::pretrained("tokiers/{repo_name}").unwrap();
+let mut ids = Vec::new();
+tokenizer.encode_plus("Hello, world!", &mut ids).unwrap();
+let mut text = String::new();
+tokenizer.decode(&ids, &mut text, Specials::Keep).unwrap();
+println!("{{text}}");
 ```
 
 ## Files
 
-- `tokenizer.tkz` — tokie binary format (~10x smaller, loads in ~5ms)
+- `tokenizer.tokie` — tokie binary format
 - `tokenizer.json` — original HuggingFace tokenizer (if available)
 
 ## About tokie
