@@ -45,7 +45,7 @@ fn a_present_json_matches_tokenizers_v1() {
             assert_eq!(ids, hf, "{} on {sample:?}", row.name);
             assert_decode(&model, &reference, &ids, row.name, sample);
             ids.clear();
-            model.wrap(sample, &mut ids).unwrap_or_else(|err| {
+            model.encode_plus(sample, &mut ids).unwrap_or_else(|err| {
                 panic!("{} specials on {sample:?}: {err}", row.name);
             });
             let hf = hf::ids_with_specials(&reference, sample).unwrap_or_else(|err| {

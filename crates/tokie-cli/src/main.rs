@@ -1,6 +1,6 @@
 //! CLI for the tokie 0.2 tokenizer.
 //!
-//! `encode`, `wrap`, `decode`, `batch`, `save`, and `open` are the calls.
+//! `encode`, `encode_plus`, `decode`, `batch`, `save`, and `open` are the calls.
 //! `ids` prints one id list per length-prefixed text so a Python test can
 //! compare against this binary. `bench` times one file.
 
@@ -30,13 +30,13 @@ enum Commands {
         file: Option<PathBuf>,
         /// Apply the single-sequence template.
         #[arg(long)]
-        wrap: bool,
+        encode_plus: bool,
     },
     /// Print ids for length-prefixed texts on stdin.
     Ids {
         tokenizer: PathBuf,
         #[arg(long)]
-        wrap: bool,
+        encode_plus: bool,
     },
     /// Decode ids to text.
     Decode {
@@ -76,7 +76,7 @@ fn run(cli: Cli) -> Result<(), String> {
             tokenizer,
             text,
             file,
-            wrap,
+            encode_plus,
         } => {
             let mut tok = Tokenizer::open(&tokenizer).map_err(|err| err.to_string())?;
             let body = match (text, file) {
@@ -85,15 +85,15 @@ fn run(cli: Cli) -> Result<(), String> {
                 _ => return Err("pass --text or --file".to_string()),
             };
             let mut ids = Vec::new();
-            if wrap {
-                tok.wrap(&body, &mut ids).map_err(|err| err.to_string())?;
+            if encode_plus {
+                tok.encode_plus(&body, &mut ids).map_err(|err| err.to_string())?;
             } else {
                 tok.encode(&body, &mut ids).map_err(|err| err.to_string())?;
             }
             print_ids(&ids);
             Ok(())
         }
-        Commands::Ids { tokenizer, wrap } => {
+        Commands::Ids { tokenizer, encode_plus } => {
             let mut tok = Tokenizer::open(&tokenizer).map_err(|err| err.to_string())?;
             let texts = read_texts(std::io::stdin())?;
             let mut ids = Vec::new();
@@ -101,8 +101,8 @@ fn run(cli: Cli) -> Result<(), String> {
             let mut out = stdout.lock();
             for text in &texts {
                 ids.clear();
-                if wrap {
-                    tok.wrap(text, &mut ids).map_err(|err| err.to_string())?;
+                if encode_plus {
+                    tok.encode_plus(text, &mut ids).map_err(|err| err.to_string())?;
                 } else {
                     tok.encode(text, &mut ids).map_err(|err| err.to_string())?;
                 }

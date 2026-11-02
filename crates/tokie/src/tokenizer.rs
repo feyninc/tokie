@@ -506,7 +506,7 @@ impl Tokenizer {
     }
 
     /// Append the ids for `text`. A special token listed in the file is
-    /// emitted when it occurs in the text. [`Self::wrap`] applies the template.
+    /// emitted when it occurs in the text. [`Self::encode_plus`] applies the template.
     #[inline]
     pub fn encode(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), Error> {
         // No rewrite and no special in the text: one segment. The general
@@ -523,7 +523,7 @@ impl Tokenizer {
     ///
     /// A ByteLevel post-processor adds nothing, so those ids match
     /// [`Self::encode`]. BERT uncased is `[CLS]`, the ids, `[SEP]`.
-    pub fn wrap(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), Error> {
+    pub fn encode_plus(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), Error> {
         let prefix = self.tables.post.prefix.clone();
         let suffix = self.tables.post.suffix.clone();
         let at = ids.len();
@@ -2722,6 +2722,51 @@ mod tests {
         ids.clear();
         loaded.encode(".:.:", &mut ids).unwrap();
         assert_eq!(ids, [3]);
+    }
+
+    const TEMPLATE: &str = r#"{
+        "model": {
+            "type": "BPE",
+            "ignore_merges": true,
+            "vocab": {".": 0, ":": 1, ".:": 2, ".:.:": 3},
+            "merges": [". :"]
+        },
+        "post_processor": {
+            "type": "TemplateProcessing",
+            "single": [
+                {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+            ],
+            "special_tokens": {
+                "[CLS]": {"id": "[CLS]", "ids": [4], "tokens": ["[CLS]"]},
+                "[SEP]": {"id": "[SEP]", "ids": [5], "tokens": ["[SEP]"]}
+            }
+        }
+    }"#;
+
+    #[test]
+    fn encode_plus_applies_the_single_sequence_template() {
+        let mut tok = Tokenizer::json(TEMPLATE).unwrap();
+        let mut ids = vec![9];
+        tok.encode(".:.", &mut ids).unwrap();
+        assert_eq!(ids, [9, 2, 0]);
+
+        ids = vec![9];
+        tok.encode_plus(".:.", &mut ids).unwrap();
+        assert_eq!(ids, [9, 4, 2, 0, 5]);
+
+        ids.clear();
+        tok.encode_plus("", &mut ids).unwrap();
+        assert_eq!(ids, [4, 5]);
+
+        let mut plain = Tokenizer::json(WITH).unwrap();
+        ids.clear();
+        plain.encode(".:.", &mut ids).unwrap();
+        let encoded = ids.clone();
+        ids.clear();
+        plain.encode_plus(".:.", &mut ids).unwrap();
+        assert_eq!(ids, encoded);
     }
 
     fn sequential(tok: &mut Tokenizer, docs: &[&str]) -> (Vec<u32>, Vec<usize>) {

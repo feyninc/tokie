@@ -1,7 +1,7 @@
 //! Every loaded tokenizer matches its spec on a complete set of short strings.
 //!
 //! The spec is tokenizers v1, specials off and on. When v1 cannot encode the
-//! file, the spec for `encode` is gigatoken. `wrap` is then unchecked,
+//! file, the spec for `encode` is gigatoken. `encode_plus` is then unchecked,
 //! because gigatoken does not apply the post-processor template.
 
 use std::path::Path;
@@ -72,14 +72,14 @@ fn every_tokenizer_matches_the_reference() {
             );
             if matches!(spec, Spec::Hf(_)) {
                 ids.clear();
-                model.wrap(text, &mut ids).unwrap_or_else(|err| {
-                    panic!("{} wrap {text:?}: {err}", row.name);
+                model.encode_plus(text, &mut ids).unwrap_or_else(|err| {
+                    panic!("{} encode_plus {text:?}: {err}", row.name);
                 });
                 reference.clear();
                 spec_encode(&mut spec, text, true, &mut reference);
                 assert_eq!(
                     ids, reference,
-                    "{} wrap {text:?}",
+                    "{} encode_plus {text:?}",
                     row.name
                 );
             }

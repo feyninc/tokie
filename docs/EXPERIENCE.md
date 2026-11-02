@@ -39,12 +39,12 @@ tokenizer.decode(&ids, &mut text, Specials::Keep)?;
 
 ```rust
 tokenizer.encode(text, &mut ids)?;
-tokenizer.wrap(text, &mut ids)?;
+tokenizer.encode_plus(text, &mut ids)?;
 ```
 
-`encode` emits a special token when its text occurs in the input. The template stays off. `wrap` runs `encode`, then writes the single-sequence template around those ids. BERT uncased is `[CLS]`, the ids, `[SEP]`. A ByteLevel template adds nothing, so `wrap` and `encode` write the same ids for GPT-2.
+`encode` emits a special token when its text occurs in the input. The template stays off. `encode_plus` runs `encode`, then writes the single-sequence template around those ids. BERT uncased is `[CLS]`, the ids, `[SEP]`. A ByteLevel template adds nothing, so `encode_plus` and `encode` write the same ids for GPT-2.
 
-`encode` is the short call because the speed bench and the id checks use it. `wrap` splices a short prefix and a short suffix after that call returns.
+`encode` is the short call because the speed bench and the id checks use it. `encode_plus` splices a short prefix and a short suffix after that call returns.
 
 Both take `&mut self`. The piece cache and the scratch live on the tokenizer.
 
@@ -107,7 +107,7 @@ These leave the root and keep the names they have now, one module in:
 
 The single-string encode path stays in place.
 
-- `wrap` calls `encode`, then splices the template.
+- `encode_plus` calls `encode`, then splices the template.
 - `decode`, `token`, and `id` read the load-time table.
 - `pretrained` downloads the repo's `.tokie` file. A repo with no `.tokie` file uses `tokenizer.json`.
 - `batch` calls `encode` on forked tokenizers.

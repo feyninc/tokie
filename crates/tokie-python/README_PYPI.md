@@ -25,7 +25,7 @@ print(ids.tolist())
 print(tokenizer.decode(ids.tolist()))
 
 # The single-sequence template. GPT-2 has none, so this matches encode.
-print(tokenizer.wrap("Hello world").tolist())
+print(tokenizer.encode_plus("Hello world").tolist())
 
 flat, ends = tokenizer.batch(["Hello world", "a12b"])
 tokenizer.save("gpt2.tokie")
