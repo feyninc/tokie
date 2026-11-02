@@ -44,6 +44,8 @@ pip install tokie
 tokie = "0.2"
 ```
 
+This tree is 0.2. crates.io and PyPI still serve 0.1.4, which does not have these calls.
+
 Coming from Hugging Face `tokenizers`? See the [migration guide](docs/MIGRATION.md).
 
 ## Quick start
@@ -61,7 +63,7 @@ print(ids.tolist())
 plus = tokenizer.encode_plus("Hello, world!")
 print(plus.tolist())
 
-print(tokenizer.decode(plus.tolist()))
+print(tokenizer.decode(plus.tolist(), skip=True))
 
 flat, ends = tokenizer.batch(["Hello!", "World"])
 ```
@@ -81,7 +83,7 @@ ids.clear();
 tokenizer.encode_plus("Hello, world!", &mut ids)?;
 
 let mut text = String::new();
-tokenizer.decode(&ids, &mut text, Specials::Keep)?;
+tokenizer.decode(&ids, &mut text, Specials::Skip)?;
 ```
 
 `encode` and `encode_plus` append into the `Vec` the caller owns. Clear it to start a new sequence.

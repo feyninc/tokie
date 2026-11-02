@@ -203,6 +203,7 @@ Cohere embedding models use a proprietary tokenizer format that hasn't been anal
 let mut tokenizer = Tokenizer::open("tokenizer.json")?;
 let mut ids = Vec::new();
 tokenizer.encode("Hello world", &mut ids)?;
+ids.clear();
 tokenizer.encode_plus("Hello world", &mut ids)?;
 ```
 
@@ -215,7 +216,7 @@ tokenizer.save("model.tokie")?;
 let mut again = Tokenizer::open("model.tokie")?;
 ```
 
-Pre-built binary files are available in the `models/` directory:
+The loader refuses an old `.tkz` file. The names below are the previous catalog.
 
 **OpenAI / tiktoken-style (Backtracking):**
 - `gpt2.tkz` - GPT-2 (50K vocab)

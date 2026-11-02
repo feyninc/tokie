@@ -9,12 +9,12 @@
 | 0.1.4 | 0.2 |
 | --- | --- |
 | `encode(text, add_special_tokens=False)` | `encode`. The template stays off. |
-| `encode(text, add_special_tokens=True)` | `encode_plus`. `encode`, then the single-sequence template. |
+| `encode(text, add_special_tokens=True)` | `encode_plus`. `encode`, then a `TemplateProcessing` single sequence. `BertProcessing` and `RobertaProcessing` add no ids. |
 | `encode_ids` | The same append call. The caller passes the `Vec`. |
 | `encode_batch` | `batch`. One name. One id buffer and one `ends` entry per text. |
 | `encode_batch_flat` | `batch`. 0.1.4 returned per-document lengths. 0.2 `ends[i]` is the id count after text `i`. |
-| `count_tokens` | New. Encode into the scratch and return the length. No template. |
-| `count_tokens_batch` | New. `batch` into the scratch and return one length per text. |
+| `count_tokens` | Planned. Not on the tokenizer yet. Encode into a tokenizer-owned buffer and return the length. No template. |
+| `count_tokens_batch` | Planned. Not on the tokenizer yet. `batch` into that buffer and return one length per text. |
 | `decode` | Already appends into a `String`. Python keeps returning a `str`. |
 | `id_to_token` / `token_to_id` | `token` / `id`. |
 | `from_file` | `open`. |
@@ -55,6 +55,7 @@
 ```rust
 pub fn encode_plus(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), Error>;
 
+// Planned. Not implemented.
 pub fn count_tokens(&mut self, text: &str) -> Result<usize, Error>;
 pub fn count_tokens_batch(&mut self, texts: &[&str]) -> Result<Vec<usize>, Error>;
 ```
@@ -69,8 +70,7 @@ pub fn count_tokens_batch(&mut self, texts: &[&str]) -> Result<Vec<usize>, Error
 tokenizer.encode("Hello")                  # template off
 tokenizer.encode_plus("Hello")             # [CLS], ids, [SEP] when the template says so
 tokenizer.batch(["Hello", "world"])         # (ids, ends), template off
-tokenizer.count_tokens("Hello")            # int
-tokenizer.count_tokens_batch(["Hello", "world"])  # list of ints
+# count_tokens and count_tokens_batch are planned. They are not on the tokenizer yet.
 ```
 
 `batch` returns one id array and one ends array. `token` and `id` are the vocab calls. `open` reads a path.

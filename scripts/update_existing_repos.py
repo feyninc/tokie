@@ -42,7 +42,10 @@ BANNER_PATH = "assets/tokie-banner.png"
 ORG = "tokiers"
 
 
-def make_readme(repo_name, original_repo):
+def make_readme(repo_name, original_repo, files):
+    binary = ""
+    if "tokenizer.tokie" in files:
+        binary = "- `tokenizer.tokie` — tokie binary format\n"
     return f"""---
 tags:
 - tokie
@@ -70,7 +73,7 @@ tokenizer = tokie.Tokenizer.from_pretrained("tokiers/{repo_name}")
 ids = tokenizer.encode("Hello, world!")
 plus = tokenizer.encode_plus("Hello, world!")
 print(plus.tolist())
-print(tokenizer.decode(plus.tolist()))
+print(tokenizer.decode(plus.tolist(), skip=True))
 ```
 
 ## Quick Start (Rust)
@@ -87,14 +90,13 @@ let mut tokenizer = Tokenizer::pretrained("tokiers/{repo_name}").unwrap();
 let mut ids = Vec::new();
 tokenizer.encode_plus("Hello, world!", &mut ids).unwrap();
 let mut text = String::new();
-tokenizer.decode(&ids, &mut text, Specials::Keep).unwrap();
+tokenizer.decode(&ids, &mut text, Specials::Skip).unwrap();
 println!("{{text}}");
 ```
 
 ## Files
 
-- `tokenizer.tokie` — tokie binary format
-- `tokenizer.json` — original HuggingFace tokenizer (if available)
+{binary}- `tokenizer.json` — original HuggingFace tokenizer (if available)
 
 ## About tokie
 
@@ -133,7 +135,7 @@ for repo_name, original_repo in sorted(EXISTING_REPOS.items()):
             )
 
         # Upload/update README
-        readme_content = make_readme(repo_name, original_repo)
+        readme_content = make_readme(repo_name, original_repo, files)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(readme_content)
             f.flush()

@@ -11,7 +11,7 @@ tokenizer = tokie.Tokenizer.from_pretrained("google-bert/bert-base-uncased")
 
 ids = tokenizer.encode("Hello, world!")
 plus = tokenizer.encode_plus("Hello, world!")
-print(tokenizer.decode(plus.tolist()))
+print(tokenizer.decode(plus.tolist(), skip=True))
 
 flat, ends = tokenizer.batch(["Hello!", "World"])
 print(tokenizer.token(101))
@@ -36,8 +36,9 @@ ids.clear();
 tokenizer.encode_plus("Hello, world!", &mut ids)?;
 
 let mut text = String::new();
-tokenizer.decode(&ids, &mut text, Specials::Keep)?;
+tokenizer.decode(&ids, &mut text, Specials::Skip)?;
 
+ids.clear();
 let lines = ["Hello!", "World"];
 let mut ends = Vec::new();
 tokenizer.batch(&lines, &mut ids, &mut ends)?;
@@ -53,10 +54,10 @@ let again = Tokenizer::open("model.tokie")?;
 | Hugging Face | tokie |
 | --- | --- |
 | `Tokenizer.from_pretrained(repo)` | Python `Tokenizer.from_pretrained(repo)`. Rust `Tokenizer::pretrained(repo)`. |
-| `encode(text)` with the template on | `encode_plus` |
+| `encode(text)` with the template on | `encode_plus`. A `TemplateProcessing` single sequence. `BertProcessing` and `RobertaProcessing` add no ids. |
 | `encode(text, add_special_tokens=False)` | `encode` |
-| `encode_batch(texts)` | `batch` |
-| `decode(ids)` | `decode` |
+| `encode_batch(texts)` | `batch`. The template stays off. Call `encode_plus` on each text when the template is required. |
+| `decode(ids)` | Python `decode(ids, skip=True)`. Rust `decode` with `Specials::Skip`. The default keeps specials. |
 | `id_to_token(id)` | `token` |
 | `token_to_id(token)` | `id` |
 | `save(path)` | `save`. The file is `.tokie`. |
