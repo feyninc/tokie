@@ -94,6 +94,27 @@ def test_gpt2_encode_plus_matches_encode(gpt2):
         assert gpt2.encode_plus(text).tolist() == gpt2.encode(text).tolist()
 
 
+def test_count_tokens_matches_encode(model):
+    name, _, tok = model
+    for text in SAMPLES:
+        assert tok.count_tokens(text) == len(tok.encode(text)), name
+    if name == "bert":
+        assert tok.count_tokens("Hello") != len(tok.encode_plus("Hello"))
+
+
+def test_count_tokens_batch_matches_ends(model):
+    _, _, tok = model
+    _, ends = tok.batch(SAMPLES)
+    ends = ends.tolist()
+    prev = 0
+    expect = []
+    for end in ends:
+        expect.append(end - prev)
+        prev = end
+    assert tok.count_tokens_batch(SAMPLES) == expect
+    assert tok.count_tokens_batch([]) == []
+
+
 def test_batch_matches_encode(model):
     _, _, gpt2 = model
     ids, ends = gpt2.batch(SAMPLES)

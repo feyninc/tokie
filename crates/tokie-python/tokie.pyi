@@ -77,10 +77,10 @@ class Tokenizer:
         """Get the full vocabulary as a dict mapping token strings to IDs."""
         ...
     def count_tokens(self, text: str) -> int:
-        """Count the number of tokens in the text."""
+        """How many ids encode would return. The template stays off."""
         ...
     def count_tokens_batch(self, texts: list[str]) -> list[int]:
-        """Count tokens for multiple texts in parallel."""
+        """One length per text, from batch. The template stays off."""
         ...
     def encode_files(
         self,

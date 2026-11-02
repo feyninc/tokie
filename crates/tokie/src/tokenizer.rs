@@ -130,6 +130,8 @@ struct Scratch {
     view: String,
     syms: Vec<u32>,
     piece: Vec<u32>,
+    /// Ids for `count_tokens`. Separate from `piece`, which is the merge scratch.
+    count: Vec<u32>,
     raw_parts: Vec<Part>,
     norm_parts: Vec<Part>,
     /// Byte-level spelling of the current piece, for `ignore_merges`.
@@ -143,6 +145,7 @@ impl Scratch {
             view: String::new(),
             syms: Vec::new(),
             piece: Vec::new(),
+            count: Vec::new(),
             raw_parts: Vec::new(),
             norm_parts: Vec::new(),
             mapped: String::new(),
@@ -533,6 +536,38 @@ impl Tokenizer {
         }
         ids.extend_from_slice(&suffix);
         Ok(())
+    }
+
+    /// How many ids [`Self::encode`] appends for `text`.
+    ///
+    /// The method writes the ids into a buffer on this tokenizer and returns
+    /// the length. The template stays off. The next call reuses the buffer.
+    pub fn count_tokens(&mut self, text: &str) -> Result<usize, Error> {
+        let mut ids = std::mem::take(&mut self.scratch.count);
+        ids.clear();
+        let result = self.encode(text, &mut ids).map(|()| ids.len());
+        self.scratch.count = ids;
+        result
+    }
+
+    /// One length per text. This calls [`Self::batch`].
+    ///
+    /// The template stays off. The returned `Vec` is allocated for this call.
+    /// The method does not call [`Self::threads`].
+    pub fn count_tokens_batch(&mut self, texts: &[&str]) -> Result<Vec<usize>, Error> {
+        let mut ids = std::mem::take(&mut self.scratch.count);
+        ids.clear();
+        let mut ends = Vec::with_capacity(texts.len());
+        let result = self.batch(texts, &mut ids, &mut ends);
+        self.scratch.count = ids;
+        result?;
+        let mut lengths = Vec::with_capacity(ends.len());
+        let mut prev = 0;
+        for end in ends {
+            lengths.push(end - prev);
+            prev = end;
+        }
+        Ok(lengths)
     }
 
     /// Append the text for `ids`. `Keep` writes every id. `Skip` omits specials.
@@ -2767,6 +2802,57 @@ mod tests {
         ids.clear();
         plain.encode_plus(".:.", &mut ids).unwrap();
         assert_eq!(ids, encoded);
+    }
+
+    #[test]
+    fn count_tokens_matches_encode_and_keeps_the_caller_buffer() {
+        let mut tok = Tokenizer::json(TEMPLATE).unwrap();
+        let mut ids = vec![9];
+        tok.encode(".:.", &mut ids).unwrap();
+        assert_eq!(ids, [9, 2, 0]);
+        assert_eq!(tok.count_tokens(".:.").unwrap(), 2);
+        assert_eq!(ids, [9, 2, 0]);
+
+        ids.clear();
+        tok.encode_plus(".:.", &mut ids).unwrap();
+        assert_eq!(ids.len(), 4);
+        assert_eq!(tok.count_tokens(".:.").unwrap(), 2);
+        assert_eq!(ids.len(), 4);
+
+        assert_eq!(tok.count_tokens("").unwrap(), 0);
+        assert_eq!(tok.count_tokens(".:.:").unwrap(), 1);
+
+        let docs = ["", ".:.", ".:.:"];
+        ids.clear();
+        let mut ends = Vec::new();
+        tok.batch(&docs, &mut ids, &mut ends).unwrap();
+        assert_eq!(ids, [2, 0, 3]);
+        assert_eq!(ends, [0, 2, 3]);
+        let expect = vec![0, 2, 1];
+        assert_eq!(tok.count_tokens_batch(&docs).unwrap(), expect);
+        assert_eq!(ids, [2, 0, 3]);
+
+        tok.threads(4);
+        assert_eq!(tok.count_tokens_batch(&docs).unwrap(), expect);
+        assert_eq!(ids, [2, 0, 3]);
+        assert!(tok.count_tokens_batch(&[]).unwrap().is_empty());
+
+        let mut split = Tokenizer::json(
+            r#"{
+                "model": {
+                    "type": "BPE",
+                    "ignore_merges": true,
+                    "vocab": {".": 0, ":": 1, ".:": 2, ".:.:": 3},
+                    "merges": [". :"]
+                },
+                "pre_tokenizer": {"type": "WhitespaceSplit"}
+            }"#,
+        )
+        .unwrap();
+        assert!(split.count_tokens(".:.: x").is_err());
+        assert_eq!(split.count_tokens(".:.:").unwrap(), 1);
+        assert!(split.count_tokens_batch(&[".:.:", ".:.: x"]).is_err());
+        assert_eq!(split.count_tokens(".:.:").unwrap(), 1);
     }
 
     fn sequential(tok: &mut Tokenizer, docs: &[&str]) -> (Vec<u32>, Vec<usize>) {
