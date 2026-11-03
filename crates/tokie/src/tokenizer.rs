@@ -279,6 +279,12 @@ impl<'a> EncodePlus<'a> for &'a String {
     }
 }
 
+impl<'a> EncodePlus<'a> for &&'a str {
+    fn spec(self) -> Spec<'a> {
+        (*self).spec()
+    }
+}
+
 impl<'a> EncodePlus<'a> for &'a str {
     fn spec(self) -> Spec<'a> {
         Spec {
