@@ -40,7 +40,7 @@ Most pieces are 15 bytes or fewer and repeat. Those pack into one `u128`. A hit 
 ## Remaining
 
 - GPT-2 on the whole OpenWebText file is still sometimes under gigatoken. GPT-2 and cl100k line rates sit a few percent under. WordPiece, Unigram, and unaffixed SentencePiece still need a timing against tokenizers v1 on this binary.
-- Pair encoding, padding, truncation, and offsets. `encode_plus` only applies the single-sequence template.
+- Offsets, attention masks, and type ids. `encode_plus` applies the template, encodes a pair, cuts to a length, and pads. It does not return offsets, masks, or type ids.
 - Added-token `lstrip`, `rstrip`, and `single_word`. A `normalized` token is matched as written, and the normalizer does not rewrite that needle.
 - Affixed SentencePiece BPE. A continuing-subword prefix or an end-of-word suffix is refused. Llama 2, Mistral, and Gemma use that form.
 - These files are refused. Mistral-7B-v0.1 uses a metaspace prepend of `first`. gemma-2-2b and gemma-3-4b-it split on a space. bge-m3, snowflake-arctic-embed-l-v2.0, and potion-multilingual-128M replace with the regex ` {2,}`. Only a literal replace is loaded.

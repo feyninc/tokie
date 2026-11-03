@@ -14,4 +14,4 @@ mod file;
 mod prepare;
 mod tokenizer;
 
-pub use tokenizer::{Error, Specials, Tokenizer};
+pub use tokenizer::{EncodePlus, Error, Plus, Specials, Tokenizer};

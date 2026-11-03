@@ -132,6 +132,8 @@ struct Scratch {
     piece: Vec<u32>,
     /// Ids for `count_tokens`. Separate from `piece`, which is the merge scratch.
     count: Vec<u32>,
+    /// Second sequence for `encode_plus`. Separate from `piece` and `count`.
+    second: Vec<u32>,
     raw_parts: Vec<Part>,
     norm_parts: Vec<Part>,
     /// Byte-level spelling of the current piece, for `ignore_merges`.
@@ -146,6 +148,7 @@ impl Scratch {
             syms: Vec::new(),
             piece: Vec::new(),
             count: Vec::new(),
+            second: Vec::new(),
             raw_parts: Vec::new(),
             norm_parts: Vec::new(),
             mapped: String::new(),
@@ -211,6 +214,92 @@ impl Pool {
 impl Drop for Pool {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// A second sequence, a cut, or padding for [`Tokenizer::encode_plus`].
+///
+/// `truncate` and `pad` share one length. The length counts the template ids.
+pub struct Plus<'a> {
+    text: &'a str,
+    pair: Option<&'a str>,
+    max_len: Option<usize>,
+    truncate: bool,
+    pad: bool,
+}
+
+impl<'a> Plus<'a> {
+    pub fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            pair: None,
+            max_len: None,
+            truncate: false,
+            pad: false,
+        }
+    }
+
+    /// Encode `pair` after `text` and use the pair template.
+    pub fn pair(mut self, pair: &'a str) -> Self {
+        self.pair = Some(pair);
+        self
+    }
+
+    /// Drop ids from the end of the longer sequence until the result fits.
+    pub fn truncate(mut self, max_len: usize) -> Self {
+        self.truncate = true;
+        self.max_len = Some(max_len);
+        self
+    }
+
+    /// Append the pad id until this call's ids reach `max_len`.
+    pub fn pad(mut self, max_len: usize) -> Self {
+        self.pad = true;
+        self.max_len = Some(max_len);
+        self
+    }
+}
+
+/// Text for [`Tokenizer::encode_plus`], or a [`Plus`] that adds a pair, a cut, or padding.
+pub trait EncodePlus<'a> {
+    fn spec(self) -> Spec<'a>;
+}
+
+pub struct Spec<'a> {
+    text: &'a str,
+    pair: Option<&'a str>,
+    max_len: Option<usize>,
+    truncate: bool,
+    pad: bool,
+}
+
+impl<'a> EncodePlus<'a> for &'a String {
+    fn spec(self) -> Spec<'a> {
+        self.as_str().spec()
+    }
+}
+
+impl<'a> EncodePlus<'a> for &'a str {
+    fn spec(self) -> Spec<'a> {
+        Spec {
+            text: self,
+            pair: None,
+            max_len: None,
+            truncate: false,
+            pad: false,
+        }
+    }
+}
+
+impl<'a> EncodePlus<'a> for Plus<'a> {
+    fn spec(self) -> Spec<'a> {
+        Spec {
+            text: self.text,
+            pair: self.pair,
+            max_len: self.max_len,
+            truncate: self.truncate,
+            pad: self.pad,
+        }
     }
 }
 
@@ -452,6 +541,10 @@ impl Tokenizer {
             added_norm: tables.norm_rows.clone(),
             post_prefix: tables.post.prefix.clone(),
             post_suffix: tables.post.suffix.clone(),
+            has_pair: tables.post.has_pair,
+            pair_prefix: tables.post.pair_prefix.clone(),
+            pair_mid: tables.post.pair_mid.clone(),
+            pair_end: tables.post.pair_end.clone(),
             wp,
             pieces: (*self.piece_seed).clone(),
         }
@@ -522,11 +615,25 @@ impl Tokenizer {
         self.encode_general(text, ids).map_err(Error::from)
     }
 
-    /// [`Self::encode`], then the single-sequence template.
+    /// [`Self::encode`], then the template.
+    ///
+    /// Pass the text for the single-sequence template. Pass a [`Plus`] to
+    /// encode a second sequence, cut to a length, or pad to that length.
     ///
     /// A ByteLevel post-processor adds nothing, so those ids match
-    /// [`Self::encode`]. BERT uncased is `[CLS]`, the ids, `[SEP]`.
-    pub fn encode_plus(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), Error> {
+    /// [`Self::encode`]. BERT uncased is `[CLS]`, the ids, `[SEP]`. A pair is
+    /// `[CLS]`, the first ids, `[SEP]`, the second ids, `[SEP]`. The cut drops
+    /// ids from the end of the longer sequence until the template fits. Pad
+    /// appends the `[PAD]` or `<pad>` id after the ids this call wrote.
+    pub fn encode_plus<'a>(&mut self, text: impl EncodePlus<'a>, ids: &mut Vec<u32>) -> Result<(), Error> {
+        let spec = text.spec();
+        if spec.pair.is_none() && !spec.truncate && !spec.pad {
+            return self.encode_plus_single(spec.text, ids);
+        }
+        self.encode_plus_full(spec, ids)
+    }
+
+    fn encode_plus_single(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), Error> {
         let prefix = self.tables.post.prefix.clone();
         let suffix = self.tables.post.suffix.clone();
         let at = ids.len();
@@ -536,6 +643,69 @@ impl Tokenizer {
         }
         ids.extend_from_slice(&suffix);
         Ok(())
+    }
+
+    fn encode_plus_full(&mut self, spec: Spec<'_>, ids: &mut Vec<u32>) -> Result<(), Error> {
+        if spec.pair.is_some() && !self.tables.post.has_pair {
+            return Err(Error::new("this tokenizer has no pair template"));
+        }
+        let mut first = std::mem::take(&mut self.scratch.count);
+        first.clear();
+        let mut second = std::mem::take(&mut self.scratch.second);
+        second.clear();
+        let result = self.write_plus(spec, ids, &mut first, &mut second);
+        self.scratch.count = first;
+        self.scratch.second = second;
+        result
+    }
+
+    fn write_plus(
+        &mut self,
+        spec: Spec<'_>,
+        ids: &mut Vec<u32>,
+        first: &mut Vec<u32>,
+        second: &mut Vec<u32>,
+    ) -> Result<(), Error> {
+        self.encode(spec.text, first)?;
+        let paired = spec.pair.is_some();
+        if let Some(pair) = spec.pair {
+            self.encode(pair, second)?;
+        }
+        let (prefix, mid, end) = if paired {
+            (
+                self.tables.post.pair_prefix.clone(),
+                self.tables.post.pair_mid.clone(),
+                self.tables.post.pair_end.clone(),
+            )
+        } else {
+            (self.tables.post.prefix.clone(), Vec::new(), self.tables.post.suffix.clone())
+        };
+        if spec.truncate {
+            let max_len = spec.max_len.ok_or_else(|| Error::new("truncate needs a length"))?;
+            let room = max_len.saturating_sub(prefix.len() + mid.len() + end.len());
+            fit_longest(first, second, room, paired);
+        }
+        let at = ids.len();
+        ids.extend_from_slice(&prefix);
+        ids.extend_from_slice(first);
+        ids.extend_from_slice(&mid);
+        ids.extend_from_slice(second);
+        ids.extend_from_slice(&end);
+        if spec.pad {
+            let max_len = spec.max_len.ok_or_else(|| Error::new("pad needs a length"))?;
+            let have = ids.len() - at;
+            if have < max_len {
+                let pad_id = self.pad_id()?;
+                ids.resize(at + max_len, pad_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn pad_id(&self) -> Result<u32, Error> {
+        self.id("[PAD]")
+            .or_else(|| self.id("<pad>"))
+            .ok_or_else(|| Error::new("this tokenizer has no pad token"))
     }
 
     /// How many ids [`Self::encode`] appends for `text`.
@@ -1602,15 +1772,24 @@ fn regex_of(value: &Value) -> Result<String, String> {
 struct Post {
     prefix: Vec<u32>,
     suffix: Vec<u32>,
+    pair_prefix: Vec<u32>,
+    pair_mid: Vec<u32>,
+    pair_end: Vec<u32>,
+    has_pair: bool,
 }
 
 /// Single-sequence template. Anything other than `TemplateProcessing` adds
 /// no ids. Specials before the sequence are the prefix. Specials after it
-/// are the suffix.
+/// are the suffix. A pair template stores the ids before A, between A and B,
+/// and after B.
 fn post_of(value: Option<&Value>) -> Result<Post, String> {
     let empty = Post {
         prefix: Vec::new(),
         suffix: Vec::new(),
+        pair_prefix: Vec::new(),
+        pair_mid: Vec::new(),
+        pair_end: Vec::new(),
+        has_pair: false,
     };
     let Some(value) = value.filter(|v| !v.is_null()) else {
         return Ok(empty);
@@ -1627,16 +1806,55 @@ fn post_of(value: Option<&Value>) -> Result<Post, String> {
         .get("single")
         .and_then(|v| v.as_array())
         .ok_or("template has no single sequence")?;
-    let mut prefix = Vec::new();
-    let mut suffix = Vec::new();
-    let mut seen_seq = false;
-    for item in single {
+    let (prefix, _, suffix) = template_runs(single, specials, 1)?;
+    let (pair_prefix, pair_mid, pair_end, has_pair) = match obj.get("pair").filter(|v| !v.is_null()) {
+        None => (Vec::new(), Vec::new(), Vec::new(), false),
+        Some(pair) => {
+            let pair = pair.as_array().ok_or("template pair is not a list")?;
+            let (prefix, mid, end) = template_runs(pair, specials, 2)?;
+            (prefix, mid, end, true)
+        }
+    };
+    Ok(Post {
+        prefix,
+        suffix,
+        pair_prefix,
+        pair_mid,
+        pair_end,
+        has_pair,
+    })
+}
+
+/// Specials before the first sequence, between the two sequences, and after
+/// the last one. `sequences` is 1 for the single template and 2 for the pair.
+fn template_runs(
+    items: &[Value],
+    specials: &serde_json::Map<String, Value>,
+    sequences: usize,
+) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>), String> {
+    let mut before = Vec::new();
+    let mut mid = Vec::new();
+    let mut after = Vec::new();
+    let mut seen = 0usize;
+    for item in items {
         let item = item.as_object().ok_or("template piece is not an object")?;
         if item.contains_key("Sequence") {
-            if seen_seq {
-                return Err("single template has two sequences".to_string());
+            let name = item
+                .get("Sequence")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str());
+            let expect = if seen == 0 { "A" } else { "B" };
+            if name != Some(expect) {
+                return Err(format!("template sequence is {name:?}"));
             }
-            seen_seq = true;
+            seen += 1;
+            if seen > sequences {
+                return Err(if sequences == 1 {
+                    "single template has two sequences".to_string()
+                } else {
+                    "pair template has more than two sequences".to_string()
+                });
+            }
             continue;
         }
         let name = item
@@ -1649,13 +1867,57 @@ fn post_of(value: Option<&Value>) -> Result<Post, String> {
             .and_then(|v| v.get("ids"))
             .and_then(|v| v.as_array())
             .ok_or_else(|| format!("template token {name} has no ids"))?;
-        let dest = if seen_seq { &mut suffix } else { &mut prefix };
+        let dest = if seen == 0 {
+            &mut before
+        } else if sequences == 2 && seen == 1 {
+            &mut mid
+        } else {
+            &mut after
+        };
         for id in ids {
             let id = id.as_u64().ok_or_else(|| format!("template id for {name} is not an integer"))?;
             dest.push(u32::try_from(id).map_err(|_| format!("template id {id} does not fit in u32"))?);
         }
     }
-    Ok(Post { prefix, suffix })
+    if seen != sequences {
+        return Err(format!("template has {seen} sequences"));
+    }
+    Ok((before, mid, after))
+}
+
+/// Longest-first cut. `room` is the ids left after the template is reserved.
+/// The kept ids are a prefix of each sequence.
+fn fit_longest(first: &mut Vec<u32>, second: &mut Vec<u32>, room: usize, paired: bool) {
+    if !paired {
+        if first.len() > room {
+            first.truncate(room);
+        }
+        return;
+    }
+    let mut n1 = first.len();
+    let mut n2 = second.len();
+    if n1 + n2 <= room {
+        return;
+    }
+    let mut swap = false;
+    if n1 > n2 {
+        swap = true;
+        std::mem::swap(&mut n1, &mut n2);
+    }
+    if n1 > room {
+        n2 = n1;
+    } else {
+        n2 = n1.max(room - n1);
+    }
+    if n1 + n2 > room {
+        n1 = room / 2;
+        n2 = n1 + room % 2;
+    }
+    if swap {
+        std::mem::swap(&mut n1, &mut n2);
+    }
+    first.truncate(n1);
+    second.truncate(n2);
 }
 
 fn from_image(image: crate::file::Image) -> Result<Tokenizer, Error> {
@@ -1739,6 +2001,10 @@ fn from_image(image: crate::file::Image) -> Result<Tokenizer, Error> {
             post: Post {
                 prefix: image.post_prefix,
                 suffix: image.post_suffix,
+                pair_prefix: image.pair_prefix,
+                pair_mid: image.pair_mid,
+                pair_end: image.pair_end,
+                has_pair: image.has_pair,
             },
             vocab,
             scan: OnceLock::new(),
@@ -2716,7 +2982,7 @@ fn added_entries(value: Option<&Value>) -> Result<Vec<(String, u32, bool)>, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::Tokenizer;
+    use super::{Plus, Tokenizer};
 
     const WITH: &str = r#"{
         "model": {
@@ -2802,6 +3068,80 @@ mod tests {
         ids.clear();
         plain.encode_plus(".:.", &mut ids).unwrap();
         assert_eq!(ids, encoded);
+    }
+
+    const PAIR: &str = r#"{
+        "model": {
+            "type": "BPE",
+            "ignore_merges": true,
+            "vocab": {".": 0, ":": 1, ".:": 2, ".:.:": 3, "[PAD]": 6},
+            "merges": [". :"]
+        },
+        "post_processor": {
+            "type": "TemplateProcessing",
+            "single": [
+                {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+            ],
+            "pair": [
+                {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "[SEP]", "type_id": 0}},
+                {"Sequence": {"id": "B", "type_id": 1}},
+                {"SpecialToken": {"id": "[SEP]", "type_id": 1}}
+            ],
+            "special_tokens": {
+                "[CLS]": {"id": "[CLS]", "ids": [4], "tokens": ["[CLS]"]},
+                "[SEP]": {"id": "[SEP]", "ids": [5], "tokens": ["[SEP]"]}
+            }
+        }
+    }"#;
+
+    #[test]
+    fn encode_plus_pairs_truncates_and_pads() {
+        let mut tok = Tokenizer::json(PAIR).unwrap();
+        let mut ids = vec![9];
+        tok.encode_plus(".:.", &mut ids).unwrap();
+        assert_eq!(ids, [9, 4, 2, 0, 5]);
+
+        ids = vec![9];
+        tok.encode_plus(Plus::new(".:.").pair(".:.:"), &mut ids).unwrap();
+        assert_eq!(ids, [9, 4, 2, 0, 5, 3, 5]);
+
+        ids.clear();
+        tok.encode(&".".repeat(8), &mut ids).unwrap();
+        let dots = ids.clone();
+        ids.clear();
+        tok.encode_plus(Plus::new(&".".repeat(8)).truncate(4), &mut ids).unwrap();
+        assert_eq!(ids, [&[4], &dots[..2], &[5]].concat());
+
+        ids.clear();
+        tok.encode_plus(Plus::new(".:.").pad(6), &mut ids).unwrap();
+        assert_eq!(ids, [4, 2, 0, 5, 6, 6]);
+
+        let mut short = Vec::new();
+        tok.encode(&".".repeat(2), &mut short).unwrap();
+        ids.clear();
+        tok.encode_plus(Plus::new(&".".repeat(8)).pair(&".".repeat(2)).truncate(7).pad(7), &mut ids)
+            .unwrap();
+        assert_eq!(ids, [&[4], &dots[..2], &[5], &short[..2], &[5]].concat());
+
+        ids.clear();
+        tok.encode_plus(Plus::new(".:.").pad(4), &mut ids).unwrap();
+        assert_eq!(ids, [4, 2, 0, 5]);
+
+        let mut plain = Tokenizer::json(WITH).unwrap();
+        let err = plain.encode_plus(Plus::new(".:.").pair(".:.:"), &mut ids);
+        assert!(err.is_err(), "{ids:?}");
+
+        let path = std::env::temp_dir().join(format!("tokie-plus-{}.tokie", std::process::id()));
+        tok.save(&path).unwrap();
+        let mut loaded = Tokenizer::open(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        ids.clear();
+        loaded.encode_plus(Plus::new(".:.").pair(".:.:"), &mut ids).unwrap();
+        assert_eq!(ids, [4, 2, 0, 5, 3, 5]);
     }
 
     #[test]

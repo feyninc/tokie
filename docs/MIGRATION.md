@@ -55,6 +55,8 @@ let again = Tokenizer::open("model.tokie")?;
 | --- | --- |
 | `Tokenizer.from_pretrained(repo)` | Python `Tokenizer.from_pretrained(repo)`. Rust `Tokenizer::pretrained(repo)`. |
 | `encode(text)` with the template on | `encode_plus`. A `TemplateProcessing` single sequence. `BertProcessing` and `RobertaProcessing` add no ids. |
+| `encode(text, text_pair)` | `encode_plus` with `pair`. The pair template. |
+| truncation or padding | `truncate` and `pad` on that same call. One `max_len` covers both, and it counts the template ids. |
 | `encode(text, add_special_tokens=False)` | `encode` |
 | `encode_batch(texts)` | `batch`. The template stays off. Call `encode_plus` on each text when the template is required. |
 | `decode(ids)` | Python `decode(ids, skip=True)`. Rust `decode` with `Specials::Skip`. The default keeps specials. |

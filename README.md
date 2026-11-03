@@ -62,6 +62,7 @@ print(ids.tolist())
 
 plus = tokenizer.encode_plus("Hello, world!")
 print(plus.tolist())
+print(tokenizer.encode_plus("Hello", pair="world", truncate=True, pad=True, max_len=8).tolist())
 
 print(tokenizer.decode(plus.tolist(), skip=True))
 
@@ -70,12 +71,12 @@ print(tokenizer.count_tokens("Hello, world!"))
 print(tokenizer.count_tokens_batch(["Hello!", "World"]))
 ```
 
-`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the single-sequence template, so BERT uncased is `[CLS]`, the ids, `[SEP]`. `batch` returns one id array and `ends[i]`, the id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off.
+`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the single-sequence template, so BERT uncased is `[CLS]`, the ids, `[SEP]`. `pair` uses the pair template. `truncate` and `pad` share `max_len`, and that length counts the template ids. `batch` returns one id array and `ends[i]`, the id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off.
 
 ### Rust
 
 ```rust
-use tokie::{Specials, Tokenizer};
+use tokie::{Plus, Specials, Tokenizer};
 
 let mut tokenizer = Tokenizer::pretrained("google-bert/bert-base-uncased")?;
 let mut ids = Vec::new();
@@ -83,6 +84,7 @@ tokenizer.encode("Hello, world!", &mut ids)?;
 
 ids.clear();
 tokenizer.encode_plus("Hello, world!", &mut ids)?;
+tokenizer.encode_plus(Plus::new("Hello").pair("world").truncate(8).pad(8), &mut ids)?;
 
 let mut text = String::new();
 tokenizer.decode(&ids, &mut text, Specials::Skip)?;

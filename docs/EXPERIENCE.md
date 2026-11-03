@@ -40,9 +40,10 @@ tokenizer.decode(&ids, &mut text, Specials::Keep)?;
 ```rust
 tokenizer.encode(text, &mut ids)?;
 tokenizer.encode_plus(text, &mut ids)?;
+tokenizer.encode_plus(Plus::new(text).pair(other).truncate(32).pad(32), &mut ids)?;
 ```
 
-`encode` emits a special token when its text occurs in the input. The template stays off. `encode_plus` runs `encode`, then writes the single-sequence template around those ids. BERT uncased is `[CLS]`, the ids, `[SEP]`. A ByteLevel template adds nothing, so `encode_plus` and `encode` write the same ids for GPT-2.
+`encode` emits a special token when its text occurs in the input. The template stays off. `encode_plus` runs `encode`, then writes the template around those ids. BERT uncased is `[CLS]`, the ids, `[SEP]`. A pair is `[CLS]`, the first ids, `[SEP]`, the second ids, `[SEP]`. `truncate` and `pad` share one length, and that length counts the template ids. A ByteLevel template adds nothing, so `encode_plus` and `encode` write the same ids for GPT-2.
 
 `encode` is the short call because the speed bench and the id checks use it. `encode_plus` splices a short prefix and a short suffix after that call returns.
 
@@ -87,7 +88,7 @@ On `Error`, `ids` and `ends` hold the texts that finished. The caller truncates 
 ## Root
 
 ```rust
-pub use tokenizer::{Tokenizer, Error, Specials};
+pub use tokenizer::{Tokenizer, Error, Plus, Specials};
 ```
 
 `Specials` is `Keep` and `Skip`.
@@ -121,9 +122,6 @@ These names stay free for the calls that come after this API. The open work is l
 
 | Name | Job |
 | --- | --- |
-| `pair` | Two sequences and the pair template |
-| `pad` | Pad a batch to a width |
-| `truncate` | Cut ids to a length |
 | `offsets` | Byte offsets for each id |
 
 `open` reads a `.tokie` file or `tokenizer.json`. `save` writes the `.tokie` file. The layout is in [FORMAT.md](FORMAT.md).

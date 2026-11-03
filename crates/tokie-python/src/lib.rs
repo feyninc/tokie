@@ -14,7 +14,7 @@ use numpy::npyffi::{self, PY_ARRAY_API};
 use pyo3::create_exception;
 use pyo3::prelude::*;
 use pyo3::types::{PyString, PyStringMethods};
-use tokie_core::{Specials, Tokenizer};
+use tokie_core::{Plus, Specials, Tokenizer};
 
 create_exception!(tokie, TokieError, pyo3::exceptions::PyException);
 
@@ -80,12 +80,39 @@ impl PyTokenizer {
         ids_array(py, &self.ids, ids)
     }
 
-    /// `encode`, then the single-sequence template. Returns a `uint32` array.
-    fn encode_plus<'py>(&self, py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyArray1<u32>>> {
+    /// `encode`, then the template. `pair` uses the pair template.
+    /// `truncate` cuts to `max_len`. `pad` extends to `max_len`.
+    /// Returns a `uint32` array.
+    #[pyo3(signature = (text, pair=None, max_len=None, truncate=false, pad=false))]
+    fn encode_plus<'py>(
+        &self,
+        py: Python<'py>,
+        text: &str,
+        pair: Option<&str>,
+        max_len: Option<usize>,
+        truncate: bool,
+        pad: bool,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
         let ids = py.detach(|| {
             let mut tok = self.inner.lock().unwrap();
             let mut ids = checkout(&self.ids, text.len() / 4 + 16);
-            tok.encode_plus(text, &mut ids).map_err(|err| err.to_string())?;
+            if pair.is_none() && !truncate && !pad {
+                tok.encode_plus(text, &mut ids).map_err(|err| err.to_string())?;
+            } else {
+                let mut plus = Plus::new(text);
+                if let Some(pair) = pair {
+                    plus = plus.pair(pair);
+                }
+                if truncate {
+                    let n = max_len.ok_or("truncate needs a length")?;
+                    plus = plus.truncate(n);
+                }
+                if pad {
+                    let n = max_len.ok_or("pad needs a length")?;
+                    plus = plus.pad(n);
+                }
+                tok.encode_plus(plus, &mut ids).map_err(|err| err.to_string())?;
+            }
             Ok::<Vec<u32>, String>(ids)
         })
         .map_err(to_py_err)?;
