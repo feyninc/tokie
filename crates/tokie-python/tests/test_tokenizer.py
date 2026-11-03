@@ -89,6 +89,44 @@ def test_encode_plus_matches_rust(model):
     assert got == rust_ids(path, SAMPLES, encode_plus=True), name
 
 
+PAIR = """{
+    "model": {
+        "type": "BPE",
+        "ignore_merges": true,
+        "vocab": {".": 0, ":": 1, ".:": 2, ".:.:": 3, "[PAD]": 6},
+        "merges": [". :"]
+    },
+    "post_processor": {
+        "type": "TemplateProcessing",
+        "single": [
+            {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}},
+            {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+        ],
+        "pair": [
+            {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}},
+            {"SpecialToken": {"id": "[SEP]", "type_id": 0}},
+            {"Sequence": {"id": "B", "type_id": 1}},
+            {"SpecialToken": {"id": "[SEP]", "type_id": 1}}
+        ],
+        "special_tokens": {
+            "[CLS]": {"id": "[CLS]", "ids": [4], "tokens": ["[CLS]"]},
+            "[SEP]": {"id": "[SEP]", "ids": [5], "tokens": ["[SEP]"]}
+        }
+    }
+}"""
+
+
+def test_encode_plus_pair_truncate_pad():
+    tok = tokie.Tokenizer.json(PAIR)
+    assert tok.encode_plus(".:.").tolist() == [4, 2, 0, 5]
+    assert tok.encode_plus(".:.", pair=".:.:").tolist() == [4, 2, 0, 5, 3, 5]
+    dots = tok.encode("....").tolist()
+    assert tok.encode_plus("....", truncate=True, max_len=4).tolist() == [4, *dots[:2], 5]
+    assert tok.encode_plus(".:.", pad=True, max_len=6).tolist() == [4, 2, 0, 5, 6, 6]
+
+
 def test_gpt2_encode_plus_matches_encode(gpt2):
     for text in SAMPLES:
         assert gpt2.encode_plus(text).tolist() == gpt2.encode(text).tolist()

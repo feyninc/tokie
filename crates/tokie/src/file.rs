@@ -39,6 +39,8 @@ const TAG_CHARSMAP: u16 = 18;
 const TAG_BMP: u16 = 19;
 const TAG_WP: u16 = 20;
 const TAG_PIECES: u16 = 21;
+const TAG_POST_PAIR: u16 = 22;
+const TAG_LAST: u16 = TAG_POST_PAIR;
 
 const MODEL_BPE: u8 = 1;
 const MODEL_WP: u8 = 2;
@@ -113,6 +115,12 @@ pub(crate) struct Image {
     pub added_norm: Vec<(String, u32)>,
     pub post_prefix: Vec<u32>,
     pub post_suffix: Vec<u32>,
+    /// Pair template, present only when the file has one. The three runs are
+    /// the ids before A, the ids between A and B, and the ids after B.
+    pub has_pair: bool,
+    pub pair_prefix: Vec<u32>,
+    pub pair_mid: Vec<u32>,
+    pub pair_end: Vec<u32>,
     pub wp: Vec<(String, u32)>,
     pub pieces: Vec<(Vec<u8>, Vec<u32>)>,
 }
@@ -156,6 +164,7 @@ pub(crate) fn encode(image: &Image) -> Result<Vec<u8>, String> {
     push_opt(&mut blobs, added_blob(TAG_ADDED_NORM, &image.added_norm, &mut tab)?);
     push_opt(&mut blobs, ids_blob(TAG_POST_PREFIX, &image.post_prefix));
     push_opt(&mut blobs, ids_blob(TAG_POST_SUFFIX, &image.post_suffix));
+    push_opt(&mut blobs, pair_blob(image));
     push_opt(&mut blobs, charsmap_blob(image));
     push_opt(&mut blobs, bmp_blob(image));
     push_opt(&mut blobs, wp_blob(image, &mut tab)?);
@@ -281,7 +290,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Image, String> {
         let offset = u64::from_le_bytes(directory[at + 16..at + 24].try_into().unwrap());
         let len = u64::from_le_bytes(directory[at + 24..at + 32].try_into().unwrap());
         let crc = u32::from_le_bytes(directory[at + 32..at + 36].try_into().unwrap());
-        if tag == 0 || tag > TAG_PIECES {
+        if tag == 0 || tag > TAG_LAST {
             return Err(format!(".tokie tag {tag} is unknown"));
         }
         if seen[tag as usize] {
@@ -355,6 +364,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Image, String> {
     let added_norm = read_pairs_str(bytes, strtab, got[TAG_ADDED_NORM as usize])?;
     let post_prefix = read_ids(bytes, got[TAG_POST_PREFIX as usize])?;
     let post_suffix = read_ids(bytes, got[TAG_POST_SUFFIX as usize])?;
+    let (has_pair, pair_prefix, pair_mid, pair_end) = read_pair(bytes, got[TAG_POST_PAIR as usize])?;
     let charsmaps = read_charsmaps(bytes, got[TAG_CHARSMAP as usize], got[TAG_BMP as usize])?;
     let wp = read_pairs_str(bytes, strtab, got[TAG_WP as usize])?;
     let pieces = read_pieces(bytes, got[TAG_PIECES as usize], vocab_len)?;
@@ -405,6 +415,10 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Image, String> {
         added_norm,
         post_prefix,
         post_suffix,
+        has_pair,
+        pair_prefix,
+        pair_mid,
+        pair_end,
         wp,
         pieces,
     })
@@ -1024,6 +1038,58 @@ fn added_blob(tag: u16, rows: &[(String, u32)], tab: &mut Tab) -> Result<Option<
         stride: 16,
         bytes,
     }))
+}
+
+fn pair_blob(image: &Image) -> Option<Blob> {
+    if !image.has_pair {
+        return None;
+    }
+    let mut ids = Vec::new();
+    push_run(&mut ids, &image.pair_prefix);
+    push_run(&mut ids, &image.pair_mid);
+    push_run(&mut ids, &image.pair_end);
+    let mut bytes = Vec::with_capacity(ids.len() * 4);
+    for id in ids {
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    Some(Blob {
+        tag: TAG_POST_PAIR,
+        count: (bytes.len() / 4) as u32,
+        stride: 4,
+        bytes,
+    })
+}
+
+fn push_run(out: &mut Vec<u32>, ids: &[u32]) {
+    out.push(u32::try_from(ids.len()).expect("pair template is longer than 4 GiB of ids"));
+    out.extend_from_slice(ids);
+}
+
+fn read_pair(bytes: &[u8], span: Option<Span>) -> Result<(bool, Vec<u32>, Vec<u32>, Vec<u32>), String> {
+    let Some(span) = span else {
+        return Ok((false, Vec::new(), Vec::new(), Vec::new()));
+    };
+    let ids = read_ids(bytes, Some(span))?;
+    let mut at = 0;
+    let prefix = take_run(&ids, &mut at)?;
+    let mid = take_run(&ids, &mut at)?;
+    let end = take_run(&ids, &mut at)?;
+    if at != ids.len() {
+        return Err("pair template has trailing ids".to_string());
+    }
+    Ok((true, prefix, mid, end))
+}
+
+fn take_run(ids: &[u32], at: &mut usize) -> Result<Vec<u32>, String> {
+    let n = *ids.get(*at).ok_or("pair template is short")? as usize;
+    *at += 1;
+    let end = at.checked_add(n).ok_or("pair template length overflows")?;
+    if end > ids.len() {
+        return Err("pair template is short".to_string());
+    }
+    let out = ids[*at..end].to_vec();
+    *at = end;
+    Ok(out)
 }
 
 fn ids_blob(tag: u16, ids: &[u32]) -> Option<Blob> {

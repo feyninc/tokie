@@ -2,7 +2,7 @@
 
 0.2 appends ids into a buffer the caller owns. tokie 0.1.4 returned an owned `Encoding` from `encode` and `encode_batch`, and counted with `count_tokens`. This conversion puts those names on the 0.2 engine. It does not bring back the `Encoding` struct, padding, truncation, offsets, or pair encoding. Those stay in [GOAL.md](GOAL.md).
 
-`encode_plus` is `encode`, then the single-sequence template. A call that passes only the text stays `encode`, so the template stays off. 0.1.4 turned the template on by default inside `encode`. Padding, truncation, offsets, pairs, attention masks, and type ids stay in [GOAL.md](GOAL.md).
+`encode_plus` is `encode`, then the template. A call that passes only the text stays `encode`, so the template stays off. 0.1.4 turned the template on by default inside `encode`. `Plus` on `encode_plus` adds the second sequence, cuts to a length, or pads to that length. Offsets, attention masks, and type ids stay in [GOAL.md](GOAL.md).
 
 ## Names
 
@@ -10,6 +10,8 @@
 | --- | --- |
 | `encode(text, add_special_tokens=False)` | `encode`. The template stays off. |
 | `encode(text, add_special_tokens=True)` | `encode_plus`. `encode`, then a `TemplateProcessing` single sequence. `BertProcessing` and `RobertaProcessing` add no ids. |
+| `encode(text, text_pair)` | `encode_plus(Plus::new(text).pair(text_pair))`. The pair template. |
+| `encode` with truncation or padding | `encode_plus(Plus::new(text).truncate(n).pad(n))`. One length for the cut and the pad. |
 | `encode_ids` | The same append call. The caller passes the `Vec`. |
 | `encode_batch` | `batch`. One name. One id buffer and one `ends` entry per text. |
 | `encode_batch_flat` | `batch`. 0.1.4 returned per-document lengths. 0.2 `ends[i]` is the id count after text `i`. |
@@ -45,15 +47,18 @@
 | `token`, `id`, `open` | No id movement. |
 | `open`, `json`, `pretrained`, `save` | Load and store. Outside the encode timing. |
 | Attention mask and type ids on `encode_plus` | Two more buffers the length of the ids. Left for later. |
-| Padding on `encode_plus` | A second pass over the batch. Left for later. |
-| Pair encoding on `encode_plus` | The model runs twice, then the pair template. Left for later. |
+| Truncation on `encode_plus` | Cuts the longer sequence after `encode` returns. The bench still calls `encode`. |
+| Padding on `encode_plus` | Appends the pad id onto the ids this call wrote. |
+| Pair encoding on `encode_plus` | `encode` runs twice, then the pair template. |
 
 ## Rust
 
 `encode`, `batch`, and `decode` keep their signatures. Benches and the piece cache call `encode`. `encode_plus` appends into the same buffer. The batch call is `batch`. The vocab calls are `token` and `id`. The path call is `open`.
 
 ```rust
-pub fn encode_plus(&mut self, text: &str, ids: &mut Vec<u32>) -> Result<(), Error>;
+pub fn encode_plus<'a>(&mut self, text: impl EncodePlus<'a>, ids: &mut Vec<u32>) -> Result<(), Error>;
+// encode_plus(text, ids) is the single-sequence template.
+// encode_plus(Plus::new(text).pair(other).truncate(n).pad(n), ids) adds the rest.
 pub fn count_tokens(&mut self, text: &str) -> Result<usize, Error>;
 pub fn count_tokens_batch(&mut self, texts: &[&str]) -> Result<Vec<usize>, Error>;
 ```
@@ -67,6 +72,7 @@ pub fn count_tokens_batch(&mut self, texts: &[&str]) -> Result<Vec<usize>, Error
 ```python
 tokenizer.encode("Hello")                  # template off
 tokenizer.encode_plus("Hello")             # [CLS], ids, [SEP] when the template says so
+tokenizer.encode_plus("Hello", pair="world", truncate=True, pad=True, max_len=8)
 tokenizer.batch(["Hello", "world"])         # (ids, ends), template off
 tokenizer.count_tokens("Hello")            # length of encode, template off
 tokenizer.count_tokens_batch(["Hello", "world"])
@@ -78,4 +84,4 @@ tokenizer.count_tokens_batch(["Hello", "world"])
 
 1. `encode_plus` is in. `batch`, `token`, `id`, and `open` stay the only names for those jobs.
 2. The count methods are on the tokenizer. A test checks `count_tokens` against `encode` with an empty buffer, and `count_tokens_batch` against `batch` ends. The count buffer is a field on the tokenizer.
-3. Leave padding, truncation, offsets, pairs, attention masks, and type ids on the Remaining list. `encode_plus` gains them later.
+3. Truncation, padding, and pair encoding are on `encode_plus`. Offsets, attention masks, and type ids stay on the Remaining list.

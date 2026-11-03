@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tokie::Tokenizer;
+use tokie::{Plus, Tokenizer};
 
 fn roundtrip(json: &Path) {
     let mut original = Tokenizer::open(json).unwrap_or_else(|err| panic!("{}: {err}", json.display()));
@@ -21,6 +21,16 @@ fn roundtrip(json: &Path) {
         original.encode_plus(sample, &mut wrapped_left).unwrap();
         loaded.encode_plus(sample, &mut wrapped_right).unwrap();
         assert_eq!(wrapped_left, wrapped_right, "encode_plus {sample:?}");
+        let mut pair_left = Vec::new();
+        let mut pair_right = Vec::new();
+        let pair_ok_left = original.encode_plus(Plus::new(sample).pair("other"), &mut pair_left);
+        let pair_ok_right = loaded.encode_plus(Plus::new(sample).pair("other"), &mut pair_right);
+        match (pair_ok_left, pair_ok_right) {
+            (Ok(()), Ok(())) => assert_eq!(pair_left, pair_right, "pair {sample:?}"),
+            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "pair {sample:?}"),
+            (Ok(()), Err(err)) => panic!("loaded pair failed: {err}"),
+            (Err(err), Ok(())) => panic!("saved pair failed: {err}"),
+        }
         let mut text_left = String::new();
         let mut text_right = String::new();
         original
