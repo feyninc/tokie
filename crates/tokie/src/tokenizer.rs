@@ -7,6 +7,7 @@ use crate::cache::{Cache, Prep, ProbeView, mix, pack, pack_bounds, pack_spans};
 use crate::cut::Cut;
 use crate::norm::Norm;
 use crate::unigram::Lattice;
+use crate::TokenId;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 use std::fs;
@@ -339,6 +340,22 @@ impl Tokenizer {
         Self::from_bytes(&bytes)
     }
 
+    /// Read a `.tokie` file or a `tokenizer.json` from `path`.
+    ///
+    /// This is [`Self::open`] under another name, so either format loads. The
+    /// argument is a path, not the file contents. [`Self::json`] parses a
+    /// string.
+    pub fn from_json(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open(path)
+    }
+
+    /// Read a `.tokie` file or a `tokenizer.json` from `path`.
+    ///
+    /// Another name for [`Self::open`]. The argument is a path.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open(path)
+    }
+
     /// Parse a `tokenizer.json`.
     pub fn json(text: &str) -> Result<Self, Error> {
         let mut tok = Self::parse_json(text)?;
@@ -410,6 +427,13 @@ impl Tokenizer {
             .map_err(|err| format!("sync {}: {err}", tmp.display()))?;
         fs::rename(tmp, path).map_err(|err| format!("rename {}: {err}", path.display()))?;
         Ok(())
+    }
+
+    /// Write this tokenizer as a `.tokie` file.
+    ///
+    /// Another name for [`Self::save`]. The argument is a path.
+    pub fn to_file(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        self.save(path)
     }
 
     /// Encode `piece` and keep the ids in the piece list `save` writes.
@@ -601,6 +625,14 @@ impl Tokenizer {
         }
     }
 
+    /// Download a tokenizer for a Hub repo.
+    ///
+    /// Another name for [`Self::pretrained`], with the repo name as `&str`,
+    /// `String`, or another `AsRef<str>`.
+    pub fn from_pretrained(repo: impl AsRef<str>) -> Result<Self, Error> {
+        Self::pretrained(repo.as_ref())
+    }
+
     /// `(filled slots, capacity, table address)` after the encodes so far.
     #[doc(hidden)]
     pub fn cache_stats(&self) -> (usize, usize, usize) {
@@ -772,6 +804,86 @@ impl Tokenizer {
         };
         text.push_str(&String::from_utf8_lossy(view));
         Ok(())
+    }
+
+    /// The bytes for `ids`. This is [`Self::decode`] without the `String`.
+    ///
+    /// The lead slice, the `Keep`/`Skip` filter, and the lead-space strip are
+    /// the ones [`Self::decode`] uses, so a lossy conversion of the result is
+    /// that method's text. Bytes that are not UTF-8 stay as they are, so the
+    /// result can end in a partial character. An id outside the vocab is an
+    /// error, including a gap id a `.tokie` file left empty.
+    pub fn decode_bytes(&self, ids: &[u32], specials: Specials) -> Result<Vec<u8>, Error> {
+        let vocab = &self.tables.vocab;
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut emitted = false;
+        for &id in ids {
+            let index = id as usize;
+            let slice = vocab.lead.get(index).ok_or_else(|| Error::new(format!("unknown id {id}")))?;
+            if slice.at == u32::MAX {
+                return Err(Error::new(format!("unknown id {id}")));
+            }
+            if specials == Specials::Skip && vocab.special.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let slice = if emitted { &vocab.next[index] } else { slice };
+            let start = slice.at as usize;
+            bytes.extend_from_slice(&vocab.arena[start..start + slice.len as usize]);
+            emitted = true;
+        }
+        if vocab.strip_space && bytes.first() == Some(&b' ') {
+            bytes.remove(0);
+        }
+        Ok(bytes)
+    }
+
+    /// How many ids the vocab spans. An id at or above this is unknown.
+    ///
+    /// This is one past the highest id in the file, gaps and added ids
+    /// included. Sparse ids mean [`Self::get_vocab`] can be shorter; this is
+    /// the id-space size, not the vocab entry count.
+    pub fn vocab_size(&self) -> usize {
+        self.tables.vocab.tokens.len()
+    }
+
+    /// The raw vocab spelling for each id, as the file writes it.
+    ///
+    /// The keys are the strings the model and added tokens list, not the text
+    /// [`Self::decode`] gives back. A byte-level file keeps `Ġ` and `Ċ` here,
+    /// so each key is the one [`Self::token`] and [`Self::id`] use. The older
+    /// API returned decoded spellings from this call. That is intentionally
+    /// not restored, because a decoded spelling does not map back to an id.
+    pub fn get_vocab(&self) -> std::collections::HashMap<String, TokenId> {
+        self.tables
+            .vocab
+            .ids
+            .iter()
+            .map(|(token, id)| (token.clone(), *id))
+            .collect()
+    }
+
+    /// The pad id, or `None`. `[PAD]` wins, then `<pad>`; no other name counts.
+    ///
+    /// These are the two names [`Self::encode_plus`] pads with.
+    pub fn pad_token_id(&self) -> Option<TokenId> {
+        self.id("[PAD]").or_else(|| self.id("<pad>"))
+    }
+
+    /// How many ids the post-processor adds around the sequences.
+    ///
+    /// The count is the length of the template runs, so a special with two
+    /// ids counts twice. A tokenizer with no pair template adds nothing when
+    /// `is_pair` is true.
+    pub fn num_special_tokens_to_add(&self, is_pair: bool) -> usize {
+        let post = &self.tables.post;
+        if is_pair {
+            if !post.has_pair {
+                return 0;
+            }
+            post.pair_prefix.len() + post.pair_mid.len() + post.pair_end.len()
+        } else {
+            post.prefix.len() + post.suffix.len()
+        }
     }
 
     /// The vocab string for `id`.

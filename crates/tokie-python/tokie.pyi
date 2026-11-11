@@ -1,153 +1,101 @@
+from collections.abc import Sequence
 from typing import Optional
 
 import numpy
-
-class Encoding:
-    """Result of encoding text, with token IDs, attention mask, and type IDs."""
-
-    ids: list[int]
-    tokens: list[str]
-    special_tokens_mask: list[int]
-    attention_mask: list[int]
-    type_ids: list[int]
-    offsets: list[tuple[int, int]]
-    def __len__(self) -> int: ...
-    def __repr__(self) -> str: ...
+import numpy.typing
 
 class Tokenizer:
-    """Fast, correct tokenizer. Supports BPE, WordPiece, and Unigram."""
+    """One tokenizer. `encode` and `batch` return owner-backed NumPy arrays."""
 
     @staticmethod
+    def open(path: str) -> "Tokenizer":
+        """Read a `.tokie` file or a `tokenizer.json`."""
+        ...
+    @staticmethod
+    def json(text: str) -> "Tokenizer":
+        """Parse the text of a `tokenizer.json`."""
+        ...
+    @staticmethod
+    def from_pretrained(repo: str) -> "Tokenizer":
+        """Download the repo's `.tokie` file, or `tokenizer.json` when the repo has none."""
+        ...
+    @staticmethod
     def from_json(path: str) -> "Tokenizer":
-        """Load a tokenizer from a HuggingFace tokenizer.json file."""
+        """Read a `.tokie` file or a `tokenizer.json` from a path. Alias for `open`."""
         ...
     @staticmethod
     def from_file(path: str) -> "Tokenizer":
-        """Load a tokenizer from a .tkz binary file."""
+        """Read a `.tokie` file or a `tokenizer.json` from a path. Alias for `open`."""
         ...
-    @staticmethod
-    def from_pretrained(repo_id: str) -> "Tokenizer":
-        """Download and load a tokenizer from the HuggingFace Hub."""
+    def encode(self, text: str) -> numpy.typing.NDArray[numpy.uint32]:
+        """Append-style encode. Specials in `text` are emitted; the template stays off."""
         ...
-    def __call__(
+    def encode_plus(
         self,
         text: str,
-        text_pair: Optional[str] = None,
-        add_special_tokens: bool = True,
-    ) -> Encoding:
-        """Encode text or a text pair. Usage: tokenizer("text") or tokenizer("text_a", "text_b")."""
-        ...
-    def encode(self, text: str, add_special_tokens: bool = True) -> Encoding:
-        """Encode text into an Encoding (ids, attention_mask, type_ids)."""
-        ...
-    def encode_batch(
-        self, texts: list[str], add_special_tokens: bool = True
-    ) -> list[Encoding]:
-        """Encode multiple texts in parallel, returning a list of Encoding objects."""
-        ...
-    def encode_pair(
-        self, text_a: str, text_b: str, add_special_tokens: bool = True
-    ) -> Encoding:
-        """Encode a pair of texts (e.g. for cross-encoder models)."""
-        ...
-    def encode_with_offsets(
-        self, text: str, add_special_tokens: bool = True
-    ) -> Encoding:
-        """Encode text into an Encoding with byte offsets into the (normalized) input."""
-        ...
-    def encode_bytes(self, data: bytes) -> list[int]:
-        """Encode raw bytes into token IDs."""
-        ...
-    def decode(self, tokens: list[int]) -> Optional[str]:
-        """Decode token IDs back to a string. Returns None if not valid UTF-8."""
-        ...
-    def decode_bytes(self, tokens: list[int]) -> bytes:
-        """Decode token IDs back to raw bytes."""
-        ...
-    def decode_batch(self, sequences: list[list[int]]) -> list[Optional[str]]:
-        """Decode multiple token ID sequences."""
-        ...
-    def id_to_token(self, id: int) -> Optional[str]:
-        """Convert a token ID to its string representation."""
-        ...
-    def token_to_id(self, token: str) -> Optional[int]:
-        """Convert a token string to its ID."""
-        ...
-    def get_vocab(self) -> dict[str, int]:
-        """Get the full vocabulary as a dict mapping token strings to IDs."""
+        pair: Optional[str] = None,
+        max_len: Optional[int] = None,
+        truncate: bool = False,
+        pad: bool = False,
+    ) -> numpy.typing.NDArray[numpy.uint32]:
+        """`encode`, then the template. `pair` uses the pair template.
+        `truncate` cuts to `max_len`. `pad` extends to `max_len`."""
         ...
     def count_tokens(self, text: str) -> int:
-        """How many ids encode would return. The template stays off."""
+        """How many ids `encode` would return for `text`. The template stays off."""
         ...
-    def count_tokens_batch(self, texts: list[str]) -> list[int]:
-        """One length per text, from batch. The template stays off."""
+    def count_tokens_batch(self, texts: Sequence[str]) -> list[int]:
+        """One length per text, from `batch`. The template stays off."""
         ...
-    def encode_files(
+    def decode(
         self,
-        paths: list[str],
-        separator: bytes = b"<|endoftext|>",
-        add_special_tokens: bool = False,
-    ) -> tuple["numpy.ndarray", "numpy.ndarray"]:
-        """Encode corpus files entirely in Rust: read bytes, split documents on
-        the separator, drop empty documents, encode in parallel. Returns
-        (ids, offsets) numpy arrays — uint32 concatenated ids and uint64
-        document boundaries of length ndocs + 1; document i is
-        ids[offsets[i]:offsets[i + 1]]. Invalid UTF-8 is lossy-converted."""
+        ids: Sequence[int] | numpy.typing.NDArray[numpy.uint32],
+        skip: bool = False,
+    ) -> str:
+        """Text for `ids`. `ids` may be a list, tuple, or the `encode` array.
+        `skip` omits specials. Invalid UTF-8 is replaced."""
         ...
-    def count_tokens_files(
-        self, paths: list[str], separator: bytes = b"<|endoftext|>"
-    ) -> int:
-        """Total token count across corpus files, split and encoded as in
-        encode_files, without materializing ids."""
+    def decode_bytes(
+        self,
+        ids: Sequence[int] | numpy.typing.NDArray[numpy.uint32],
+        skip: bool = False,
+    ) -> bytes:
+        """Raw bytes for `ids`. `ids` may be a list, tuple, or the `encode` array.
+        `skip` omits specials. Invalid UTF-8 stays as bytes."""
+        ...
+    def batch(
+        self, texts: Sequence[str]
+    ) -> tuple[
+        numpy.typing.NDArray[numpy.uint32], numpy.typing.NDArray[numpy.uint64]
+    ]:
+        """Encode each text with `encode`. Returns `(ids, ends)` as `uint32` and
+        `uint64` arrays. `ends[i]` is the id count after text `i`."""
+        ...
+    def threads(self, n: int) -> None:
+        """How many workers `batch` uses."""
+        ...
+    def token(self, id: int) -> Optional[str]:
+        """The vocab string for `id`."""
+        ...
+    def id(self, token: str) -> Optional[int]:
+        """The id for a vocab string."""
         ...
     def save(self, path: str) -> None:
-        """Save the tokenizer to a .tkz binary file."""
-        ...
-    def enable_padding(
-        self,
-        *,
-        direction: str = "right",
-        pad_id: int = 0,
-        pad_type_id: int = 0,
-        length: Optional[int] = None,
-        pad_to_multiple_of: Optional[int] = None,
-    ) -> None:
-        """Enable padding for encode_batch."""
-        ...
-    def enable_truncation(
-        self,
-        max_length: int,
-        *,
-        stride: int = 0,
-        strategy: str = "longest_first",
-        direction: str = "right",
-    ) -> None:
-        """Enable truncation."""
-        ...
-    def no_padding(self) -> None:
-        """Disable padding."""
-        ...
-    def no_truncation(self) -> None:
-        """Disable truncation."""
+        """Write this tokenizer as a `.tokie` file."""
         ...
     @property
     def vocab_size(self) -> int:
-        """The vocabulary size."""
+        """The largest id plus one, counting empty slots."""
         ...
     @property
     def pad_token_id(self) -> Optional[int]:
-        """The pad token ID, if set."""
+        """The pad id, when the vocab spells it `[PAD]` or `<pad>`."""
         ...
-    @property
-    def padding(self) -> Optional[dict[str, object]]:
-        """Get current padding configuration, or None if disabled."""
-        ...
-    @property
-    def truncation(self) -> Optional[dict[str, object]]:
-        """Get current truncation configuration, or None if disabled."""
+    def get_vocab(self) -> dict[str, int]:
+        """The vocabulary with its raw `tokenizer.json` spelling."""
         ...
     def num_special_tokens_to_add(self, is_pair: bool = False) -> int:
-        """Number of special tokens added for a single sequence or pair."""
+        """Ids the template adds for one text, or for a pair."""
         ...
     def __repr__(self) -> str: ...
 
