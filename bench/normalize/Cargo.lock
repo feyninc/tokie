@@ -2811,6 +2811,8 @@ dependencies = [
 [[package]]
 name = "tokie"
 version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfb5ea1612e3fc71e8bfd1a61a8101d89310d80309fa617273bcaf66624bbcb0"
 dependencies = [
  "base64 0.22.1",
  "chunk",

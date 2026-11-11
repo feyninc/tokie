@@ -3,6 +3,9 @@
 //!
 //! A `None` return means that library has no scheme for the row. Precompiled
 //! rows use the charsmap embedded in `google-t5/t5-small`.
+//!
+//! The tokie column is intentionally pinned to the historical registry 0.1.4
+//! as a frozen oracle; the normalie column tracks the current crate separately.
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
