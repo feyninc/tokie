@@ -32,10 +32,24 @@ fn bert_uncased_is_one_pass() {
     assert_eq!(apply("\u{2B820}"), " \u{2B820} ");
     assert_eq!(apply("\u{2B91F}"), " \u{2B91F} ");
     assert_eq!(apply("\u{2CEB0}"), "\u{2CEB0}");
-    assert_eq!(apply("\u{3040}"), "");
-    assert_eq!(apply("\u{3097}"), "");
-    assert_eq!(apply("\u{3098}"), "");
+    assert_eq!(apply("\u{3040}"), "\u{3040}");
+    assert_eq!(apply("\u{3097}"), "\u{3097}");
+    assert_eq!(apply("\u{3098}"), "\u{3098}");
     let mut cased = String::new();
     assert!(normalie::BertCased::write("\u{F900}", true, &mut cased));
     assert_eq!(cased, " \u{F900} ");
+}
+
+#[test]
+fn bert_uncased_keeps_unassigned_kana_code_points() {
+    // U+3040, U+3097, and U+3098 are unassigned. NFD and lowercase leave them
+    // alone, so uncased BERT keeps them. Only U+3099 and U+309A are nonspacing
+    // marks in the kana blocks, and only those are dropped.
+    assert_eq!(apply("\u{3040}"), "\u{3040}");
+    assert_eq!(apply("\u{3097}"), "\u{3097}");
+    assert_eq!(apply("\u{3098}"), "\u{3098}");
+    assert_eq!(apply("\u{3099}"), "");
+    assert_eq!(apply("\u{309A}"), "");
+    // The fast kana path must not swallow them inside a run either.
+    assert_eq!(apply("あ\u{3040}い\u{3097}う\u{3098}"), "あ\u{3040}い\u{3097}う\u{3098}");
 }

@@ -12,7 +12,7 @@
 [![docs.rs](https://img.shields.io/docsrs/tokie)](https://docs.rs/tokie)
 [![GitHub Stars](https://img.shields.io/github/stars/chonkie-inc/tokie)](https://github.com/chonkie-inc/tokie)
 
-*25 to 150 times faster than Hugging Face tokenizers, with the same token ids*
+*Historical 0.1.3 benchmark: 25 to 150 times faster than Hugging Face tokenizers, with the same token ids. 0.2 timings are pending.*
 
 [Install](#install) •
 [Quick start](#quick-start) •
@@ -25,7 +25,7 @@
 > [!CAUTION]
 > tokie is in its alpha stage and might produce mis-aligned output. Please report any issues you encounter.
 
-tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face `tokenizer.json` and encodes 25 to 150 times faster than Hugging Face tokenizers. It implements BPE, WordPiece, SentencePiece, and Unigram. The token ids match Hugging Face tokenizers.
+tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face `tokenizer.json` and, in the historical 0.1.3 benchmark, encoded 25 to 150 times faster than Hugging Face tokenizers. It implements BPE, WordPiece, SentencePiece, and Unigram. The token ids match Hugging Face tokenizers. 0.2 has not been re-timed; see [Benchmarks](#benchmarks) and [docs/BENCHMARK_BASELINE.md](docs/BENCHMARK_BASELINE.md).
 
 ![benchmark](assets/benchmark.png)
 
@@ -44,7 +44,7 @@ pip install tokie
 tokie = "0.2"
 ```
 
-This tree is 0.2. crates.io and PyPI still serve 0.1.4, which does not have these calls.
+This tree is the unreleased 0.2. crates.io and PyPI still serve 0.1.4, which does not have these calls. See [API changes in 0.2](docs/API_CHANGES_0_2.md).
 
 Coming from Hugging Face `tokenizers`? See the [migration guide](docs/MIGRATION.md).
 
@@ -71,7 +71,7 @@ print(tokenizer.count_tokens("Hello, world!"))
 print(tokenizer.count_tokens_batch(["Hello!", "World"]))
 ```
 
-`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the single-sequence template, so BERT uncased is `[CLS]`, the ids, `[SEP]`. `pair` uses the pair template. `truncate` and `pad` share `max_len`, and that length counts the template ids. `batch` returns one id array and `ends[i]`, the id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off.
+`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the parsed template, so BERT's single sequence is `[CLS]`, the ids, `[SEP]`. `pair` uses the pair template. `truncate` and `pad` share `max_len`, and that length counts the template ids; truncation drops from the right, longest sequence first, and padding is fixed on the right. `batch` returns one id array and `ends[i]`, the cumulative id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off. Python returns NumPy arrays, not 0.1.4 `Encoding` objects; there is no `.ids`, so use `.tolist()`.
 
 ### Rust
 
@@ -119,12 +119,22 @@ Text `i` is `ids[prev..ends[i]]`. `ends[i]` is `ids.len()` after that text.
 ```python
 tokenizer.id("[SEP]")
 tokenizer.token(101)
+print(tokenizer.vocab_size)                          # highest id + 1
+print(tokenizer.get_vocab())                         # raw token -> id
+print(tokenizer.pad_token_id)                        # [PAD] then <pad>
+print(tokenizer.num_special_tokens_to_add(is_pair=False))
 ```
 
 ```rust
 tokenizer.id("[SEP]");
 tokenizer.token(101);
+let size = tokenizer.vocab_size();
+let vocab = tokenizer.get_vocab();
+let pad = tokenizer.pad_token_id();
+let n = tokenizer.num_special_tokens_to_add(false);
 ```
+
+`token`, `id`, and `get_vocab` use the raw vocab spelling. `vocab_size` is the highest id plus one, so it can include gaps and added ids; `get_vocab` may have fewer entries. `pad_token_id` looks up `[PAD]`, then `<pad>`, and nothing else.
 
 ### Save and load a `.tokie` file
 
@@ -138,11 +148,11 @@ tokenizer.save("model.tokie")?;
 let mut again = Tokenizer::open("model.tokie")?;
 ```
 
-`from_pretrained` in Python, and `pretrained` in Rust, reads the repo's `.tokie` file and then `tokenizer.json`.
+`from_pretrained` in Python and `from_pretrained`/`pretrained` in Rust open exactly one `.tokie` file from the repo, whatever its name. A repo with no `.tokie` file is parsed from `tokenizer.json`; several `.tokie` files is an error. There is no runtime `.tkz` fallback: a genuine legacy `TOKI` image is refused by magic, not by filename, while a JSON file merely named `.tkz` is parsed as JSON. `from_json(path)` and `from_file(path)` are path aliases for `open`, and `to_file` is an alias for `save` in Rust. Legacy 0.1.4 binaries cannot read a `.tokie` file: rebuild from `tokenizer.json` with the new code, because renaming a `.tkz` file is not enough.
 
 ## Benchmarks
 
-All benchmarks run on an Apple M3 with tokie 0.1.3. The ids match Hugging Face tokenizers.
+All numbers in this section are historical measurements from the 0.1.3/0.1.4 `.tkz` artifact on an Apple M3. They are not 0.2 `.tokie` measurements. The before-state baseline is [docs/BENCHMARK_BASELINE.md](docs/BENCHMARK_BASELINE.md); the final 0.2 report is [docs/BENCHMARK_AFTER.md](docs/BENCHMARK_AFTER.md), where the strict performance criterion is uncertified/partial. The ids match Hugging Face tokenizers.
 
 ### BPE encoding (GPT-2, Llama, Qwen, ModernBERT)
 
@@ -196,11 +206,11 @@ All results on Apple M3, single-string encode, median of 10 runs.
 | o200k (GPT-4o) | 45 KB | 0.16 ms | 3.57 ms | **22x** |
 | o200k (GPT-4o) | 900 KB | 1.66 ms | 70.7 ms | **42x** |
 
-The ids match on every model in these tables. Batch encoding is 17 to 36 times faster than Hugging Face tokenizers. `encode_batch_flat` returns one contiguous NumPy array.
+The ids match on every model in these tables. In that historical benchmark, batch encoding was 17 to 36 times faster than Hugging Face tokenizers. 0.2 `batch` returns one contiguous NumPy id array plus cumulative `ends`; the old `encode_batch_flat` name is gone.
 
-### Tokenizer loading
+### Tokenizer loading (historical 0.1.4 `.tkz` measurements)
 
-Loading `tokenizer.json` parses the JSON, builds the vocabulary, and, for BPE, builds the Aho-Corasick automaton. tiktoken parses its BPE data and compiles its regexes on every load. A `.tkz` file stores the Double-Array Aho-Corasick state, the normalized vocabulary, the encoder configuration, and, since v13, the added and special tokens. Loading that file is deserialization. `from_pretrained` reads the hub disk cache before the network and writes the compiled `.tkz` next to the snapshot, so a warm load does not use the network. A warm load is 13 to 44 times faster than Hugging Face tokenizers. BERT takes 2.8 ms. GPT-2 takes 6.2 ms.
+Loading `tokenizer.json` parses the JSON, builds the vocabulary, and, for BPE, builds the tables the encoder reads. The 0.2 `.tokie` file stores the normalized tables and the loaded piece list, so a warm load is deserialization; ids learned by later `encode` calls stay in the piece cache and are not written by `save`. `from_pretrained`/`pretrained` opens exactly one `.tokie` file from the repo, whatever its name; a repo with none is parsed from `tokenizer.json`. Several `.tokie` files is an error. There is no runtime `.tkz` fallback: a genuine legacy `TOKI` image is refused by magic, not by filename, while a JSON file merely named `.tkz` is parsed as JSON. The load times below are historical 0.1.4 `.tkz` measurements, not 0.2 `.tokie` measurements.
 
 | Model | tokie | Hugging Face | Speedup |
 |-------|-------|---------------|---------|
@@ -209,6 +219,8 @@ Loading `tokenizer.json` parses the JSON, builds the vocabulary, and, for BPE, b
 | Llama 3.2 | 10.6 ms | 261 ms | **25x** |
 | cl100k | 11.1 ms | 244 ms | **22x** |
 | o200k | 23.2 ms | 310 ms | **13x** |
+
+*These load times are historical 0.1.4 `.tkz` measurements. They are not 0.2 `.tokie` measurements.*
 
 ![Tokenizer loading time](assets/benchmark_loading.png)
 
@@ -313,7 +325,7 @@ No single library loaded every Hugging Face tokenizer. I tried [AutoTikTokenizer
 
 Tokenization runs in parallel when the split keeps token boundaries. [chunk](https://github.com/chonkie-inc/chunk) splits the text on those boundaries. Each core encodes one chunk, and the ids are concatenated. On 8 cores that is about 5 times faster.
 
-`.tkz` skips rebuilding those structures at load time. `tokenizer.json` is parsed and validated, and the Aho-Corasick automaton is built. That build is slow for a large vocabulary. `.tkz` stores the automaton, the vocabulary, the configuration, and the added tokens as a flat binary. Loading deserializes that file. With the hub cache and a compiled file on disk, a warm BERT load is 2.8 ms and a warm GPT-2 load is 6.2 ms. Hugging Face tokenizers takes 120 to 310 ms on those two models.
+0.2 stores the normalized vocabulary and the loaded piece list in a `.tokie` file, so load does not rebuild them. `tokenizer.json` is parsed and validated and the vocabulary tables are built; for a large vocabulary that build is slow. A `.tokie` file is a different format from legacy `.tkz`: a genuine legacy `TOKI` image is refused by magic, not by extension, and legacy 0.1.4 binaries cannot read `.tokie`. Rebuild from `tokenizer.json`; renaming is not enough. The load times quoted in the table above are historical 0.1.4 `.tkz` measurements, not 0.2 `.tokie` measurements.
 
 ## Acknowledgements
 

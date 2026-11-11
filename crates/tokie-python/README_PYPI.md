@@ -6,7 +6,7 @@
   <a href="https://github.com/chonkie-inc/tokie">GitHub</a> · <a href="https://crates.io/crates/tokie">crates.io</a>
 </p>
 
-Python bindings for the tokie 0.2 tokenizer. `encode` and `batch` release the GIL and return NumPy arrays.
+Python bindings for the tokie 0.2 tokenizer. `encode`, `encode_plus`, and `batch` release the GIL and return NumPy arrays. There is no `Encoding` object and no `.ids` attribute; use `.tolist()`.
 
 ## Installation
 
@@ -20,20 +20,30 @@ pip install tokie
 import tokie
 
 tokenizer = tokie.Tokenizer.from_pretrained("openai-community/gpt2")
-ids = tokenizer.encode("Hello world")
+# from_json(path) and from_file(path) are aliases for open(path).
+
+ids = tokenizer.encode("Hello world")            # uint32 array, template off
 print(ids.tolist())
 print(tokenizer.decode(ids.tolist()))
+print(tokenizer.decode_bytes(ids.tolist()))      # raw bytes
 
 # The single-sequence template. GPT-2 has none, so this matches encode.
 print(tokenizer.encode_plus("Hello world").tolist())
 
-flat, ends = tokenizer.batch(["Hello world", "a12b"])
-print(tokenizer.count_tokens("Hello world"))
+flat, ends = tokenizer.batch(["Hello world", "a12b"])  # ends are cumulative
+print(tokenizer.count_tokens("Hello world"))           # template off
 print(tokenizer.count_tokens_batch(["Hello world", "a12b"]))
+print(tokenizer.vocab_size)                            # highest id + 1
+print(tokenizer.pad_token_id)                          # [PAD] then <pad>
+print(tokenizer.num_special_tokens_to_add(is_pair=False))
 tokenizer.save("gpt2.tokie")
 ```
 
-`from_pretrained` opens the repo's `.tokie` file, whatever its name. A repo with no `.tokie` file is parsed from `tokenizer.json`. `open` reads either file from disk. `json` parses the file contents. `decode(..., skip=True)` omits specials.
+`encode` leaves the template off. `encode_plus` applies it and accepts `pair`, `truncate`, and `pad`; truncation is from the right, longest sequence first, and padding is fixed on the right. One `max_len` covers both and counts the template ids.
+
+`from_pretrained` opens exactly one `.tokie` file from the repo, whatever its name. A repo with no `.tokie` file is parsed from `tokenizer.json`; several `.tokie` files is an error. There is no runtime `.tkz` fallback: a genuine legacy `TOKI` image is refused by magic, not by extension, while a JSON file merely named `.tkz` is parsed as JSON. `open` reads either file from disk by its magic, `from_json(path)` and `from_file(path)` are path aliases for `open`, and `json(text)` parses JSON text.
+
+`decode` returns `str` (lossy only where needed). `decode_bytes` returns raw bytes. Both keep specials by default; `skip=True` omits them. `get_vocab()` returns raw token strings and may have fewer entries than `vocab_size`.
 
 ## Benchmark
 

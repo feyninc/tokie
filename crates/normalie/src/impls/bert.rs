@@ -261,7 +261,10 @@ fn kana_stripped(c: char) -> Option<Option<char>> {
         return None;
     }
     Some(match cp {
-        0x3040 | 0x3097 | 0x3098 | 0x3099 | 0x309A => None,
+        // U+3099 and U+309A are the block's only nonspacing marks. U+3040,
+        // U+3097, and U+3098 are unassigned gaps, which NFD and lowercase
+        // leave alone, so they fall through to the direct emit.
+        0x3099 | 0x309A => None,
         0x304C => Some('\u{304B}'),
         0x304E => Some('\u{304D}'),
         0x3050 => Some('\u{304F}'),

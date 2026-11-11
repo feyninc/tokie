@@ -13,7 +13,7 @@ use numpy::PyArrayDescrMethods;
 use numpy::npyffi::{self, PY_ARRAY_API};
 use pyo3::create_exception;
 use pyo3::prelude::*;
-use pyo3::types::{PyString, PyStringMethods};
+use pyo3::types::{PyBytes, PyDict, PyString, PyStringMethods};
 use tokie_core::{Plus, Specials, Tokenizer};
 
 create_exception!(tokie, TokieError, pyo3::exceptions::PyException);
@@ -61,6 +61,24 @@ impl PyTokenizer {
     fn from_pretrained(py: Python<'_>, repo: &str) -> PyResult<Self> {
         let repo = repo.to_string();
         let inner = py.detach(|| Tokenizer::pretrained(&repo).map_err(to_py_err))?;
+        Ok(fresh(inner))
+    }
+
+    /// Read a `.tokie` file or a `tokenizer.json` from `path`. Alias for `open`;
+    /// `path` is a filename, not the json text.
+    #[staticmethod]
+    fn from_json(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let path = path.to_string();
+        let inner = py.detach(|| Tokenizer::from_json(&path).map_err(to_py_err))?;
+        Ok(fresh(inner))
+    }
+
+    /// Read a `.tokie` file or a `tokenizer.json` from `path`. Alias for `open`;
+    /// `path` is a filename, not the json text.
+    #[staticmethod]
+    fn from_file(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let path = path.to_string();
+        let inner = py.detach(|| Tokenizer::from_file(&path).map_err(to_py_err))?;
         Ok(fresh(inner))
     }
 
@@ -155,6 +173,28 @@ impl PyTokenizer {
         .map_err(to_py_err)
     }
 
+    /// Raw decoded bytes for `ids`. `skip` omits specials. Invalid UTF-8 stays
+    /// as bytes.
+    #[pyo3(signature = (ids, skip=false))]
+    fn decode_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        ids: Vec<u32>,
+        skip: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let specials = if skip { Specials::Skip } else { Specials::Keep };
+        let bytes = py
+            .detach(|| {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .decode_bytes(&ids, specials)
+                    .map_err(|err| err.to_string())
+            })
+            .map_err(to_py_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     /// Encode each text with `encode`. Returns `(ids, ends)` as `uint32` and
     /// `uint64` arrays. `ends[i]` is the id count after text `i`.
     fn batch<'py>(
@@ -193,6 +233,34 @@ impl PyTokenizer {
     /// The id for a vocab string.
     fn id(&self, token: &str) -> Option<u32> {
         self.inner.lock().unwrap().id(token)
+    }
+
+    /// The largest id plus one, counting empty slots.
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.lock().unwrap().vocab_size()
+    }
+
+    /// The pad id, when the vocab spells it `[PAD]` or `<pad>`.
+    #[getter]
+    fn pad_token_id(&self) -> Option<u32> {
+        self.inner.lock().unwrap().pad_token_id()
+    }
+
+    /// The vocabulary with its raw tokenizer.json spelling.
+    fn get_vocab<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let vocab = py.detach(|| self.inner.lock().unwrap().get_vocab());
+        let dict = PyDict::new(py);
+        for (token, id) in vocab {
+            dict.set_item(token, id)?;
+        }
+        Ok(dict)
+    }
+
+    /// Ids the template adds for one text, or for a pair.
+    #[pyo3(signature = (is_pair=false))]
+    fn num_special_tokens_to_add(&self, is_pair: bool) -> usize {
+        self.inner.lock().unwrap().num_special_tokens_to_add(is_pair)
     }
 
     /// Write this tokenizer as a `.tokie` file.

@@ -9,7 +9,10 @@ publish = false
 [dependencies]
 gigatoken = { path = "../../../gigatoken" }
 tk-encode = { path = "../../../tokenizers-v1/tokenizers/tk-encode", features = ["normalizers", "fancy-regex"] }
-tokie = { path = "../../crates/tokie" }
+# Historical oracle backend: 0.1.4 is the last tokie with the normalizer API
+# this harness benchmarks. Keep it on the registry, not the current path crate;
+# the normalie column below is the independent current oracle.
+tokie = { version = "=0.1.4", default-features = false }
 normalie = { path = "../../crates/normalie" }
 
 [profile.release]
