@@ -28,15 +28,21 @@ a publish on its own.
 ## Preparation (no token, no upload)
 
 Run from the repository root. A clean checkout needs no extra flags. If the
-preparation tree is uncommitted, add `--allow-dirty` to `cargo package --list`,
-`cargo package`, and the dry run; do not add it to the real publish.
+preparation tree is uncommitted, add `--allow-dirty` to both packaging commands
+and to the dry run; do not add it to the real publish.
+
+Always select the registry explicitly. If the operator's user config names another
+default registry, omitting the flag would let cargo store the token for that
+registry and send the upload there. Every command below that reads from or writes
+to a registry passes `--registry crates-io`; keep that flag on all of them.
+`cargo test` takes no registry flag and needs none.
 
 ```bash
-cargo package --list -p normalie
-cargo package -p normalie                 # writes target/package/normalie-0.1.0.crate
+cargo package --list -p normalie --registry crates-io
+cargo package -p normalie --registry crates-io   # writes target/package/normalie-0.1.0.crate
 cargo +stable test --locked -p normalie
 cargo +stable test --doc -p normalie --locked
-cargo +stable publish --dry-run -p normalie
+cargo +stable publish --dry-run -p normalie --registry crates-io
 ```
 
 The dry run needs no crates.io token and does not upload.
@@ -62,18 +68,22 @@ cargo +stable test
 Only after commit, review, and a clean approved `main`:
 
 1. Create a short-lived crates.io API token with the `publish-new` scope.
-2. Run `cargo login` interactively as the human operator; interactive login is
-   preferred for this bootstrap. Keep the token out of chat, logs, source, and
-   shell history, and do not pass `--token` as a command-line argument. A CI job
-   supplying a short-lived secret through the environment is the normal
-   automation path; this manual first publish does not need one.
+2. Run `cargo login --registry crates-io` interactively as the human operator;
+   interactive login is preferred for this bootstrap. Passing the registry
+   explicitly makes sure the token is stored for crates.io and not for whatever
+   registry the user config names as default. Keep the token out of chat, logs,
+   source, and shell history, and do not pass `--token` as a command-line
+   argument. A CI job supplying a short-lived secret through the environment is
+   the normal automation path; this manual first publish does not need one.
 3. From the approved clean tree, run:
 
    ```bash
-   cargo +stable publish -p normalie
+   cargo +stable publish -p normalie --registry crates-io
    ```
 
-   Do not pass `--allow-dirty`. Do not publish the workspace.
+   Do not pass `--allow-dirty`. Do not publish the workspace. The explicit
+   registry is what keeps the token and the upload on crates.io; dropping it lets
+   cargo fall back to whatever default registry the user config names.
 4. Verify the crate at <https://crates.io/crates/normalie> and the docs build at
    <https://docs.rs/normalie>. docs.rs can take a few minutes after the index
    update.
