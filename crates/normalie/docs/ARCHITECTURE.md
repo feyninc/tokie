@@ -2,13 +2,13 @@
 
 Normalie rewrites text. Pretokie then splits that string. Token offsets index the rewritten string.
 
-Each formula is a type. A formula with no table and no blob is zero-sized. `Precompiled` and `PunctPad` hold a SentencePiece charsmap. `StripAccents` holds the small Unicode 9 mark set. There is no regex engine on this path.
+Each formula is a type. Every formula is zero-sized except `Precompiled` and `PunctPad`, which hold a SentencePiece charsmap. There is no regex engine on this path.
 
 The strings below are the ones the oracles lock to Hugging Face tokenizers v1.
 
 ## Write
 
-`write` reads `text` and, when the formula changes it, pushes the result onto a caller-owned `String`. The caller passes an empty buffer. `write` returns whether it pushed. A `false` return leaves the buffer empty, and the caller keeps `text`.
+`write(text, at_start, out) -> bool` reads `text` and writes a changed result onto a caller-owned `String`. The caller passes an empty or cleared buffer. A `false` return leaves the buffer empty and the caller keeps `text`; a `true` return means `out` holds the result, which may itself be empty. Do not choose with `out.is_empty()`.
 
 ```rust
 let mut out = String::new();
@@ -107,7 +107,7 @@ Each formula lives in one file under `src/impls/`. Two formulas share a file whe
 
 `bert.rs` has `CLEAN`, `CJK`, `ACCENTS`, and `LOWER`. `BertUncased` turns all four on. `BertCased` cleans and spaces CJK. `Clean` only cleans.
 
-`metaspace.rs` has `PREPEND` and `DROP`. `Metaspace` prepends unless the text already starts with a space or `▁`, and it turns spaces into `▁`. `MetaspaceFirst` prepends only when `at_start` is set. `MetaspaceNever` does not prepend. `MetaspaceWords` drops whitespace and prepends `▁` on every word.
+`metaspace.rs` has four zero-sized types. `Metaspace::write` ignores its `at_start` argument and starts the driver as if the segment were at the start: every nonempty call prepends `▁` unless the text already starts with a space or `▁`, and spaces become `▁`; a leading space becomes the mark, not a second prefix. `MetaspaceFirst` is the conditional variant and prepends only when `at_start` is set. `MetaspaceNever` does not prepend. `MetaspaceWords` drops whitespace and prepends `▁` on every word. The kernel still gates the unchanged prefix once per call.
 
 `Precompiled` parses the charsmap once. Each ASCII byte and the `\r\n` grapheme get a cached replacement. The copy scan is valid when no printable ASCII byte is remapped. The T5 map qualifies. A map that rewrites a printable ASCII byte stays on the trie.
 

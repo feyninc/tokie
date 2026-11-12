@@ -1,4 +1,4 @@
-const T5: &[u8] = include_bytes!("../../../bench/normalize/data/t5.charsmap");
+const T5: &[u8] = include_bytes!("data/t5.charsmap");
 
 #[test]
 fn whitespace_folded_by_the_charsmap_stays_empty() {
