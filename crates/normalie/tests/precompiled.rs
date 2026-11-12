@@ -1,4 +1,4 @@
-const T5: &[u8] = include_bytes!("../../../bench/normalize/data/t5.charsmap");
+const T5: &[u8] = include_bytes!("data/t5.charsmap");
 
 fn map() -> normalie::Precompiled {
     normalie::Precompiled::parse(T5).unwrap()

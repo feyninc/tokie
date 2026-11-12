@@ -102,7 +102,7 @@ This is the `" {2,}"` replace. The replacement is a space. The OpenWebText sampl
 
 ## Strip
 
-Trim Unicode whitespace from both ends. A one-sided trim is the same formula with that side off. The result is a borrow of the input whenever the trimmed text is a subslice.
+Trim Unicode whitespace from both ends. A one-sided trim is the same formula with that side off. `write` copies the trimmed text into `out` and returns `true`; when nothing is trimmed it returns `false` and leaves `out` empty, so the caller keeps the input. The result is a copy, not a borrow of the input.
 
 `  a  ` becomes `a`. `\n\thi\t\n` becomes `hi`.
 
@@ -111,6 +111,8 @@ Trim Unicode whitespace from both ends. A one-sided trim is the same formula wit
 Spaces become `▁`. A leading `▁` is written when the text does not already start with a space or `▁`. Tabs and newlines stay, so they break the space run and leave a `▁` on each side.
 
 `aa bb cc` becomes `▁aa▁bb▁cc`. ` aa bb` becomes `▁aa▁bb`. `aa\tbb  cc` becomes `▁aa\tbb▁▁cc`. `▁hello` stays `▁hello`.
+
+`Metaspace` applies this on every call: a nonempty string gets one leading `▁` unless it already starts with a space or `▁`, regardless of `at_start`. A leading space becomes that `▁`, not a second prefix. `MetaspaceFirst` is the conditional variant and prepends only when `at_start` is true.
 
 This is the Hugging Face metaspace pretokenizer with `prepend_scheme=always` and whitespace kept.
 

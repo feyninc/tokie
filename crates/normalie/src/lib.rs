@@ -1,8 +1,4 @@
-//! Normalizers for tokie.
-//!
-//! Each formula rewrites text into a caller-owned buffer. `false` leaves the
-//! buffer empty: the text was already in the formula's form. Pretokie splits
-//! the string this crate returns.
+#![doc = include_str!("../README.md")]
 
 mod charsmap;
 mod form;
