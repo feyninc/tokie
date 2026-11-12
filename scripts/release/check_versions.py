@@ -26,11 +26,16 @@ from pathlib import Path
 
 # SemVer 2.0.0, without build metadata. Cargo rejects duplicate versions that
 # differ only by build metadata, so a release version must not carry it.
-SEMVER = re.compile(
-    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    r"(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
-    r"(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$"
+#
+# The core regex is ASCII-only and flat. The optional prerelease suffix is one
+# character class; parse_semver validates its dot-separated identifiers one at a
+# time. A single alternation-heavy prerelease pattern backtracks exponentially
+# on input such as "0.0.0---.---.---...", so this split must stay iterative.
+SEMVER_CORE = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-([0-9A-Za-z.-]+))?"
 )
+PRERELEASE_IDENTIFIER = re.compile(r"[0-9A-Za-z-]+")
 
 NORMALIE_VERSION = "0.1.0"
 EXPECTED_PACKAGES = ("normalie", "pretokie", "tokie", "tokie-python", "tokie-cli")
@@ -46,8 +51,28 @@ def fail(message: str) -> None:
 
 
 def parse_semver(value: str, label: str) -> str:
-    if not isinstance(value, str) or not SEMVER.fullmatch(value):
+    match = SEMVER_CORE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
         fail(f"{label} {value!r} is not a strict SemVer release version")
+
+    prerelease = match.group(4)
+    if prerelease is not None:
+        for identifier in prerelease.split("."):
+            if not PRERELEASE_IDENTIFIER.fullmatch(identifier):
+                fail(
+                    f"{label} {value!r} has an empty or invalid prerelease "
+                    f"identifier {identifier!r}"
+                )
+            if (
+                identifier.isascii()
+                and identifier.isdigit()
+                and len(identifier) > 1
+                and identifier[0] == "0"
+            ):
+                fail(
+                    f"{label} {value!r} has a numeric prerelease identifier "
+                    f"with a leading zero: {identifier!r}"
+                )
     return value
 
 

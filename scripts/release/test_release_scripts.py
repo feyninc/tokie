@@ -115,6 +115,17 @@ class VersionTests(unittest.TestCase):
             ):
                 check_versions.parse_semver(value, "version")
 
+    def test_semver_long_adversarial_prerelease_is_rejected(self) -> None:
+        # Regression: the former alternation-heavy prerelease pattern
+        # backtracked exponentially on repeated "--." fragments.
+        value = "0.0.0-" + "--." * 3333
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            check_versions.parse_semver(value, "version")
+
+    def test_semver_allows_hyphen_only_prerelease_identifiers(self) -> None:
+        value = "0.0.0-0.--.--"
+        self.assertEqual(check_versions.parse_semver(value, "version"), value)
+
     def test_exact_requirement_spellings(self) -> None:
         for requirement in ("0.1.0", "=0.1.0", "^0.1.0", "~0.1.0"):
             self.assertTrue(
