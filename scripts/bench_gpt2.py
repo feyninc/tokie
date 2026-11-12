@@ -73,6 +73,12 @@ TOKIE_WHEEL_SHA = "8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1
 TOKENIZER_SHA = "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6"
 EXPECTED_TEXTS = 179 + len(EDGE_TEXTS) + 256
 MIN_SAMPLE_BYTES = 1048576
+EXPECTED_SAMPLE_DOCS = 179
+EXPECTED_SAMPLE_TOKENS = 245492
+EXPECTED_VALIDATION_TOKENS = 253419
+EXPECTED_VALIDATION_CHECKSUM = (
+    "3f74aa9e68a7433ef98dd5103d70bd97f29c8c1b14043029610ab5932fb882b0"
+)
 
 API = {
     "tokie": "tokie.Tokenizer.open(path); threads(1); tokenizer.encode(text) -> numpy uint32 ids; len(ids) in clock",
@@ -170,6 +176,25 @@ def check_pins(observed):
             module_version = observed[lib].get("module_version")
             if not module_version or not module_version.startswith("1.0.0"):
                 errors.append(f"hf1: tokenizers module reports {module_version!r}, expected 1.0.x")
+    return errors
+
+
+def golden_preflight_errors(n_sample, n_validation, sample_tokens,
+                            validation_tokens, validation_checksum):
+    """Reject a changed corpus/slice before any timing starts."""
+    errors = []
+    if n_sample != EXPECTED_SAMPLE_DOCS:
+        errors.append(f"sample docs {n_sample} != {EXPECTED_SAMPLE_DOCS}")
+    if n_validation != EXPECTED_TEXTS:
+        errors.append(f"validation texts {n_validation} != {EXPECTED_TEXTS}")
+    if sample_tokens != EXPECTED_SAMPLE_TOKENS:
+        errors.append(f"sample ids {sample_tokens} != {EXPECTED_SAMPLE_TOKENS}")
+    if validation_tokens != EXPECTED_VALIDATION_TOKENS:
+        errors.append(f"validation ids {validation_tokens} != {EXPECTED_VALIDATION_TOKENS}")
+    if validation_checksum != EXPECTED_VALIDATION_CHECKSUM:
+        errors.append(
+            f"validation checksum {validation_checksum} != {EXPECTED_VALIDATION_CHECKSUM}"
+        )
     return errors
 
 
@@ -282,6 +307,7 @@ def _tiktoken_vocab_check(tokenizer_path, encoding):
         if got_id != want_id and special_first is None:
             special_first = {"text": text, "want_id": want_id, "got_id": got_id}
     return {
+        "ok": first is None and special_first is None,
         "hf_vocab_entries": len(vocab),
         "hf_vocab_non_special_entries": len(vocab) - len(special_ids & set(vocab.values())),
         "ranks_checked": checked,
@@ -546,7 +572,7 @@ def main(argv=None):
             "rounds": a.rounds,
             "passes": a.passes,
             "warmup_passes": a.warmup,
-            "round_order": "latin rotation of the six libraries, one fresh child process per library per round",
+            "round_order": "latin rotation uses 5 of 6 starting positions; partial rotation, not fully balanced",
             "timed_region": "passes x all sample documents; len(ids) and accumulation inside the clock",
             "outside_clock": "import, model load, warmup passes, and the id-checksum pass",
             "thread_pools": "Rayon, tokenizers, OpenBLAS/OMP/MKL, numexpr, and vecLib pools are all pinned to 1",
@@ -568,6 +594,9 @@ def main(argv=None):
     result["meta"]["harness"] = {
         "script": str(script),
         "sha256": sha256_file(script),
+        "helpers": {
+            "bench_published.py": sha256_file(script.parent / "bench_published.py"),
+        },
         "git_head": _git(("rev-parse", "HEAD")),
         "git_status_porcelain": _git(("status", "--porcelain")) or "",
     }
@@ -674,12 +703,29 @@ def main(argv=None):
             if vocab_check["rank_mismatches"] or vocab_check["special_mismatches"]:
                 errors.append("tiktoken: vocab or special ids differ from the HF tokenizer.json")
 
+        validation_token_count = sum(len(x) for x in oracle_rows)
+        validation_checksum = ids_checksum(oracle_rows)
+        sample_token_count = sum(len(x) for x in oracle_rows[:len(sample)])
+        preflight = golden_preflight_errors(
+            len(sample), len(oracle_rows), sample_token_count,
+            validation_token_count, validation_checksum,
+        )
+        result["meta"]["golden_preflight"] = {
+            "ok": not preflight,
+            "sample_docs": len(sample),
+            "validation_texts": len(oracle_rows),
+            "sample_ids": sample_token_count,
+            "validation_ids": validation_token_count,
+            "validation_checksum": validation_checksum,
+        }
+        if preflight:
+            errors.extend(preflight)
+
         if errors:
             result["status"] = "invalid"
             return _finish(a, result, errors, host_before, started)
 
         # ---- five globally interleaved timing rounds -----------------------
-        sample_token_count = sum(len(x) for x in oracle_rows[:len(sample)])
         sample_checksum = ids_checksum(oracle_rows[:len(sample)])
         for r in range(a.rounds):
             order = rotate_order(r)
@@ -761,10 +807,14 @@ def _finish(a, result, errors, host_before, started):
     result["meta"]["host"]["snapshot_after"] = host_snapshot()
     result["meta"]["elapsed_seconds"] = round(time.time() - started, 3)
     result["meta"]["command"] = [sys.executable, str(Path(__file__).resolve())] + sys.argv[1:]
-    _write_result(a.output, result)
+    target = a.output
+    if result["status"] != "ok":
+        # Never clobber the canonical recorded result with a failed replay.
+        target = a.output.with_name(a.output.name + ".error.json")
+    _write_result(target, result)
     brief = {
         "status": result["status"],
-        "output": str(a.output),
+        "output": str(target),
         "validation": {k: v.get("ok") for k, v in result.get("validation", {}).items()},
         "errors": errors,
     }

@@ -22,10 +22,11 @@
 
 </div>
 
-> [!CAUTION]
-> tokie is in its alpha stage and might produce mis-aligned output. Please report any issues you encounter.
+tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face `tokenizer.json` and implements BPE, WordPiece, SentencePiece, and Unigram. The token ids match Hugging Face tokenizers for the supported models listed below. See [Benchmarks](#benchmarks) for the latest warm comparisons, including Hugging Face tokenizers 0.23.3 and 1.0.0rc4, Kitoken, tiktoken, and GigaToken.
 
-tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face `tokenizer.json` and implements BPE, WordPiece, SentencePiece, and Unigram. The token ids match Hugging Face tokenizers for the supported models listed below. See [Benchmarks](#benchmarks) for warm measurements of the current source tree against public GigaToken and Hugging Face wheels.
+![GPT-2 encoding across six tokenizer libraries](assets/benchmark_gpt2_main.png)
+
+*GPT-2 encode, one thread, warm cache, 179 OpenWebText documents. Local unreleased tokie; public GigaToken, Hugging Face 0.23.3 and 1.0.0rc4, Kitoken, and tiktoken. Separate run from the detailed charts below. \*\* GigaToken does not support all tokenizer types; WordPiece and Unigram are excluded.*
 
 ## Install
 
@@ -167,7 +168,7 @@ Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte or
 
 ## Benchmarks
 
-Python 3.12, AMD Ryzen AI 9 HX 370, Linux. Warm-cache medians over five alternating rounds with the library order rotated. Single-document encode and Unicode decode use 179 OpenWebText documents (1.008 MiB); batch uses 3,411 documents (16.14 MiB) at one and eight threads. The tokie series is a **local unreleased 0.2.0 wheel** (sha256 `8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85`); the report records the source branch snapshot separately. Its version metadata says 0.2.0, but it is not on PyPI. GigaToken 0.11.0 and Hugging Face `tokenizers` 0.23.3 are public wheels.
+Python 3.12, AMD Ryzen AI 9 HX 370, Linux. Warm-cache medians over five alternating rounds with the library order rotated. Single-document encode and Unicode decode use 179 OpenWebText documents (1.008 MiB); batch uses 3,411 documents (16.14 MiB) at one and eight threads. The tokie series is a **local unreleased 0.2.0 wheel** (sha256 `8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85`); the report records the source branch snapshot separately. Its version metadata says 0.2.0, but it is not on PyPI. GigaToken 0.11.0 and Hugging Face `tokenizers` 0.23.3 are public wheels. The detailed charts below use those three; the GPT-2 six-library chart above adds HF 1.0.0rc4, Kitoken 0.11.1, and tiktoken 0.14.0 in a separate run.
 
 The clocks cover each library's public call and output, not an isolated kernel. Encode includes id materialization. Decode decodes the same contiguous NumPy `uint32` ids to Unicode; GigaToken's UTF-8 decode and Hugging Face's `ids.tolist()` conversion are inside the clock. Batch includes tokie's flat ids plus ends, GigaToken's Awkward array, and Hugging Face's list of `Encoding.ids`. These are end-to-end API costs. Ranges are min–max over the five rounds, not confidence intervals.
 

@@ -5,7 +5,14 @@ These do not import any native tokenizer library and do not run a benchmark.
     python scripts/test_bench_gpt2.py
 """
 
+import argparse
+import contextlib
+import io
+import json
+import shutil
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -86,6 +93,110 @@ class ByteAlphabetTest(unittest.TestCase):
         self.assertEqual(len(set(inv.values())), 256)
         self.assertEqual(inv["Ġ"], 32)
         self.assertEqual(inv["Ċ"], 10)
+
+
+class GoldenPreflightTest(unittest.TestCase):
+    def test_reference_counts_pass(self):
+        self.assertEqual(b.golden_preflight_errors(
+            179, 459, 245492, 253419, b.EXPECTED_VALIDATION_CHECKSUM), [])
+
+    def test_changed_counts_fail(self):
+        errors = b.golden_preflight_errors(
+            178, 458, 245491, 253418, b.EXPECTED_VALIDATION_CHECKSUM)
+        self.assertEqual(len(errors), 4)
+
+    def test_changed_checksum_fails(self):
+        errors = b.golden_preflight_errors(
+            179, 459, 245492, 253419, "0" * 64)
+        self.assertTrue(any("checksum" in e for e in errors))
+
+
+class FinishArtifactTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="gpt2-finish-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.canonical = self.dir / "gpt2-hero.json"
+
+    def _finish(self, status):
+        args = argparse.Namespace(output=self.canonical)
+        result = {"status": status, "errors": [], "validation": {}, "meta": {"host": {}}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = b._finish(args, result, [], {}, time.time())
+        return rc, json.loads(out.getvalue())
+
+    def test_error_preserves_canonical_and_writes_error_artifact(self):
+        self.canonical.write_text("CANONICAL-SENTINEL")
+        rc, brief = self._finish("error")
+        self.assertEqual(self.canonical.read_text(), "CANONICAL-SENTINEL")
+        artifact = self.dir / "gpt2-hero.json.error.json"
+        self.assertTrue(artifact.is_file())
+        self.assertEqual(json.loads(artifact.read_text())["status"], "error")
+        self.assertEqual(rc, 1)
+        self.assertEqual(brief["output"], str(artifact))
+
+    def test_invalid_preserves_canonical(self):
+        self.canonical.write_text("CANONICAL-SENTINEL")
+        rc, _ = self._finish("invalid")
+        self.assertEqual(self.canonical.read_text(), "CANONICAL-SENTINEL")
+        self.assertEqual(rc, 2)
+
+    def test_success_writes_canonical_unchanged_path(self):
+        rc, brief = self._finish("ok")
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.canonical.is_file())
+        self.assertFalse((self.dir / "gpt2-hero.json.error.json").exists())
+        self.assertEqual(brief["output"], str(self.canonical))
+
+
+class TiktokenVocabStubTest(unittest.TestCase):
+    class Encoding:
+        def __init__(self, ranks, specials):
+            self._mergeable_ranks = ranks
+            self._special_tokens = specials
+            self.n_vocab = len(ranks) + len(specials)
+
+    def _tokenizer(self, rank_id=1, special_id=2):
+        tmp = Path(tempfile.mkdtemp(prefix="gpt2-vocab-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / "tokenizer.json"
+        path.write_text(json.dumps({
+            "model": {"vocab": {"a": 0, "ab": rank_id, "<|endoftext|>": 2}},
+            "added_tokens": [{"content": "<|endoftext|>", "id": 2, "special": True}],
+        }))
+        return path
+
+    def test_rank_and_special_match(self):
+        enc = self.Encoding({b"a": 0, b"ab": 1}, {"<|endoftext|>": 2})
+        check = b._tiktoken_vocab_check(self._tokenizer(), enc)
+        self.assertTrue(check["ok"])
+        self.assertEqual(check["ranks_checked"], 2)
+        self.assertEqual(check["rank_mismatches"], 0)
+        self.assertEqual(check["special_mismatches"], 0)
+
+    def test_rank_and_special_mismatch_is_false(self):
+        enc = self.Encoding({b"a": 0, b"ab": 99}, {"<|endoftext|>": 3})
+        check = b._tiktoken_vocab_check(self._tokenizer(), enc)
+        self.assertFalse(check["ok"])
+        self.assertEqual(check["rank_mismatches"], 1)
+        self.assertEqual(check["special_mismatches"], 1)
+        self.assertIsNotNone(check["first_rank_mismatch"])
+        self.assertIsNotNone(check["first_special_mismatch"])
+
+
+class RawProofTest(unittest.TestCase):
+    """The archived production run must keep its 50256-rank proof."""
+
+    def test_archived_tiktoken_proof(self):
+        path = (Path(__file__).resolve().parent.parent
+                / "docs/benchmarks/uint32-decode/gpt2-hero.json")
+        raw = json.loads(path.read_text())
+        check = raw["meta"]["tiktoken_vocab_check"]
+        self.assertEqual(check["ranks_checked"], 50256)
+        self.assertEqual(check["rank_mismatches"], 0)
+        self.assertEqual(check["special_mismatches"], 0)
+        self.assertEqual(raw["validation"]["hf023"]["checksum"],
+                         b.EXPECTED_VALIDATION_CHECKSUM)
 
 
 class PythonMapTest(unittest.TestCase):

@@ -365,8 +365,27 @@ class DashboardTests(unittest.TestCase):
                 self.assertEqual((outputs[0] / filename).read_bytes(),
                                  (outputs[1] / filename).read_bytes())
             labels = [dashboard._legend_name(lib, dataset["artifacts"]) for lib in ("tokie", "giga", "hf")]
-            self.assertEqual(labels, ["Tokie 0.2.0\nLOCAL, UNRELEASED", "GigaToken\n0.11.0",
+            self.assertEqual(labels, ["Tokie 0.2.0\nLOCAL, UNRELEASED", "** GigaToken\n0.11.0",
                                       "HuggingFace tokenizers\n0.23.3"])
+
+    def test_giga_coverage_note_only_in_overview_and_escaped_tables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = dashboard.load_dataset(self.write(fixture_files(), directory))
+            out = Path(directory) / "figures"
+            dashboard.render(dataset, "faceted", str(out))
+            overview = (out / "benchmark_current_overview.svg").read_text()
+            hf_only = (out / "benchmark_current_hf_only.svg").read_text()
+            note = "** GigaToken: WordPiece and Unigram not supported."
+            self.assertIn(note, overview)
+            self.assertNotIn(note, hf_only)
+            self.assertNotIn("** GigaToken", hf_only)
+            tables = Path(directory) / "tables.md"
+            dashboard.write_tables(dataset, str(tables))
+            text = tables.read_text()
+            self.assertIn(r"\*\* GigaToken 0.11.0", text)
+            self.assertEqual(text.count(r"\*\* GigaToken: WordPiece and Unigram not supported."), 1)
+            hf_tables = text.split("## HuggingFace-only models", 1)[1]
+            self.assertNotIn(r"\*\* GigaToken", hf_tables)
 
     def test_both_layouts_render(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -383,8 +402,10 @@ class DashboardTests(unittest.TestCase):
                 for version in ("0.2.0", "0.11.0", "0.23.3"):
                     self.assertIn(version, overview)
                 self.assertIn("Giga.decode", overview)
+                self.assertIn("** GigaToken", overview)
                 hf_only = (out / "benchmark_current_hf_only.svg").read_text()
                 self.assertNotIn("Giga.decode", hf_only)
+                self.assertNotIn("** GigaToken", hf_only)
                 self.assertIn("HF.decode(ids.tolist())", hf_only)
                 self.assertTrue((out / "benchmark_current_hf_only.png").exists())
             tables = Path(directory) / "tables.md"

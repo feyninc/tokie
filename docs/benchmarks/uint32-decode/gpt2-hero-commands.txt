@@ -14,8 +14,10 @@ Corpus:    /tmp/opencode/tokie-compat/corpus/owt_20m.jsonl
            sha256 20dc6601bee15f270b7a2c35cfde6cd2f073f8c15567c76b913453157d2c67db
 Tokenizer: /home/bhavnick/.cache/huggingface/hub/models--openai-community--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e/tokenizer.json
            sha256 8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6
-           (HF cache path; the runner used the blob path printed in the JSON,
-            same bytes: /home/bhavnick/.cache/huggingface/hub/models--openai-community--gpt2/blobs/4b988bccc9dc5adacd403c00b4704976196548f8)
+           The snapshot path resolves to the cache blob
+           /home/bhavnick/.cache/huggingface/hub/models--openai-community--gpt2/blobs/4b988bccc9dc5adacd403c00b4704976196548f8.
+           The recorded runner passed that resolved blob path, which is what the
+           JSON records; same file, same sha256.
 Result:    docs/benchmarks/uint32-decode/gpt2-hero.json
 Harness:   scripts/bench_gpt2.py
 Tests:     scripts/test_bench_gpt2.py
@@ -183,4 +185,69 @@ Notes
   sha256, corpus/tokenizer hashes, wheel and native-member hashes, per-round
   order, per-library seconds and CPU time, and the validation checksum.
 - No core, binding, README, report, generator, or old raw-data file was
-  modified. No commit or push was made.
+  modified by this benchmark.
+
+Repro guards and artifact provenance
+------------------------------------
+Archive commit:
+  b03aa70a853108b3f5d2fc97486dd6d4572e9252
+  feat(docs): record the six-library gpt2 comparison
+
+That commit contains the producer source (scripts/bench_gpt2.py sha256
+f9de7e9804acca2d6275c28a348f21855dce699e4143f2dfd3d7cec1ec625a64), the raw
+JSON, the tests, and the commands file as recorded. The raw JSON is unchanged
+after that commit: sha256
+23c82bd7c1af00f2c7dfa348167dbb5c000b4eab09c879de5cc2fa679fb13c69.
+The guard changes described below are uncommitted, change no timing, and do
+not rewrite the raw JSON.
+
+Failure guard:
+  A replay whose status is not "ok" writes <name>.error.json beside the target
+  and leaves an existing canonical JSON untouched. The process still exits
+  nonzero (1 for error, 2 for invalid). A successful run writes the canonical
+  path as before. `scripts/test_bench_gpt2.py` proves the preserved-sentinel
+  case and the success path.
+
+Golden preflight (before any timing):
+  179 sample documents, 245492 sample ids, 459 validation texts,
+  253419 validation ids, validation checksum
+  3f74aa9e68a7433ef98dd5103d70bd97f29c8c1b14043029610ab5932fb882b0.
+  A changed corpus/slice fails as invalid instead of producing a benchmark.
+  Future results also record the sha256 of scripts/bench_published.py in
+  meta.harness.helpers.
+
+Round order wording:
+  The 5-round latin rotation uses 5 of the 6 possible starting positions. It is
+  a partial rotation, not a fully balanced design. The archived raw JSON is not
+  changed; future results use this wording in meta.protocol.
+
+tiktoken first use:
+  `tiktoken.get_encoding("gpt2")` downloads the ~4 MB GPT-2 BPE over HTTPS into
+  the data-gym cache (TMPDIR/data-gym-cache) on first use. Prewarm it before
+  timing and expect network on a clean machine. The load and warmup are outside
+  the timed region.
+
+Local unreleased tokie wheel provenance:
+  Build command, run from crates/tokie-python in the local worker:
+
+    cd /home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/crates/tokie-python
+    RUSTUP_TOOLCHAIN=stable \
+      CARGO_TARGET_DIR=/tmp/opencode/decode-u32-after/target \
+      maturin build --release --locked \
+      --interpreter /tmp/opencode/decode-u32-after/venv/bin/python \
+      --out /tmp/opencode/decode-u32-after/dist
+
+  Toolchain: rustc/cargo 1.98.0 stable, maturin 1.16.0, Python 3.12.13.
+  Default Cargo release was requested. No explicit profile overrides or
+  project-level release overrides are recorded, and this does not claim that
+  competing build flags are equivalent. The wheel was built from the working
+  tree before the strict commit; the installed lib/stub match the d5674e4
+  snapshot. This is not a claim that the wheel was built from commit d5674e4,
+  nor that it was built before that commit's timestamp. No source proof of
+  Cargo flags beyond the recorded command exists; unknown environment is left
+  explicit rather than inferred.
+
+  Classification: local, unreleased tokie artifact, not a PyPI release. The
+  raw JSON records its wheel sha256 and native-member sha256 and verifies the
+  installed .so against the wheel member. No synthetic commit was inserted
+  into the archived raw JSON.

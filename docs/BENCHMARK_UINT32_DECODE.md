@@ -20,6 +20,77 @@ different harness. Do not combine their numbers or ratios. The prior
 published 0.2.0 report, JSON, and `assets/benchmark_published_*` figures remain
 unchanged as the historical record for the public wheel.
 
+## GPT-2 main comparison
+This six-library GPT-2 run is the primary chart: single-text encode to token ids,
+one thread, one host, five globally rotated rounds, 10 passes per round, and a
+fresh child process per library per round. Import, model load, and three warmup
+passes are outside the clock. The five-round rotation uses 5 of the 6 starting
+positions, so it is partial rather than fully balanced; tiktoken's first-use
+~4 MB HTTPS vocabulary download is also outside the timed region. The sample is
+the same 179 OpenWebText documents (1,057,339 UTF-8 bytes), seed `20261111`; all
+libraries ran on Python 3.12.13, with HF 1.0.0rc4 in a separate venv so
+interpreters were not mixed.
+
+| Library | Version | MiB/s median [min–max] |
+| --- | --- | ---: |
+| tokie | local unreleased 0.2.0, wheel `8786f91…` | 705.85 [656.89–709.57] |
+| \*\* GigaToken | 0.11.0 | 744.44 [712.11–745.43] |
+| HF tokenizers | 0.23.3 | 4.10 [4.04–4.18] |
+| HF tokenizers | 1.0.0rc4 (prerelease; module `1.0.0-rc.4`) | 169.73 [138.37–171.96] |
+| Kitoken | 0.11.1 | 33.35 [31.46–33.63] |
+| tiktoken | 0.14.0 | 24.51 [24.19–24.81] |
+
+\*\* GigaToken 0.11.0 supports BPE tokenizers only; WordPiece and Unigram are
+refused (including BERT and T5) and excluded from this comparison.
+
+Chart measures GPT-2 only, not a cross-family compatibility ranking.
+
+All six matched HF 0.23.3 on the same GPT-2 `tokenizer.json` for all 459
+validation texts (179 timing plus 24 edge and 256 fuzz), with zero id
+mismatches. tiktoken also checked its canonical GPT-2 vocabulary: all 50,256
+non-special ranks and the `<|endoftext|>` special matched, with zero mismatches.
+
+Timing covers each library's full public single-text encode and id output. Tokie
+and GigaToken return NumPy arrays; HF, Kitoken, and tiktoken return lists, so
+binding/output costs differ and are included. This is not an isolated kernel
+comparison. APIs: HF 0.23.3 uses `encode(...).ids`; HF 1.0.0rc4 compiles once
+outside the clock with `Tokenizer.from_file(path).compile()`, then uses
+`compiled.encode(text, add_special_tokens=False).ids` (no `encode_fast` API is
+installed). Kitoken uses documented `encode_specials=True` to match HF; its
+default would encode the literal as 7 regular ids. tiktoken passes
+`allowed_special={'<|endoftext|>'}` explicitly; the default raises on that literal.
+These arguments are recorded in the raw JSON.
+
+GigaToken's 744.44 median is about 5.5% above tokie's 705.85 here; the JSON
+records that the single-run round ranges do not overlap but the gap is close, so
+no robust winner is claimed. Do not read the main chart as a tokie win. HF
+1.0.0rc4 is about 41× HF 0.23.3 in this run; that is one prerelease observation,
+not a general claim that 1.0 improves every model. The README headline's 190×
+ceiling is supported by other current BPE rows (maximum median ratio 194.12×),
+not by this GPT-2 row; tokie/HF 0.23.3 is about 172× here.
+
+**Hero and detailed panels are separate experiments; do not combine their
+medians.** The detailed GPT-2 encode median in the dashboard below is 681.2
+MiB/s versus 705.85 here because host, warmup, process, and pipeline conditions
+differ.
+
+Raw data: [gpt2-hero.json](benchmarks/uint32-decode/gpt2-hero.json), sha256
+`23c82bd7c1af00f2c7dfa348167dbb5c000b4eab09c879de5cc2fa679fb13c69`,
+byte-unchanged after the recording commit. Recorded producer:
+[scripts/bench_gpt2.py](../scripts/bench_gpt2.py), sha256
+`f9de7e9804acca2d6275c28a348f21855dce699e4143f2dfd3d7cec1ec625a64`, archived
+in commit `b03aa70a853108b3f5d2fc97486dd6d4572e9252`. Current
+`scripts/bench_gpt2.py` sha256
+`6b69850fa83c3ff0d3d843644f767519574ef755e718f1d5153b54e6417b47e4` adds
+future-run HF-reference golden-checksum guards and writes `*.error.json` on
+failure; it changes no recorded physical timing and does not rewrite the raw
+JSON. Commands: [gpt2-hero-commands.txt](benchmarks/uint32-decode/gpt2-hero-commands.txt).
+Generated table: [gpt2-hero-table.md](benchmarks/uint32-decode/gpt2-hero-table.md).
+
+Figure/table command:
+`python scripts/generate_gpt2_chart.py --results docs/benchmarks/uint32-decode/gpt2-hero.json --output-dir assets --table-out docs/benchmarks/uint32-decode/gpt2-hero-table.md`;
+add `--check` to validate only and write nothing.
+
 ## Artifacts and provenance
 | Item | Recorded value |
 | --- | --- |
@@ -84,7 +155,7 @@ Generated [`tables.md`](benchmarks/uint32-decode/tables.md) is authoritative if 
 ### Single-thread encode
 MiB/s, median [min–max] over five rounds; 179 documents.
 
-| Model | tokie | GigaToken | Hugging Face |
+| Model | tokie | \*\* GigaToken | Hugging Face |
 | --- | ---: | ---: | ---: |
 | GPT-2 | 681.2 [659.3–707.2] | 708.3 [694.9–727.6] | 3.6 [3.4–3.6] |
 | Qwen2 7B | 544.5 [533.0–565.9] | 488.5 [475.3–502.4] | 3.0 [2.9–3.1] |
@@ -98,7 +169,7 @@ is uncertain: both ranges are wide and overlap. HF is far slower here.
 MiB/s of decoded UTF-8 output, median [min–max]; same 179 documents and the same
 contiguous uint32 ids per document.
 
-| Model | tokie | GigaToken | Hugging Face |
+| Model | tokie | \*\* GigaToken | Hugging Face |
 | --- | ---: | ---: | ---: |
 | GPT-2 | 309.3 [286.9–327.4] | 290.6 [274.6–299.3] | 30.3 [26.3–30.7] |
 | Qwen2 7B | 334.4 [329.6–350.3] | 286.4 [267.7–307.1] | 30.6 [30.2–31.6] |
@@ -115,7 +186,7 @@ is uncertain. These include Unicode or list conversion, not pure kernel times.
 MiB/s of input text, median [min–max]; 3,411 documents. One- and eight-thread
 runs used separate processes.
 
-| Threads | Model | tokie | GigaToken | Hugging Face |
+| Threads | Model | tokie | \*\* GigaToken | Hugging Face |
 | ---: | --- | ---: | ---: | ---: |
 | 1 | GPT-2 | 645.2 [570.2–658.4] | 649.8 [290.6–703.1] | 3.7 [3.7–3.9] |
 | 1 | Qwen2 7B | 515.6 [424.1–566.5] | 442.6 [314.5–477.2] | 3.5 [3.3–3.5] |
