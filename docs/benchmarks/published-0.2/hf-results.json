@@ -1,0 +1,1005 @@
+{
+  "meta": {
+    "generated_utc": "2026-11-12T02:52:18Z",
+    "python": "3.12.13",
+    "platform": "linux",
+    "packages": {
+      "tokie": "0.2.0",
+      "tokie_import_path": "/tmp/opencode/published-tokie-0.2-bench/.venv/lib/python3.12/site-packages/tokie/__init__.py",
+      "tokie_wheel_sha256": "5c28027c24eb418fb9bcc9733c31ad4a6956d6129685b101e996e024669b6df7",
+      "numpy": "2.5.4",
+      "tokenizers": "0.23.3"
+    },
+    "thread_env": {
+      "TOKENIZERS_PARALLELISM": "false",
+      "RAYON_NUM_THREADS": "1"
+    },
+    "dataset": {
+      "manifest": "/tmp/opencode/tokie-compat/corpus/manifest.json",
+      "manifest_sha256": "227927ab4de6324d427520ad496f4fd55808e27a0513d44d26fb4a17088b03a0",
+      "jsonl": "/tmp/opencode/tokie-compat/corpus/owt_20m.jsonl",
+      "jsonl_sha256": "20dc6601bee15f270b7a2c35cfde6cd2f073f8c15567c76b913453157d2c67db",
+      "jsonl_bytes": 21281368,
+      "source": "Skylion007/openwebtext",
+      "source_parquet": "plain_text/train-00000-of-00080.parquet",
+      "source_parquet_sha256": "caed9f4b7053d7cd4d1a13ce9ec9224d84a3bba1f11579193562a7e31ebe656e",
+      "source_rows": 100173,
+      "available_documents": 4187,
+      "available_row_range": [
+        0,
+        62790
+      ],
+      "provenance": "stride-15 full documents from the first parquet shard only; a prefix sample, not the whole dataset",
+      "sampling_seed": 20261111,
+      "sampled_documents": 179,
+      "sampled_chars": 1048248,
+      "sampled_bytes_utf8": 1057339,
+      "sampled_row_range": [
+        135,
+        62670
+      ],
+      "sampled_rows_sha256": "c9f3e026003bae02bf8281be01c8ee42a00a9d87be0626c9d471b17fae0236f4"
+    },
+    "models": {
+      "gpt2": {
+        "repo": "openai-community/gpt2",
+        "revision": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+        "algorithm": "BPE",
+        "tokenizer_json": "/home/bhavnick/.cache/huggingface/hub/models--openai-community--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e/tokenizer.json",
+        "tokenizer_json_sha256": "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6",
+        "tokenizer_json_bytes": 1355256
+      },
+      "bert-base-uncased": {
+        "repo": "google-bert/bert-base-uncased",
+        "revision": "86b5e0934494bd15c9632b12f734a8a67f723594",
+        "algorithm": "WordPiece",
+        "tokenizer_json": "/home/bhavnick/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/tokenizer.json",
+        "tokenizer_json_sha256": "ce64fce797c24f68df90b40a3f74f579b336a493db14bd583fd520ea0d8c9a98",
+        "tokenizer_json_bytes": 466062
+      },
+      "t5-small": {
+        "repo": "t5-small",
+        "revision": "main (local snapshot dir; no refs file)",
+        "algorithm": "Unigram",
+        "tokenizer_json": "/home/bhavnick/.cache/huggingface/hub/models--t5-small/snapshots/main/tokenizer.json",
+        "tokenizer_json_sha256": "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066",
+        "tokenizer_json_bytes": 1389353
+      }
+    },
+    "cpu_load_before": [
+      0.51123046875,
+      0.953125,
+      0.95556640625
+    ],
+    "cpu_count": 24,
+    "cpu_load_after": [
+      0.5869140625,
+      0.955078125,
+      0.95654296875
+    ],
+    "limitations": [
+      "Ballpark throughput from 5 paired rounds, not a statistical or regression claim.",
+      "Corpus is a seeded 179-doc slice of a stride-15 prefix of one OpenWebText parquet shard, not the whole dataset.",
+      "Repeated rounds reuse the same texts; the cold first pass is recorded separately.",
+      "HF timing is its public single-text API (Encoding object per call), not a kernel-only comparison."
+    ]
+  },
+  "validation": {
+    "gpt2": {
+      "ok": true,
+      "stats": {
+        "label": "gpt2",
+        "texts": 459,
+        "tokens": 253419,
+        "encode_mismatches": 0,
+        "decode_mismatches": 0,
+        "roundtrip_mismatches": 0
+      },
+      "first_mismatch": null,
+      "samples": [
+        {
+          "row": 1260,
+          "ids_first12": [
+            45,
+            522,
+            40305,
+            1004,
+            65,
+            1313,
+            569,
+            784,
+            968,
+            1971,
+            20082,
+            784
+          ],
+          "token_count": 185,
+          "decoded_preview": "Nike Zoom Lebron V \u2013 New York Yankees \u2013 White/Navy 4.50 / 5 1 VOTES This post contains ref\u2026"
+        },
+        {
+          "row": 13620,
+          "ids_first12": [
+            2202,
+            3635,
+            3329,
+            11,
+            1024,
+            295,
+            5831,
+            7504,
+            1539,
+            257,
+            24505,
+            3094
+          ],
+          "token_count": 199,
+          "decoded_preview": "On Thursday morning, Deion Sanders Jr., a sophomore wide receiver at SMU, tweeted this out\u2026"
+        },
+        {
+          "row": 18540,
+          "ids_first12": [
+            23609,
+            3059,
+            76,
+            2501,
+            89,
+            318,
+            407,
+            2938,
+            284,
+            307,
+            736,
+            287
+          ],
+          "token_count": 200,
+          "decoded_preview": "Nick Schmaltz is not expected to be back in the Chicago Blackhawks lineup Thursday against\u2026"
+        }
+      ]
+    },
+    "bert-base-uncased": {
+      "ok": true,
+      "stats": {
+        "label": "bert-base-uncased",
+        "texts": 459,
+        "tokens": 241425,
+        "encode_mismatches": 0,
+        "decode_mismatches": 0,
+        "roundtrip_mismatches": null
+      },
+      "first_mismatch": null,
+      "samples": [
+        {
+          "row": 1260,
+          "ids_first12": [
+            18368,
+            24095,
+            3393,
+            21337,
+            1058,
+            1516,
+            2047,
+            2259,
+            11081,
+            1516,
+            2317,
+            1013
+          ],
+          "token_count": 175,
+          "decoded_preview": "nike zoom lebron v \u2013 new york yankees \u2013 white / navy 4. 50 / 5 1 votes this post contains \u2026"
+        },
+        {
+          "row": 13620,
+          "ids_first12": [
+            2006,
+            9432,
+            2851,
+            1010,
+            14866,
+            2239,
+            12055,
+            3781,
+            1012,
+            1010,
+            1037,
+            13758
+          ],
+          "token_count": 206,
+          "decoded_preview": "on thursday morning, deion sanders jr., a sophomore wide receiver at smu, tweeted this out\u2026"
+        },
+        {
+          "row": 18540,
+          "ids_first12": [
+            4172,
+            8040,
+            22444,
+            7096,
+            2480,
+            2003,
+            2025,
+            3517,
+            2000,
+            2022,
+            2067,
+            1999
+          ],
+          "token_count": 189,
+          "decoded_preview": "nick schmaltz is not expected to be back in the chicago blackhawks lineup thursday against\u2026"
+        }
+      ]
+    },
+    "t5-small": {
+      "ok": true,
+      "stats": {
+        "label": "t5-small",
+        "texts": 459,
+        "tokens": 266973,
+        "encode_mismatches": 0,
+        "decode_mismatches": 0,
+        "roundtrip_mismatches": null
+      },
+      "first_mismatch": null,
+      "samples": [
+        {
+          "row": 1260,
+          "ids_first12": [
+            15426,
+            24900,
+            312,
+            13711,
+            584,
+            3,
+            104,
+            368,
+            1060,
+            20643,
+            7,
+            3
+          ],
+          "token_count": 188,
+          "decoded_preview": "Nike Zoom Lebron V \u2013 New York Yankees \u2013 White/Navy 4.50 / 5 1 VOTES This post contains ref\u2026"
+        },
+        {
+          "row": 13620,
+          "ids_first12": [
+            461,
+            2721,
+            1379,
+            6,
+            374,
+            23,
+            106,
+            22439,
+            8206,
+            5,
+            6,
+            3
+          ],
+          "token_count": 227,
+          "decoded_preview": "On Thursday morning, Deion Sanders Jr., a sophomore wide receiver at SMU, tweeted this out\u2026"
+        },
+        {
+          "row": 18540,
+          "ids_first12": [
+            7486,
+            16724,
+            2920,
+            172,
+            19,
+            59,
+            1644,
+            12,
+            36,
+            223,
+            16,
+            8
+          ],
+          "token_count": 200,
+          "decoded_preview": "Nick Schmaltz is not expected to be back in the Chicago Blackhawks lineup Thursday against\u2026"
+        }
+      ]
+    }
+  },
+  "benchmark": {
+    "gpt2": {
+      "texts": 459,
+      "input_bytes_utf8": 1068881,
+      "total_tokens": 253419,
+      "decoded_bytes_utf8": 1068881,
+      "cold_first_pass_s": {
+        "tokie_encode": 0.003987269999925047,
+        "hf_encode": 0.22055846900912002,
+        "tokie_decode": 0.005389387995819561,
+        "hf_decode": 0.024731162993703038
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "tokie",
+            "hf"
+          ],
+          "tokie": {
+            "encode_s": 0.00183298799674958,
+            "decode_s": 0.005436646999442019,
+            "encode_count": 253419,
+            "decode_count": 1056480
+          },
+          "hf": {
+            "encode_s": 0.21537678099412005,
+            "decode_s": 0.025380082995980047,
+            "encode_count": 253419,
+            "decode_count": 1056480
+          }
+        },
+        {
+          "round": 2,
+          "order": [
+            "hf",
+            "tokie"
+          ],
+          "hf": {
+            "encode_s": 0.2183940170070855,
+            "decode_s": 0.024899708994780667,
+            "encode_count": 253419,
+            "decode_count": 1056480
+          },
+          "tokie": {
+            "encode_s": 0.001833849004469812,
+            "decode_s": 0.005353119995561428,
+            "encode_count": 253419,
+            "decode_count": 1056480
+          }
+        },
+        {
+          "round": 3,
+          "order": [
+            "tokie",
+            "hf"
+          ],
+          "tokie": {
+            "encode_s": 0.001728522009216249,
+            "decode_s": 0.004963797997334041,
+            "encode_count": 253419,
+            "decode_count": 1056480
+          },
+          "hf": {
+            "encode_s": 0.2124223040009383,
+            "decode_s": 0.025005809002323076,
+            "encode_count": 253419,
+            "decode_count": 1056480
+          }
+        },
+        {
+          "round": 4,
+          "order": [
+            "hf",
+            "tokie"
+          ],
+          "hf": {
+            "encode_s": 0.21575786899484228,
+            "decode_s": 0.025200856995070353,
+            "encode_count": 253419,
+            "decode_count": 1056480
+          },
+          "tokie": {
+            "encode_s": 0.0018395200022496283,
+            "decode_s": 0.005497460995684378,
+            "encode_count": 253419,
+            "decode_count": 1056480
+          }
+        },
+        {
+          "round": 5,
+          "order": [
+            "tokie",
+            "hf"
+          ],
+          "tokie": {
+            "encode_s": 0.0017945360013982281,
+            "decode_s": 0.005023520003305748,
+            "encode_count": 253419,
+            "decode_count": 1056480
+          },
+          "hf": {
+            "encode_s": 0.2132265670079505,
+            "decode_s": 0.024242453000624664,
+            "encode_count": 253419,
+            "decode_count": 1056480
+          }
+        }
+      ],
+      "summary": {
+        "tokie": {
+          "encode_s_median": 0.00183298799674958,
+          "encode_s_min": 0.001728522009216249,
+          "encode_s_max": 0.0018395200022496283,
+          "decode_s_median": 0.005353119995561428,
+          "decode_s_min": 0.004963797997334041,
+          "decode_s_max": 0.005497460995684378,
+          "encode_mib_s_median": 556.1216760842177,
+          "decode_tokens_s_median": 47340429.54578337,
+          "decode_mib_s_median": 190.42434278324436
+        },
+        "hf": {
+          "encode_s_median": 0.21537678099412005,
+          "encode_s_min": 0.2124223040009383,
+          "encode_s_max": 0.2183940170070855,
+          "decode_s_median": 0.025005809002323076,
+          "decode_s_min": 0.024242453000624664,
+          "decode_s_max": 0.025380082995980047,
+          "encode_mib_s_median": 4.732935241624111,
+          "decode_tokens_s_median": 10134405.168673288,
+          "decode_mib_s_median": 40.76510209687391
+        }
+      }
+    },
+    "bert-base-uncased": {
+      "texts": 459,
+      "input_bytes_utf8": 1068881,
+      "total_tokens": 241425,
+      "decoded_bytes_utf8": 1088324,
+      "cold_first_pass_s": {
+        "tokie_encode": 0.00791856599971652,
+        "hf_encode": 0.24847476299328264,
+        "tokie_decode": 0.004604581990861334,
+        "hf_decode": 0.10957472398877144
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "tokie",
+            "hf"
+          ],
+          "tokie": {
+            "encode_s": 0.0040151739958673716,
+            "decode_s": 0.004658593999920413,
+            "encode_count": 241425,
+            "decode_count": 1077697
+          },
+          "hf": {
+            "encode_s": 0.24837361299432814,
+            "decode_s": 0.11014301399700344,
+            "encode_count": 241425,
+            "decode_count": 1077697
+          }
+        },
+        {
+          "round": 2,
+          "order": [
+            "hf",
+            "tokie"
+          ],
+          "hf": {
+            "encode_s": 0.24008022199268453,
+            "decode_s": 0.11054228400462307,
+            "encode_count": 241425,
+            "decode_count": 1077697
+          },
+          "tokie": {
+            "encode_s": 0.004074134005350061,
+            "decode_s": 0.004487672005780041,
+            "encode_count": 241425,
+            "decode_count": 1077697
+          }
+        },
+        {
+          "round": 3,
+          "order": [
+            "tokie",
+            "hf"
+          ],
+          "tokie": {
+            "encode_s": 0.0038588490133406594,
+            "decode_s": 0.004208566999295726,
+            "encode_count": 241425,
+            "decode_count": 1077697
+          },
+          "hf": {
+            "encode_s": 0.23676728999998886,
+            "decode_s": 0.11065742099890485,
+            "encode_count": 241425,
+            "decode_count": 1077697
+          }
+        },
+        {
+          "round": 4,
+          "order": [
+            "hf",
+            "tokie"
+          ],
+          "hf": {
+            "encode_s": 0.238305633989512,
+            "decode_s": 0.11251330201048404,
+            "encode_count": 241425,
+            "decode_count": 1077697
+          },
+          "tokie": {
+            "encode_s": 0.003989724995335564,
+            "decode_s": 0.004531454993411899,
+            "encode_count": 241425,
+            "decode_count": 1077697
+          }
+        },
+        {
+          "round": 5,
+          "order": [
+            "tokie",
+            "hf"
+          ],
+          "tokie": {
+            "encode_s": 0.00387934799073264,
+            "decode_s": 0.004181284995866008,
+            "encode_count": 241425,
+            "decode_count": 1077697
+          },
+          "hf": {
+            "encode_s": 0.24188782200508285,
+            "decode_s": 0.11115403501025867,
+            "encode_count": 241425,
+            "decode_count": 1077697
+          }
+        }
+      ],
+      "summary": {
+        "tokie": {
+          "encode_s_median": 0.003989724995335564,
+          "encode_s_min": 0.0038588490133406594,
+          "encode_s_max": 0.004074134005350061,
+          "decode_s_median": 0.004487672005780041,
+          "decode_s_min": 0.004181284995866008,
+          "decode_s_max": 0.004658593999920413,
+          "encode_mib_s_median": 255.49739848896357,
+          "decode_tokens_s_median": 53797380.84446656,
+          "decode_mib_s_median": 231.27952430385074
+        },
+        "hf": {
+          "encode_s_median": 0.24008022199268453,
+          "encode_s_min": 0.23676728999998886,
+          "encode_s_max": 0.24837361299432814,
+          "decode_s_median": 0.11065742099890485,
+          "decode_s_min": 0.11014301399700344,
+          "decode_s_max": 0.11251330201048404,
+          "encode_mib_s_median": 4.245932249369921,
+          "decode_tokens_s_median": 2181733.4781585895,
+          "decode_mib_s_median": 9.379458127248308
+        }
+      }
+    },
+    "t5-small": {
+      "texts": 459,
+      "input_bytes_utf8": 1068881,
+      "total_tokens": 266973,
+      "decoded_bytes_utf8": 1071333,
+      "cold_first_pass_s": {
+        "tokie_encode": 0.02489797600719612,
+        "hf_encode": 0.3260154580057133,
+        "tokie_decode": 0.006321752007352188,
+        "hf_decode": 0.031712545998743735
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "tokie",
+            "hf"
+          ],
+          "tokie": {
+            "encode_s": 0.008630714990431443,
+            "decode_s": 0.0063464490085607395,
+            "encode_count": 266973,
+            "decode_count": 1062567
+          },
+          "hf": {
+            "encode_s": 0.3170690690021729,
+            "decode_s": 0.029954008001368493,
+            "encode_count": 266973,
+            "decode_count": 1062567
+          }
+        },
+        {
+          "round": 2,
+          "order": [
+            "hf",
+            "tokie"
+          ],
+          "hf": {
+            "encode_s": 0.31803703898913227,
+            "decode_s": 0.029284878008184023,
+            "encode_count": 266973,
+            "decode_count": 1062567
+          },
+          "tokie": {
+            "encode_s": 0.0084840099880239,
+            "decode_s": 0.006218056994839571,
+            "encode_count": 266973,
+            "decode_count": 1062567
+          }
+        },
+        {
+          "round": 3,
+          "order": [
+            "tokie",
+            "hf"
+          ],
+          "tokie": {
+            "encode_s": 0.008265969998319633,
+            "decode_s": 0.005869882006663829,
+            "encode_count": 266973,
+            "decode_count": 1062567
+          },
+          "hf": {
+            "encode_s": 0.31242435101012234,
+            "decode_s": 0.029994454002007842,
+            "encode_count": 266973,
+            "decode_count": 1062567
+          }
+        },
+        {
+          "round": 4,
+          "order": [
+            "hf",
+            "tokie"
+          ],
+          "hf": {
+            "encode_s": 0.3024298600066686,
+            "decode_s": 0.029557491012383252,
+            "encode_count": 266973,
+            "decode_count": 1062567
+          },
+          "tokie": {
+            "encode_s": 0.008519886992871761,
+            "decode_s": 0.006306122988462448,
+            "encode_count": 266973,
+            "decode_count": 1062567
+          }
+        },
+        {
+          "round": 5,
+          "order": [
+            "tokie",
+            "hf"
+          ],
+          "tokie": {
+            "encode_s": 0.008454334005364217,
+            "decode_s": 0.0062140599911799654,
+            "encode_count": 266973,
+            "decode_count": 1062567
+          },
+          "hf": {
+            "encode_s": 0.30623638098768424,
+            "decode_s": 0.029633233993081376,
+            "encode_count": 266973,
+            "decode_count": 1062567
+          }
+        }
+      ],
+      "summary": {
+        "tokie": {
+          "encode_s_median": 0.0084840099880239,
+          "encode_s_min": 0.008265969998319633,
+          "encode_s_max": 0.008630714990431443,
+          "decode_s_median": 0.006218056994839571,
+          "decode_s_min": 0.005869882006663829,
+          "decode_s_max": 0.0063464490085607395,
+          "encode_mib_s_median": 120.15124433299492,
+          "decode_tokens_s_median": 42935116.26245362,
+          "decode_mib_s_median": 164.31222281596624
+        },
+        "hf": {
+          "encode_s_median": 0.31242435101012234,
+          "encode_s_min": 0.3024298600066686,
+          "encode_s_max": 0.31803703898913227,
+          "decode_s_median": 0.029633233993081376,
+          "decode_s_min": 0.029284878008184023,
+          "decode_s_max": 0.029994454002007842,
+          "encode_mib_s_median": 3.2627557797554716,
+          "decode_tokens_s_median": 9009242.800240148,
+          "decode_mib_s_median": 34.47827417881556
+        }
+      }
+    }
+  },
+  "profile": {
+    "gpt2": {
+      "tokie_encode": {
+        "wall_s": 0.004209549006191082,
+        "process_cpu_s": 0.004206612000000831,
+        "cpu_per_wall": 0.9993022990857378,
+        "top": [
+          {
+            "cumtime_s": 0.004,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:286(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.004,
+            "func": "{method 'encode' of 'builtins.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      },
+      "hf_encode": {
+        "wall_s": 0.23085501800233033,
+        "process_cpu_s": 0.2300587389999995,
+        "cpu_per_wall": 0.9965507399006472,
+        "top": [
+          {
+            "cumtime_s": 0.229,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:287(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.223,
+            "func": "{method 'encode' of 'tokenizers.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      },
+      "tokie_decode": {
+        "wall_s": 0.005751409989898093,
+        "process_cpu_s": 0.005736062999999625,
+        "cpu_per_wall": 0.9973316126088344,
+        "top": [
+          {
+            "cumtime_s": 0.006,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:288(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.006,
+            "func": "{method 'decode' of 'builtins.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      },
+      "hf_decode": {
+        "wall_s": 0.02588959099375643,
+        "process_cpu_s": 0.025816032999999905,
+        "cpu_per_wall": 0.9971587811574828,
+        "top": [
+          {
+            "cumtime_s": 0.026,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:289(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.026,
+            "func": "{method 'decode' of 'tokenizers.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      }
+    },
+    "bert-base-uncased": {
+      "tokie_encode": {
+        "wall_s": 0.008023513000807725,
+        "process_cpu_s": 0.008008814000000086,
+        "cpu_per_wall": 0.9981680093487529,
+        "top": [
+          {
+            "cumtime_s": 0.008,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:286(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.008,
+            "func": "{method 'encode' of 'builtins.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      },
+      "hf_encode": {
+        "wall_s": 0.24426484400464687,
+        "process_cpu_s": 0.24333025099999972,
+        "cpu_per_wall": 0.9961738538001426,
+        "top": [
+          {
+            "cumtime_s": 0.243,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:287(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.237,
+            "func": "{method 'encode' of 'tokenizers.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      },
+      "tokie_decode": {
+        "wall_s": 0.004757588991196826,
+        "process_cpu_s": 0.004743186999998983,
+        "cpu_per_wall": 0.9969728382959326,
+        "top": [
+          {
+            "cumtime_s": 0.005,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:288(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.005,
+            "func": "{method 'decode' of 'builtins.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      },
+      "hf_decode": {
+        "wall_s": 0.11236852999718394,
+        "process_cpu_s": 0.11202768100000071,
+        "cpu_per_wall": 0.9969666863383211,
+        "top": [
+          {
+            "cumtime_s": 0.112,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:289(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.112,
+            "func": "{method 'decode' of 'tokenizers.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      }
+    },
+    "t5-small": {
+      "tokie_encode": {
+        "wall_s": 0.024798710001050495,
+        "process_cpu_s": 0.02472404899999958,
+        "cpu_per_wall": 0.9969893191602406,
+        "top": [
+          {
+            "cumtime_s": 0.025,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:286(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.024,
+            "func": "{method 'encode' of 'builtins.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      },
+      "hf_encode": {
+        "wall_s": 0.3155781530076638,
+        "process_cpu_s": 0.31445911800000026,
+        "cpu_per_wall": 0.996454016233385,
+        "top": [
+          {
+            "cumtime_s": 0.314,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:287(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.308,
+            "func": "{method 'encode' of 'tokenizers.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      },
+      "tokie_decode": {
+        "wall_s": 0.0064411970088258386,
+        "process_cpu_s": 0.006398414999999602,
+        "cpu_per_wall": 0.9933580654701889,
+        "top": [
+          {
+            "cumtime_s": 0.006,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:288(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.006,
+            "func": "{method 'decode' of 'builtins.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      },
+      "hf_decode": {
+        "wall_s": 0.030646690996945836,
+        "process_cpu_s": 0.03051661500000158,
+        "cpu_per_wall": 0.9957556267018446,
+        "top": [
+          {
+            "cumtime_s": 0.03,
+            "func": "/tmp/opencode/published-tokie-0.2-bench/benchmark.py:289(<lambda>)"
+          },
+          {
+            "cumtime_s": 0.03,
+            "func": "{method 'decode' of 'tokenizers.Tokenizer' objects}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{built-in method builtins.len}"
+          },
+          {
+            "cumtime_s": 0.0,
+            "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+          }
+        ]
+      }
+    }
+  },
+  "errors": [],
+  "samples": [
+    {
+      "row": 1260,
+      "chars": 801,
+      "preview": "Nike Zoom Lebron V \u2013 New York Yankees \u2013 White/Navy 4.50 / 5 1 VOTES This post contains ref\u2026"
+    },
+    {
+      "row": 13620,
+      "chars": 728,
+      "preview": "On Thursday morning, Deion Sanders Jr., a sophomore wide receiver at SMU, tweeted this out\u2026"
+    },
+    {
+      "row": 18540,
+      "chars": 860,
+      "preview": "Nick Schmaltz is not expected to be back in the Chicago Blackhawks lineup Thursday against\u2026"
+    }
+  ]
+}
