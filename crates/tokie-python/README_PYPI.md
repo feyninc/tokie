@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/chonkie-inc/tokie/main/assets/tokie-banner.png" alt="tokie">
+  <img src="https://raw.githubusercontent.com/feyninc/tokie/main/assets/tokie-banner.png" alt="tokie">
 </p>
 
 <p align="center">
-  <a href="https://github.com/chonkie-inc/tokie">GitHub</a> · <a href="https://crates.io/crates/tokie">crates.io</a>
+  <a href="https://github.com/feyninc/tokie">GitHub</a> · <a href="https://crates.io/crates/tokie">crates.io</a>
 </p>
 
 Python bindings for the tokie 0.2 tokenizer. `encode`, `encode_plus`, and `batch` release the GIL and return NumPy arrays. There is no `Encoding` object and no `.ids` attribute; use `.tolist()`.

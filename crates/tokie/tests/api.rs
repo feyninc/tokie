@@ -270,6 +270,35 @@ fn to_file_saves_a_new_tokie_file() {
 }
 
 #[test]
+fn saving_over_a_saved_file_reopens_with_the_new_vocab() {
+    let path = temp_path("resaved.tokie");
+    let base = Tokenizer::json(BASE).unwrap();
+    base.save(&path).unwrap();
+
+    // The second save replaces the first. Its temporary is reopened for
+    // writing before the flush, so Windows must accept it the same way.
+    let sparse = Tokenizer::json(SPARSE).unwrap();
+    sparse.save(&path).unwrap();
+
+    let mut reopened = Tokenizer::from_file(&path).unwrap();
+    assert_eq!(reopened.get_vocab(), sparse.get_vocab());
+    assert_ne!(reopened.get_vocab(), base.get_vocab());
+
+    let mut ids = Vec::new();
+    reopened.encode("ab", &mut ids).unwrap();
+    assert_eq!(ids, [6]);
+
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    assert!(
+        !PathBuf::from(tmp).exists(),
+        "save left the temporary file behind"
+    );
+
+    cleanup(&path);
+}
+
+#[test]
 fn old_toki_magic_is_refused_by_the_aliases() {
     let path = temp_path("old.tkz");
     std::fs::write(&path, b"TOKI\0\0\0\0not a tokenizer").unwrap();

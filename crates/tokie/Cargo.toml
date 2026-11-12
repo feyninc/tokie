@@ -4,7 +4,8 @@ version = "0.2.0"
 edition = "2024"
 description = "Fast tokenizer. Normalie rewrites the string. Pretokie splits it."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/chonkie-inc/tokie"
+repository = "https://github.com/feyninc/tokie"
+readme = "README.md"
 keywords = ["tokenizer", "bpe", "wordpiece", "unigram", "nlp"]
 categories = ["text-processing"]
 
@@ -18,8 +19,8 @@ aho-corasick = "1.1"
 daggrs = "0.1"
 hf-hub = { version = "0.4", optional = true, default-features = false, features = ["ureq"] }
 memchr = "2.8"
-normalie = { path = "../normalie" }
-pretokie = { path = "../pretokie" }
+normalie = { version = "0.1.0", path = "../normalie" }
+pretokie = { version = "0.2.0", path = "../pretokie" }
 rustc-hash = "2"
 serde_json = "1"
 sha2 = "0.10"

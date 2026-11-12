@@ -4,12 +4,12 @@ version = "0.2.0"
 edition = "2024"
 description = "Encode and decode with a tokie tokenizer"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/chonkie-inc/tokie"
+repository = "https://github.com/feyninc/tokie"
 
 [[bin]]
 name = "tokie"
 path = "src/main.rs"
 
 [dependencies]
-tokie = { path = "../tokie" }
+tokie = { version = "0.2.0", path = "../tokie" }
 clap = { version = "4", features = ["derive"] }

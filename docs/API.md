@@ -92,7 +92,7 @@ The Cargo feature is `hub`; `hf` is an alias.
 
 ## Speed
 
-These are design expectations for the 0.2 shape, not measurements. [BENCHMARK_BASELINE.md](BENCHMARK_BASELINE.md) records the before-state. The after-implementation gate is pending.
+The 0.2 implementation is complete. [BENCHMARK_AFTER.md](BENCHMARK_AFTER.md) records the final results: correctness gates pass, the Rust quiet-window pair found no slowdown at its reported finite resolution, and the Python matrix has no statistically reliable familywise regression; the strict performance criterion is uncertified/partial. The table below is design rationale for the 0.2 shape, not measurement.
 
 | Change | Expected effect |
 | --- | --- |

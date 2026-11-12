@@ -1,6 +1,6 @@
 <div align="center">
 
-![tokie](https://raw.githubusercontent.com/chonkie-inc/tokie/main/assets/tokie.png)
+![tokie](https://raw.githubusercontent.com/feyninc/tokie/main/assets/tokie.png)
 
 # pretokie
 
@@ -8,7 +8,7 @@
 [![Crates.io Downloads](https://img.shields.io/crates/d/pretokie)](https://crates.io/crates/pretokie)
 [![docs.rs](https://img.shields.io/docsrs/pretokie)](https://docs.rs/pretokie)
 [![License](https://img.shields.io/crates/l/pretokie)](LICENSE-MIT)
-[![GitHub Stars](https://img.shields.io/github/stars/chonkie-inc/tokie)](https://github.com/chonkie-inc/tokie)
+[![GitHub Stars](https://img.shields.io/github/stars/feyninc/tokie)](https://github.com/feyninc/tokie)
 
 *Fast, zero-allocation pretokenizers for the major tokenizers, up to 3 times Hugging Face tokenizers*
 
@@ -21,7 +21,7 @@
 
 **pretokie** splits text into pieces before BPE, WordPiece, or Unigram encoding. Each cut is a zero-sized type. A call returns a piece count, or a batch of byte spans into the text you passed in. The text is at most 4 GiB.
 
-Part of the [tokie](https://github.com/chonkie-inc/tokie) tokenizer project. The patterns and the walker are written up in [docs/PATTERNS.md](docs/PATTERNS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Part of the [tokie](https://github.com/feyninc/tokie) tokenizer project. The patterns and the walker are written up in [docs/PATTERNS.md](docs/PATTERNS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Quick start
 

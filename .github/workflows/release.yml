@@ -3,107 +3,197 @@ name: Release
 on:
   release:
     types: [published]
-  # Manual trigger to (re)publish the crates.io half without rebuilding wheels
-  # or re-uploading to PyPI — the wheel/PyPI jobs are gated to the release event.
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the v prefix (for example 0.2.0)"
+        required: true
+        type: string
+      publish:
+        description: "Publish crates to crates.io. Only allowed from main. PyPI uploads happen only on a published GitHub release."
+        required: false
+        default: false
+        type: boolean
+
+# A release and a manual run for the same version must not race.
+concurrency:
+  group: release-${{ github.event.release.tag_name || format('v{0}', inputs.version) }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  PYTHONUNBUFFERED: "1"
+
+permissions:
+  contents: read
 
 jobs:
-  publish-crates:
-    name: Publish to crates.io
+  validate-version:
+    name: Validate release version
     runs-on: ubuntu-latest
-    permissions:
-      # Required for crates.io trusted publishing: GitHub mints an OIDC token
-      # that crates-io-auth-action exchanges for a short-lived registry token.
-      # No long-lived CARGO_REGISTRY_TOKEN secret is used.
-      id-token: write
-      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Authenticate to crates.io (trusted publishing)
-        id: auth
-        uses: rust-lang/crates-io-auth-action@v1
-      # tokie depends on the workspace pretokie, so pretokie must reach crates.io
-      # first. We tolerate the "already published" case (idempotent re-runs) but
-      # fail loudly on any other error — a silent continue-on-error once let a
-      # 403 permissions failure pass as a green release.
-      - name: Publish pretokie to crates.io
+        with:
+          # Release ancestry needs the tag commit and origin/main history.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check tag, Cargo manifests, and pyproject
+        id: check
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          out=$(cargo publish -p pretokie --allow-dirty 2>&1) && { echo "$out"; exit 0; }
-          echo "$out"
-          echo "$out" | grep -qiE "already (exists|uploaded)|already been uploaded|crate version .* is already" \
-            && { echo "pretokie version already on crates.io; continuing"; exit 0; }
-          echo "::error::pretokie publish failed"; exit 1
-      - name: Publish tokie to crates.io
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            python scripts/release/check_versions.py \
+              --tag "$RELEASE_TAG" \
+              --github-output "$GITHUB_OUTPUT"
+          else
+            python scripts/release/check_versions.py \
+              --version "$INPUT_VERSION" \
+              --github-output "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require the release tag to be on main
+        if: github.event_name == 'release'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        # Retry to ride out crates.io sparse-index propagation of the pretokie
-        # version just published (tokie's dependency requirement must resolve).
+          VERSION: ${{ steps.check.outputs.version }}
         run: |
-          for attempt in 1 2 3 4 5; do
-            out=$(cargo publish -p tokie --allow-dirty 2>&1) && { echo "$out"; exit 0; }
-            echo "$out"
-            echo "$out" | grep -qiE "already (exists|uploaded)|already been uploaded|crate version .* is already" \
-              && { echo "tokie version already on crates.io; continuing"; exit 0; }
-            if echo "$out" | grep -qiE "failed to select a version for the requirement .pretokie"; then
-              echo "pretokie not yet visible in index (attempt $attempt); retrying in 20s"; sleep 20; continue
-            fi
-            echo "::error::tokie publish failed"; exit 1
-          done
-          echo "::error::tokie publish failed after retries (pretokie never became resolvable)"; exit 1
+          set -euo pipefail
+          tag="v$VERSION"
+          if ! printf '%s' "$tag" | grep -Eq \
+            '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::validated version did not form a safe release tag: $tag"
+            exit 1
+          fi
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            "+refs/tags/$tag:refs/tags/$tag"
+          tagged=$(git rev-list -n 1 "refs/tags/$tag")
+          if ! git merge-base --is-ancestor "$tagged" refs/remotes/origin/main; then
+            echo "::error::release tag $tag is not an ancestor of origin/main"
+            exit 1
+          fi
+          echo "release tag $tag is on origin/main"
+
+      - name: Unit-test the release helpers
+        run: python scripts/release/test_release_scripts.py
+
+      - name: Reject publish from a non-main ref
+        if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::publish=true is only allowed from refs/heads/main; this run is $REF"
+          exit 1
 
   build-wheels:
-    if: github.event_name == 'release'
-    name: Build wheels (${{ matrix.target }})
+    name: Build and smoke wheels (${{ matrix.artifact }})
+    needs: validate-version
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             manylinux: auto
-          - os: ubuntu-latest
+            artifact: linux-x86_64
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            manylinux: 2_28
-          - os: macos-latest
+            manylinux: "2_28"
+            artifact: linux-aarch64
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             manylinux: auto
-          - os: macos-latest
+            artifact: macos-x86_64
+          - os: macos-15
             target: aarch64-apple-darwin
             manylinux: auto
+            artifact: macos-aarch64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             manylinux: auto
+            artifact: windows-x86_64
     steps:
       - uses: actions/checkout@v4
 
-      - uses: PyO3/maturin-action@v1
+      # Native builds need every interpreter on PATH. The manylinux container
+      # has its own interpreters, but the host still needs these for smoke tests.
+      - name: Set up Python 3.10 through 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.12
+            3.13
+            3.14
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: false
+
+      - name: Install the five smoke-test interpreters
+        run: uv python install 3.10 3.11 3.12 3.13 3.14
+
+      - name: Build native wheels
+        uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13 3.14
+          args: >-
+            --release --locked --out dist
+            --interpreter 3.10 3.11 3.12 3.13 3.14
+            --compatibility pypi
           manylinux: ${{ matrix.manylinux }}
           working-directory: crates/tokie-python
+          rust-toolchain: stable
 
-      - uses: actions/upload-artifact@v4
+      - name: Verify exactly one wheel per supported Python
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        # Windows defaults to pwsh, which needs $env:VERSION. Run under Git Bash
+        # so the shared "$VERSION" expansion works on every matrix entry.
+        shell: bash
+        run: >-
+          python scripts/release/smoke_wheel.py verify-set
+          --dir crates/tokie-python/dist
+          --expected-version "$VERSION"
+
+      - name: Install and smoke every wheel in a matching venv
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        # Same pwsh caveat as above: this step expands "$VERSION" in bash.
+        shell: bash
+        run: >-
+          python scripts/release/smoke_wheel.py install-all
+          --dir crates/tokie-python/dist
+          --expected-version "$VERSION"
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.target }}
-          path: crates/tokie-python/dist
+          name: wheels-${{ matrix.artifact }}
+          path: crates/tokie-python/dist/*.whl
+          if-no-files-found: error
 
   build-pyemscripten:
-    if: github.event_name == 'release'
     name: Build PyEmscripten wheel (Pyodide ${{ matrix.python-version }})
+    needs: validate-version
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - python-version: '3.14'
+          - python-version: "3.14"
     steps:
       - uses: actions/checkout@v4
 
@@ -133,46 +223,200 @@ jobs:
           MATURIN_PYEMSCRIPTEN_PLATFORM_VERSION: ${{ steps.pyodide_config.outputs.pyodide_abi_version }}
         with:
           target: wasm32-unknown-emscripten
-          args: --release --out dist --interpreter ${{ matrix.python-version }} --no-default-features
+          args: >-
+            --release --locked --out dist
+            --interpreter ${{ matrix.python-version }}
+            --no-default-features
           working-directory: crates/tokie-python
           rust-toolchain: ${{ steps.pyodide_config.outputs.rust_toolchain }}
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload PyEmscripten wheel
+        uses: actions/upload-artifact@v4
         with:
           name: wheels-pyemscripten-${{ matrix.python-version }}
-          path: crates/tokie-python/dist
+          path: crates/tokie-python/dist/*.whl
+          if-no-files-found: error
 
-  build-sdist:
-    if: github.event_name == 'release'
-    name: Build source distribution
+  smoke-pyemscripten:
+    name: Smoke PyEmscripten wheel in Pyodide
+    needs: [validate-version, build-pyemscripten]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install pyodide-build
+        run: pip install pyodide-build
+
+      - name: Create Pyodide venv
+        run: pyodide venv .venv-pyodide
+
+      - name: Download PyEmscripten wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-pyemscripten-3.14
+          path: dist
+
+      # The Pyodide venv's pip is the supported way to install a Pyodide
+      # package. --only-binary stops pip from trying to compile NumPy for the
+      # host, which would produce the wrong artifact.
+      - name: Install NumPy from the Pyodide package index
+        run: |
+          source .venv-pyodide/bin/activate
+          pip install --only-binary=:all: numpy
+
+      # NumPy is already installed, so tokie can be installed without allowing
+      # pip to resolve a second, native NumPy wheel.
+      - name: Install the tokie wheel
+        run: |
+          source .venv-pyodide/bin/activate
+          wheel=$(ls dist/*.whl)
+          pip install --no-deps "$wheel"
+
+      - name: Run the functional smoke test
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          source .venv-pyodide/bin/activate
+          wheel=$(ls dist/*.whl)
+          python scripts/release/smoke_wheel.py check \
+            --expected-version "$VERSION" \
+            --wheel "$wheel"
+
+  build-sdist:
+    name: Build and smoke source distribution
+    needs: validate-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: false
+
+      - name: Install Python 3.12 for the sdist smoke
+        run: uv python install 3.12
+
+      - name: Build source distribution
+        uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
           working-directory: crates/tokie-python
 
-      - uses: actions/upload-artifact@v4
+      - name: Verify the sdist bundles the workspace crates
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          archive=$(ls crates/tokie-python/dist/*.tar.gz)
+          python scripts/release/smoke_wheel.py verify-sdist \
+            --archive "$archive" \
+            --expected-version "$VERSION"
+
+      - name: Install the sdist in a clean venv and smoke it
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          archive=$(ls crates/tokie-python/dist/*.tar.gz)
+          py=$(uv python find 3.12)
+          python scripts/release/smoke_wheel.py install \
+            --source "$archive" \
+            --python "$py" \
+            --expected-version "$VERSION"
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@v4
         with:
           name: wheels-sdist
-          path: crates/tokie-python/dist
+          path: crates/tokie-python/dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-crates:
+    name: Publish crates to crates.io
+    needs:
+      - validate-version
+      - build-wheels
+      - build-pyemscripten
+      - build-sdist
+      - smoke-pyemscripten
+    # A published release always publishes. A manual run publishes only when
+    # publish=true and the ref is main. A manual preflight never writes.
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Probe crates.io for the exact versions
+        id: probe
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          bash scripts/release/publish_crate.sh probe \
+            --registry crates-io \
+            --version "$VERSION"
+
+      # OIDC is only needed when a crate is actually missing. An idempotent
+      # rerun where all exact versions already exist skips this step.
+      - name: Authenticate to crates.io only when a crate is missing
+        if: steps.probe.outputs.need_oidc == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish in dependency order
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CRATES_IO_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          bash scripts/release/publish_crate.sh publish \
+            --registry crates-io \
+            --version "$VERSION"
 
   upload-pypi:
+    name: Upload wheels and sdist to PyPI
+    needs:
+      - validate-version
+      - publish-crates
+      - build-wheels
+      - build-pyemscripten
+      - build-sdist
+    # PyPI is release-event only. A manual run, with publish true or false,
+    # never uploads to PyPI.
     if: github.event_name == 'release'
-    name: Upload to PyPI
-    needs: [build-wheels, build-pyemscripten, build-sdist]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all distributions
+        uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: List distributions
+        run: ls -l dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
           packages-dir: dist/
+          skip-existing: true
