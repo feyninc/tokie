@@ -291,7 +291,7 @@
      "hf": "Tokenizer.encode_batch(texts, add_special_tokens=False) -> list[Encoding]; [e.ids] inside clock"
     },
     "counted_inside_clock": "all ids + documents",
-    "count_unit": "ids",
+    "count_unit": "ids_and_documents",
     "count_includes_documents": true,
     "note": "public output types differ; Giga is not flattened inside any clock; one pass per round; batch input is the larger seeded sample"
    }
@@ -394,7 +394,24 @@
    3.5,
    2.7197265625,
    1.994140625
-  ]
+  ],
+  "summary_correction": {
+   "kind": "derived_units_only",
+   "original_producer_sha256": "ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59",
+   "archived_producer_commit": "a04f4006cda1d435adbe6e76cac93453fb90045f",
+   "corrected_by_script_sha256": "dfbe15540efb2ef0a428180ff51038b156a72900d23c57d7d518fc654569e310",
+   "measurements_changed": false,
+   "generated_utc_preserved": true,
+   "harness_sha256_preserved": true,
+   "original_harness_sha256_at_start": "ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59",
+   "original_harness_sha256_at_end": "ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59",
+   "changes": [
+    "decode: removed tokens_s_* aliases; chars_s_* retained",
+    "batch: removed tokens_s_* and chars_s_*; count_s_* retained; count_unit renamed ids_and_documents",
+    "encode: retained tokens_s_*; count_unit ids"
+   ],
+   "note": "Units-only correction derived from unchanged rounds and counts; no seconds, counts, checksums, validation, profiles, or MiB/s values changed."
+  }
  },
  "models": {
   "bert-base-uncased": {
@@ -748,9 +765,6 @@
       "count_s_median": 375815397.0633494,
       "count_s_min": 369128433.2955851,
       "count_s_max": 388738974.9170662,
-      "tokens_s_median": 375815397.0633494,
-      "tokens_s_min": 369128433.2955851,
-      "tokens_s_max": 388738974.9170662,
       "chars_s_median": 375815397.0633494,
       "chars_s_min": 369128433.2955851,
       "chars_s_max": 388738974.9170662
@@ -766,9 +780,6 @@
       "count_s_median": 7971723.353933171,
       "count_s_min": 7825131.4643447185,
       "count_s_max": 8160418.881305325,
-      "tokens_s_median": 7971723.353933171,
-      "tokens_s_min": 7825131.4643447185,
-      "tokens_s_max": 8160418.881305325,
       "chars_s_median": 7971723.353933171,
       "chars_s_min": 7825131.4643447185,
       "chars_s_max": 8160418.881305325
@@ -1072,9 +1083,6 @@
       "count_s_median": 319748693.29080415,
       "count_s_min": 296292554.3900344,
       "count_s_max": 327598441.02533275,
-      "tokens_s_median": 319748693.29080415,
-      "tokens_s_min": 296292554.3900344,
-      "tokens_s_max": 327598441.02533275,
       "chars_s_median": 319748693.29080415,
       "chars_s_min": 296292554.3900344,
       "chars_s_max": 327598441.02533275
@@ -1090,9 +1098,6 @@
       "count_s_median": 25997739.567363076,
       "count_s_min": 25375922.07631282,
       "count_s_max": 27854568.788581003,
-      "tokens_s_median": 25997739.567363076,
-      "tokens_s_min": 25375922.07631282,
-      "tokens_s_max": 27854568.788581003,
       "chars_s_median": 25997739.567363076,
       "chars_s_min": 25375922.07631282,
       "chars_s_max": 27854568.788581003

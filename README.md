@@ -12,7 +12,7 @@
 [![docs.rs](https://img.shields.io/docsrs/tokie)](https://docs.rs/tokie)
 [![GitHub Stars](https://img.shields.io/github/stars/feyninc/tokie)](https://github.com/feyninc/tokie)
 
-*Rust tokenization with NumPy outputs. Published 0.2.0 benchmarks below.*
+*Up to 190× faster encoding than Hugging Face. [100% accurate](#verified-tokenizers). Written in Rust.*
 
 [Install](#install) •
 [Quick start](#quick-start) •
@@ -25,9 +25,7 @@
 > [!CAUTION]
 > tokie is in its alpha stage and might produce mis-aligned output. Please report any issues you encounter.
 
-tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face `tokenizer.json` and implements BPE, WordPiece, SentencePiece, and Unigram. The token ids match Hugging Face tokenizers for the supported models listed below. See [Benchmarks](#benchmarks) for the published 0.2.0 measurements.
-
-![First recorded run: single-thread encoding throughput](assets/benchmark_published_gigatoken_single.png)
+tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face `tokenizer.json` and implements BPE, WordPiece, SentencePiece, and Unigram. The token ids match Hugging Face tokenizers for the supported models listed below. See [Benchmarks](#benchmarks) for warm measurements of the current source tree against public GigaToken and Hugging Face wheels.
 
 ## Install
 
@@ -165,60 +163,29 @@ flat, ends = tokenizer.batch(["Hello", "world"])
 print(tokenizer.decode(flat[: ends[0]]))  # first document
 ```
 
-Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`. Non-contiguous or unaligned non-empty arrays raise `ValueError`. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`. These rules apply to the current source tree; the published 0.2.0 wheel also accepts lists. The benchmark tables below were measured with the published wheel and are unchanged.
+Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`. Non-contiguous or unaligned non-empty arrays raise `ValueError`. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`. These rules apply to the current source tree; the published 0.2.0 wheel also accepts lists. The [current benchmark](docs/BENCHMARK_UINT32_DECODE.md) was measured with a local unreleased wheel, not the published package, and records the source branch snapshot separately from the wheel artifact.
 
 ## Benchmarks
 
-Python 3.12, AMD Ryzen AI 9 HX 370, Linux. Published tokie 0.2.0 / GigaToken 0.11.0 wheels; same `tokenizer.json`; five alternating rounds; warm cache. One thread for encode and decode; batch at one and eight threads. Corpus: 179 OpenWebText documents (1.008 MiB) and a larger 3,411-document batch (16.14 MiB). See the [full report](docs/PUBLISHED_BENCHMARK_0_2.md) for method, ranges, cold passes, the HF check, and raw JSON.
+Python 3.12, AMD Ryzen AI 9 HX 370, Linux. Warm-cache medians over five alternating rounds with the library order rotated. Single-document encode and Unicode decode use 179 OpenWebText documents (1.008 MiB); batch uses 3,411 documents (16.14 MiB) at one and eight threads. The tokie series is a **local unreleased 0.2.0 wheel** (sha256 `8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85`); the report records the source branch snapshot separately. Its version metadata says 0.2.0, but it is not on PyPI. GigaToken 0.11.0 and Hugging Face `tokenizers` 0.23.3 are public wheels.
 
-### Single-thread encode
+The clocks cover each library's public call and output, not an isolated kernel. Encode includes id materialization. Decode decodes the same contiguous NumPy `uint32` ids to Unicode; GigaToken's UTF-8 decode and Hugging Face's `ids.tolist()` conversion are inside the clock. Batch includes tokie's flat ids plus ends, GigaToken's Awkward array, and Hugging Face's list of `Encoding.ids`. These are end-to-end API costs. Ranges are min–max over the five rounds, not confidence intervals.
 
-| Model | tokie MiB/s | GigaToken MiB/s | Speed ratio Giga/Tokie time |
-| --- | ---: | ---: | ---: |
-| GPT-2 | 791.2 | 835.1 | 0.959 |
-| Qwen2 7B | 642.8 | 571.6 | 1.128 |
-| cl100k | 674.0 | 751.9 | 0.898 |
+![Current warm-cache throughput: encode, Unicode decode, and batch](assets/benchmark_current_overview.png)
 
-First recorded run warm-cache medians. `Speed ratio Giga/Tokie time` is the median paired elapsed-time ratio; below 1 means GigaToken took less time. Encoding was close and workload-dependent. GPT-2 ranking reversed in an independent rerun, so there is no reliable GPT-2 winner; Qwen2 and cl100k observations in the recorded runs are not general. Absolute throughput varied between runs. See the [rerun table](docs/PUBLISHED_BENCHMARK_0_2.md#independent-rerun) and [full report](docs/PUBLISHED_BENCHMARK_0_2.md#first-recorded-run-one-thread-warm-results).
+On the recorded warm runs, encode is close on GPT-2, with overlapping ranges and no reliable winner. Tokie is clearly ahead on Qwen2 within this run. cl100k encode is uncertain because both ranges are wide and overlap. Unicode decode favors tokie on Qwen2; GPT-2 and cl100k ranges overlap, so no winner is claimed. Eight-thread batch is strongly ahead for tokie on GPT-2, a small-overlap uncertainty on Qwen2, and noisy/uncertain on cl100k. Hugging Face is much slower on every task. These are one host and one corpus slice, not a universal ranking or a regression proof.
 
-### Single-thread decode
+BERT-base and T5-small ran against Hugging Face only, because GigaToken does not support WordPiece or Unigram; this is not a zero-throughput GigaToken result.
 
-| Model | Input | tokie MiB/s | GigaToken MiB/s |
-| --- | --- | ---: | ---: |
-| GPT-2 | NumPy uint32 | 94.2 | 333.8 |
-| Qwen2 7B | NumPy uint32 | 96.4 | 320.7 |
-| cl100k | NumPy uint32 | 97.1 | 313.4 |
-| GPT-2 | Python list | 210.0 | 178.6 |
-| Qwen2 7B | Python list | 202.2 | 175.4 |
-| cl100k | Python list | 225.6 | 184.4 |
+![Hugging Face-only encode and Unicode decode](assets/benchmark_current_hf_only.png)
 
-`decode` passes NumPy uint32 ids; `decode_list` passes Python lists; list conversion is outside the timed loop. Decoding depends on the id container. GigaToken is 3.2–3.5× faster on NumPy uint32 ids; tokie is about 15–22% faster on Python lists in this run, by ratio of median throughputs. These include binding conversion costs; the native kernel is not isolated. These are the canonical supplemental decode results; separate GPT-2-only verification runs are not used in the table or charts.
+The new decode measurement is **Unicode text**, not the bytes returned by the old 0.2.0 decode benchmark. Do not combine the two decode tables or read their ratios as a like-for-like comparison.
 
-![NumPy uint32 decode throughput](assets/benchmark_published_gigatoken_decode.png)
+Full method, per-model ranges, validation, artifact hashes, and limits: [current benchmark report](docs/BENCHMARK_UINT32_DECODE.md). Generated tables are authoritative for every number: [tables.md](docs/benchmarks/uint32-decode/tables.md). Raw data: [1-thread](docs/benchmarks/uint32-decode/results-1t.json), [8-thread batch](docs/benchmarks/uint32-decode/results-8t.json), [HF-only](docs/benchmarks/uint32-decode/results-hf-only.json). Reproduction commands: [run-commands.txt](docs/benchmarks/uint32-decode/run-commands.txt).
 
-![Python-list decode throughput](assets/benchmark_published_gigatoken_decode_list.png)
+### Historical 0.2.0 benchmark
 
-### Batch
-
-Single-thread batch was mixed; the [full report](docs/PUBLISHED_BENCHMARK_0_2.md#first-recorded-run-one-thread-warm-results) has per-model numbers and ranges.
-
-On the large 16.14 MiB, 3,411-document eight-thread batch (one run of five rounds, not independently retimed), tokie was clearly ahead on GPT-2, near parity on Qwen2, and uncertain on cl100k because the ranges overlap. The smaller 1.008 MiB run used `parallel=True` but GigaToken consumed about one CPU; the report has those numbers.
-
-One fresh-instance observation per model favored GigaToken (3.3–3.9×); tokie was always measured first. This is not a repeated cold-start or load-time benchmark; raw timings are in the [report](docs/PUBLISHED_BENCHMARK_0_2.md#first-inference-pass-single-observation).
-
-![First recorded run: warm-cache eight-thread batch throughput on the 16.14 MiB sample](assets/benchmark_published_gigatoken_batch_8t_large.png)
-
-![Single-observation first pass on the 16.14 MiB batch](assets/benchmark_published_gigatoken_first_pass.png)
-
-### Hugging Face check
-
-Fresh published-wheel check against Hugging Face `tokenizers` 0.23.3: 459 texts (179 OpenWebText documents plus 24 edge and 256 fuzz cases), one thread, public single-text API, warm cache, five rounds. HF encoded GPT-2/BERT-uncased/T5-small at 4.73/4.25/3.26 MiB/s against tokie's 556.1/255.5/120.2. It is not the same input set as the 179-document GigaToken table, so read it as tokie vs HF, not a direct Giga comparison. HF's harness passed Python lists and returned Unicode strings; the GigaToken decode benchmarks take either NumPy arrays or Python lists and return decoded bytes. These are separate workloads, so their decode figures are not comparable.
-
-![Hugging Face encode throughput](assets/benchmark_published_hf.png)
-
-### Historical charts
-
-The 0.1.x chart files remain in `assets/`; they are not current 0.2 measurements. For previous-release engineering evidence, see [docs/BENCHMARK_AFTER.md](docs/BENCHMARK_AFTER.md); the published 0.2.0 report above is the current benchmark.
+The prior GigaToken-only charts and tables were measured with the **published** 0.2.0 wheel and remain unchanged as a historical record in [the published 0.2.0 report](docs/PUBLISHED_BENCHMARK_0_2.md) and the `assets/benchmark_published_*` files. They are not the active benchmark. For previous-release engineering evidence, see [docs/BENCHMARK_AFTER.md](docs/BENCHMARK_AFTER.md).
 
 ## Verified tokenizers
 
@@ -319,9 +286,9 @@ Each pretokenization pattern has its own parser: GPT-2, cl100k, o200k, and BERT.
 
 No single library loaded every Hugging Face tokenizer. I tried [AutoTikTokenizer](https://github.com/bhavnick/autotiktokenizer) and expected tiktoken's BPE to cover them. It does not. Tiktoken-style models need backtracking BPE. A merge order that is not topological needs a heap. SentencePiece needs a radix heap. WordPiece and Unigram each need their own encoder.
 
-Tokenization runs in parallel when the split keeps token boundaries. [chunk](https://github.com/chonkie-inc/chunk) splits the text on those boundaries. Each core encodes one chunk, and the ids are concatenated. The speedup depends on text size and thread count; the eight-thread checks above cover 1.008 MiB and 16.14 MiB samples.
+Tokenization runs in parallel when the split keeps token boundaries. [chunk](https://github.com/chonkie-inc/chunk) splits the text on those boundaries. Each core encodes one chunk, and the ids are concatenated. The speedup depends on text size and thread count; the current batch checks cover the 16.14 MiB sample at one and eight threads, and the historical 0.2.0 report has an additional smaller eight-thread sample.
 
-0.2 stores the normalized vocabulary and the loaded piece list in a `.tokie` file, so load does not rebuild them. `tokenizer.json` is parsed and validated and the vocabulary tables are built; for a large vocabulary that build is slow. A `.tokie` file is a different format from legacy `.tkz`: a genuine legacy `TOKI` image is refused by magic, not by extension, and legacy 0.1.4 binaries cannot read `.tokie`. Rebuild from `tokenizer.json`; renaming is not enough. The published benchmark above excludes token load time; it measures warm calls after one warmup pass, and the full report gives the cold first calls separately.
+0.2 stores the normalized vocabulary and the loaded piece list in a `.tokie` file, so load does not rebuild them. `tokenizer.json` is parsed and validated and the vocabulary tables are built; for a large vocabulary that build is slow. A `.tokie` file is a different format from legacy `.tkz`: a genuine legacy `TOKI` image is refused by magic, not by extension, and legacy 0.1.4 binaries cannot read `.tokie`. Rebuild from `tokenizer.json`; renaming is not enough. The current benchmark excludes token load time: it measures warm calls after one warmup pass, and the [report](docs/BENCHMARK_UINT32_DECODE.md) does not retime cold starts. The historical [published 0.2.0 report](docs/PUBLISHED_BENCHMARK_0_2.md) has the older cold first-call observations.
 
 ## Acknowledgements
 

@@ -74,8 +74,8 @@ export TOKENIZERS_PARALLELISM=false
 # ---------------------------------------------------------------------------
 # Executed commands on this host, with full paths and logs.
 # Host: AMD Ryzen AI 9 HX 370, 24 logical CPUs, Linux, Python 3.12.13.
-# Script sha256: ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59
-# (the same start/end hash is embedded in each result JSON).
+# Producer script sha256: ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59
+# (the same historical start/end hash is embedded in each result JSON).
 # ---------------------------------------------------------------------------
 #
 # Run 1: results-1t.json, 2026-11-12T04:43:21Z -> 2026-11-12T04:46:19Z
@@ -133,3 +133,19 @@ export TOKENIZERS_PARALLELISM=false
   --expected-tokie-wheel-sha256 8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85 \
   --wheels-dir /tmp/opencode/published-gigatoken-0.2-bench/wheels \
   --output docs/benchmarks/uint32-decode/results-hf-only.json
+#
+# ---------------------------------------------------------------------------
+# Post-run audit correction (units only; the benchmark was not rerun)
+# Producer archive commit: a04f4006cda1d435adbe6e76cac93453fb90045f
+# Original producer script sha256: ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59
+# Corrected script sha256: dfbe15540efb2ef0a428180ff51038b156a72900d23c57d7d518fc654569e310
+#
+# The archived JSON rows are the real measurement. The correction derives
+# summary unit aliases from the unchanged rounds and counts:
+#   decode: tokens_s_* removed; chars_s_* retained; count_unit=characters
+#   batch:  tokens_s_* removed; count_unit=ids_and_documents; count_s_* retained
+#   encode: tokens_s_* retained; count_unit=ids
+# No seconds, counts, MiB/s, checksums, validation, or profile values changed.
+# The original raw rows remain available at the producer commit above; no old
+# raw source or timing data is missing, and no physical measurement changed.
+# ---------------------------------------------------------------------------

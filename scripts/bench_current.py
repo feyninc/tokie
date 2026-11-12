@@ -499,13 +499,10 @@ def summarize(rounds, libs, numerator_bytes, count, passes, count_unit):
                 "count_s_median": count * passes / med,
                 "count_s_min": count * passes / max(secs),
                 "count_s_max": count * passes / min(secs)}
-        base["tokens_s_median"] = base["count_s_median"]
-        base["tokens_s_min"] = base["count_s_min"]
-        base["tokens_s_max"] = base["count_s_max"]
-        if count_unit != "ids":
-            base["chars_s_median"] = base["count_s_median"]
-            base["chars_s_min"] = base["count_s_min"]
-            base["chars_s_max"] = base["count_s_max"]
+        unit = "tokens" if count_unit == "ids" else "chars" if count_unit == "characters" else None
+        if unit:
+            for suffix in ("median", "min", "max"):
+                base[f"{unit}_s_{suffix}"] = base[f"count_s_{suffix}"]
         out[lib] = base
     return out
 
@@ -555,7 +552,7 @@ def run_task(label, task, libs, path, timing_texts, timing_ids, expected_decoded
     if task == "batch":
         documents = len(batch_texts)
         input_bytes = sum(len(x.encode("utf-8")) for x in batch_texts)
-        count_unit = "ids"
+        count_unit = "ids_and_documents"
         expected_count = int(len(large_flat)) + int(len(large_ends))
         decoded_bytes = 0
     elif task == "decode":
@@ -656,6 +653,8 @@ def main():
     installed = installed_artifacts(tokie, args.tokie_wheel)
     meta_version = wheel_metadata_version(args.tokie_wheel)
     pkg_tokie = package_meta("tokie")
+    pkg_giga = package_meta("gigatoken")
+    pkg_hf = package_meta("tokenizers")
     guard_error = None
     if not wheel_ok:
         guard_error = f"tokie wheel sha256 {tokie_wheel['sha256']} != expected {expected}"
@@ -686,9 +685,9 @@ def main():
     meta = {
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "argv": sys.argv,
-        "claim_scope": ("current-state warm throughput on one seeded OpenWebText slice; "
-                        "local unreleased tokie wheel vs public gigatoken 0.11.0 and "
-                        "public HF tokenizers 0.23.3; not a regression study"),
+        "claim_scope": (f"current-state warm throughput on one seeded OpenWebText slice; "
+                        f"local unreleased tokie wheel vs public gigatoken {pkg_giga['version']} and "
+                        f"public HF tokenizers {pkg_hf['version']}; not a regression study"),
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "executable": sys.executable,
@@ -716,13 +715,13 @@ def main():
                                "string does not identify this artifact and it is not claimed as published"),
             },
             "giga": {
-                "version": package_meta("gigatoken")["version"], "kind": "pypi",
+                "version": pkg_giga["version"], "kind": "pypi",
                 "import_path": gigatoken.__file__,
                 "wheel_sha256": giga_record["sha256"] if giga_record else None,
                 "wheel": giga_record, "installed_artifacts": giga_installed,
             },
             "hf": {
-                "version": package_meta("tokenizers")["version"], "kind": "pypi",
+                "version": pkg_hf["version"], "kind": "pypi",
                 "import_path": hf_mod.__file__,
                 "wheel_sha256": hf_record["sha256"] if hf_record else None,
                 "wheel": hf_record, "installed_artifacts": hf_installed,
@@ -768,7 +767,7 @@ def main():
                       "adapters": {"tokie": "Tokenizer.batch(texts) -> (flat uint32, ends uint64)",
                                    "giga": "Tokenizer.encode_batch(texts, parallel=n>1) -> awkward Array with leading 0 offset",
                                    "hf": "Tokenizer.encode_batch(texts, add_special_tokens=False) -> list[Encoding]; [e.ids] inside clock"},
-                      "counted_inside_clock": "all ids + documents", "count_unit": "ids",
+                      "counted_inside_clock": "all ids + documents", "count_unit": "ids_and_documents",
                       "count_includes_documents": True,
                       "note": "public output types differ; Giga is not flattened inside any clock; one pass per round; batch input is the larger seeded sample"},
         },

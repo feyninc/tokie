@@ -291,7 +291,7 @@
      "hf": "Tokenizer.encode_batch(texts, add_special_tokens=False) -> list[Encoding]; [e.ids] inside clock"
     },
     "counted_inside_clock": "all ids + documents",
-    "count_unit": "ids",
+    "count_unit": "ids_and_documents",
     "count_includes_documents": true,
     "note": "public output types differ; Giga is not flattened inside any clock; one pass per round; batch input is the larger seeded sample"
    }
@@ -394,7 +394,24 @@
    3.72265625,
    2.671875,
    1.94384765625
-  ]
+  ],
+  "summary_correction": {
+   "kind": "derived_units_only",
+   "original_producer_sha256": "ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59",
+   "archived_producer_commit": "a04f4006cda1d435adbe6e76cac93453fb90045f",
+   "corrected_by_script_sha256": "dfbe15540efb2ef0a428180ff51038b156a72900d23c57d7d518fc654569e310",
+   "measurements_changed": false,
+   "generated_utc_preserved": true,
+   "harness_sha256_preserved": true,
+   "original_harness_sha256_at_start": "ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59",
+   "original_harness_sha256_at_end": "ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59",
+   "changes": [
+    "decode: removed tokens_s_* aliases; chars_s_* retained",
+    "batch: removed tokens_s_* and chars_s_*; count_s_* retained; count_unit renamed ids_and_documents",
+    "encode: retained tokens_s_*; count_unit ids"
+   ],
+   "note": "Units-only correction derived from unchanged rounds and counts; no seconds, counts, checksums, validation, profiles, or MiB/s values changed."
+  }
  },
  "models": {
   "gpt2": {
@@ -537,7 +554,7 @@
     "input_bytes_utf8": 16924074,
     "decoded_bytes_utf8": 0,
     "throughput_numerator": "input_bytes_utf8",
-    "count_unit": "ids",
+    "count_unit": "ids_and_documents",
     "count_includes_documents": true,
     "passes_per_round": 1,
     "rounds": [
@@ -659,7 +676,7 @@
     ],
     "summary": {
      "tokie": {
-      "count_unit": "ids",
+      "count_unit": "ids_and_documents",
       "seconds_median": 0.009140747002675198,
       "seconds_min": 0.00753694299783092,
       "seconds_max": 0.01053539800341241,
@@ -668,13 +685,10 @@
       "mib_s_max": 2141.4590381543003,
       "count_s_median": 422528924.48173565,
       "count_s_min": 366595547.5767527,
-      "count_s_max": 512439858.058038,
-      "tokens_s_median": 422528924.48173565,
-      "tokens_s_min": 366595547.5767527,
-      "tokens_s_max": 512439858.058038
+      "count_s_max": 512439858.058038
      },
      "giga": {
-      "count_unit": "ids",
+      "count_unit": "ids_and_documents",
       "seconds_median": 0.018498241988709196,
       "seconds_min": 0.01626685800147243,
       "seconds_max": 0.02397034500609152,
@@ -683,13 +697,10 @@
       "mib_s_max": 992.2048069330807,
       "count_s_median": 208789029.9174049,
       "count_s_min": 161125340.45790753,
-      "count_s_max": 237429379.3952343,
-      "tokens_s_median": 208789029.9174049,
-      "tokens_s_min": 161125340.45790753,
-      "tokens_s_max": 237429379.3952343
+      "count_s_max": 237429379.3952343
      },
      "hf": {
-      "count_unit": "ids",
+      "count_unit": "ids_and_documents",
       "seconds_median": 0.8933186860085698,
       "seconds_min": 0.8691138489957666,
       "seconds_max": 0.940742268008762,
@@ -698,10 +709,7 @@
       "mib_s_max": 18.570702470577483,
       "count_s_median": 4323462.679658924,
       "count_s_min": 4105513.413546363,
-      "count_s_max": 4443871.1964637125,
-      "tokens_s_median": 4323462.679658924,
-      "tokens_s_min": 4105513.413546363,
-      "tokens_s_max": 4443871.1964637125
+      "count_s_max": 4443871.1964637125
      }
     },
     "post_check": {
@@ -754,7 +762,7 @@
     "input_bytes_utf8": 16924074,
     "decoded_bytes_utf8": 0,
     "throughput_numerator": "input_bytes_utf8",
-    "count_unit": "ids",
+    "count_unit": "ids_and_documents",
     "count_includes_documents": true,
     "passes_per_round": 1,
     "rounds": [
@@ -876,7 +884,7 @@
     ],
     "summary": {
      "tokie": {
-      "count_unit": "ids",
+      "count_unit": "ids_and_documents",
       "seconds_median": 0.013531457996577956,
       "seconds_min": 0.009076627000467852,
       "seconds_max": 0.014776667987462133,
@@ -885,13 +893,10 @@
       "mib_s_max": 1778.199622164363,
       "count_s_median": 277206417.88553846,
       "count_s_min": 253846604.87619367,
-      "count_s_max": 413260013.8583039,
-      "tokens_s_median": 277206417.88553846,
-      "tokens_s_min": 253846604.87619367,
-      "tokens_s_max": 413260013.8583039
+      "count_s_max": 413260013.8583039
      },
      "giga": {
-      "count_unit": "ids",
+      "count_unit": "ids_and_documents",
       "seconds_median": 0.019475938999676146,
       "seconds_min": 0.01421253799344413,
       "seconds_max": 0.029142764993594028,
@@ -900,13 +905,10 @@
       "mib_s_max": 1135.6208659005008,
       "count_s_median": 192596978.25416136,
       "count_s_min": 128711431.49335767,
-      "count_s_max": 263922390.33804104,
-      "tokens_s_median": 192596978.25416136,
-      "tokens_s_min": 128711431.49335767,
-      "tokens_s_max": 263922390.33804104
+      "count_s_max": 263922390.33804104
      },
      "hf": {
-      "count_unit": "ids",
+      "count_unit": "ids_and_documents",
       "seconds_median": 0.9857803839986445,
       "seconds_min": 0.940567536992603,
       "seconds_max": 1.0365863979968708,
@@ -915,10 +917,7 @@
       "mib_s_max": 17.159910445522552,
       "count_s_median": 3805114.2636706773,
       "count_s_min": 3618614.9145392543,
-      "count_s_max": 3988025.157654893,
-      "tokens_s_median": 3805114.2636706773,
-      "tokens_s_min": 3618614.9145392543,
-      "tokens_s_max": 3988025.157654893
+      "count_s_max": 3988025.157654893
      }
     },
     "post_check": {
@@ -971,7 +970,7 @@
     "input_bytes_utf8": 16924074,
     "decoded_bytes_utf8": 0,
     "throughput_numerator": "input_bytes_utf8",
-    "count_unit": "ids",
+    "count_unit": "ids_and_documents",
     "count_includes_documents": true,
     "passes_per_round": 1,
     "rounds": [
@@ -1093,7 +1092,7 @@
     ],
     "summary": {
      "tokie": {
-      "count_unit": "ids",
+      "count_unit": "ids_and_documents",
       "seconds_median": 0.01012432599964086,
       "seconds_min": 0.009467622003285214,
       "seconds_max": 0.014074387989239767,
@@ -1102,13 +1101,10 @@
       "mib_s_max": 1704.763318302978,
       "count_s_median": 361401045.37623477,
       "count_s_min": 259971659.35722077,
-      "count_s_max": 386468956.90706354,
-      "tokens_s_median": 361401045.37623477,
-      "tokens_s_min": 259971659.35722077,
-      "tokens_s_max": 386468956.90706354
+      "count_s_max": 386468956.90706354
      },
      "giga": {
-      "count_unit": "ids",
+      "count_unit": "ids_and_documents",
       "seconds_median": 0.013221325993072242,
       "seconds_min": 0.007732491008937359,
       "seconds_max": 0.026677544010453857,
@@ -1117,13 +1113,10 @@
       "mib_s_max": 2087.303390861213,
       "count_s_median": 276745464.25352687,
       "count_s_min": 137154379.67476344,
-      "count_s_max": 473190592.2387657,
-      "tokens_s_median": 276745464.25352687,
-      "tokens_s_min": 137154379.67476344,
-      "tokens_s_max": 473190592.2387657
+      "count_s_max": 473190592.2387657
      },
      "hf": {
-      "count_unit": "ids",
+      "count_unit": "ids_and_documents",
       "seconds_median": 0.9346555310039548,
       "seconds_min": 0.9195675339869922,
       "seconds_max": 1.0624403810070362,
@@ -1132,10 +1125,7 @@
       "mib_s_max": 17.551788320298723,
       "count_s_median": 3914749.2082668883,
       "count_s_min": 3443903.361929697,
-      "count_s_max": 3978981.2762699793,
-      "tokens_s_median": 3914749.2082668883,
-      "tokens_s_min": 3443903.361929697,
-      "tokens_s_max": 3978981.2762699793
+      "count_s_max": 3978981.2762699793
      }
     },
     "post_check": {

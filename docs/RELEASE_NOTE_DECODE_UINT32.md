@@ -56,3 +56,5 @@ The `ends` array from `batch` is `uint64`; it is not decode input. Use it to sli
 ## Compatibility
 
 The published 0.2.0 wheel still accepts Python lists and tuples. Historical 0.2.0 examples, release notes, and benchmark results remain valid for that wheel and are not rewritten. The root README, [API guide](API.md), and [migration guide](MIGRATION.md) describe the current source tree and pass arrays directly; those examples also work with the published wheel. The 0.2.0 release notes and the 0.2 API changes page carry a banner pointing here.
+
+The current-source uint32 decode benchmark is separate from the published 0.2.0 measurements: [docs/BENCHMARK_UINT32_DECODE.md](BENCHMARK_UINT32_DECODE.md). It uses a local unreleased wheel and does not change the published package.
