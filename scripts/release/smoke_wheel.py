@@ -465,8 +465,9 @@ def verify_sdist(archive: Path, expected_version: str) -> None:
         fail("sdist is missing the tokie-python src/lib.rs")
 
     for crate in ("normalie", "pretokie", "tokie", "tokie-python"):
-        if not any(crate in name and name.endswith("Cargo.toml") for name in names):
-            fail(f"sdist does not bundle the {crate} workspace crate")
+        manifest = f"{top}/crates/{crate}/Cargo.toml"
+        if manifest not in names:
+            fail(f"sdist does not bundle the {crate} workspace crate ({manifest})")
 
     if any(name.endswith(".whl") for name in names):
         fail("sdist unexpectedly contains a wheel")

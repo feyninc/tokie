@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -29,6 +30,14 @@ import check_versions  # noqa: E402
 import smoke_wheel  # noqa: E402
 
 PUBLISH = HERE / "publish_crate.sh"
+
+
+def write_sdist(path: Path, names: list[str]) -> None:
+    with tarfile.open(path, "w:gz") as tar:
+        for name in names:
+            info = tarfile.TarInfo(name)
+            info.size = 0
+            tar.addfile(info)
 
 
 def run_publish(
@@ -94,6 +103,18 @@ class VersionTests(unittest.TestCase):
             check_versions.version_from_tag("0.2.0")
         self.assertEqual(check_versions.version_from_tag("v0.2.0"), "0.2.0")
 
+    def test_semver_prerelease_identifiers(self) -> None:
+        for value in ("0.2.0-0", "0.2.0-rc.1", "0.2.0-01a"):
+            with self.subTest(value=value):
+                self.assertEqual(check_versions.parse_semver(value, "version"), value)
+        for value in ("0.2.0-01", "0.2.0-rc.01"):
+            with (
+                self.subTest(value=value),
+                redirect_stderr(StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                check_versions.parse_semver(value, "version")
+
     def test_exact_requirement_spellings(self) -> None:
         for requirement in ("0.1.0", "=0.1.0", "^0.1.0", "~0.1.0"):
             self.assertTrue(
@@ -135,6 +156,47 @@ class WheelTests(unittest.TestCase):
 
     def test_sdist_version(self) -> None:
         self.assertEqual(smoke_wheel.sdist_version(Path("tokie-0.2.0.tar.gz")), "0.2.0")
+
+    SDIST_FILES = (
+        "pyproject.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "PKG-INFO",
+        "README_PYPI.md",
+        "src/lib.rs",
+        "crates/normalie/Cargo.toml",
+        "crates/pretokie/Cargo.toml",
+        "crates/tokie/Cargo.toml",
+        "crates/tokie-python/Cargo.toml",
+    )
+
+    def make_sdist(self, directory: Path, omit: str | None = None) -> Path:
+        top = "tokie-0.2.0"
+        names = [f"{top}/{name}" for name in self.SDIST_FILES if name != omit]
+        archive = directory / "tokie-0.2.0.tar.gz"
+        write_sdist(archive, names)
+        return archive
+
+    def test_verify_sdist_accepts_full_archive(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tokie-sdist-") as directory:
+            archive = self.make_sdist(Path(directory))
+            smoke_wheel.verify_sdist(archive, "0.2.0")
+
+    def test_verify_sdist_rejects_missing_tokie_with_pretokie_present(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tokie-sdist-") as directory:
+            archive = self.make_sdist(Path(directory), omit="crates/tokie/Cargo.toml")
+            stderr = StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit):
+                smoke_wheel.verify_sdist(archive, "0.2.0")
+            self.assertIn("tokie workspace crate", stderr.getvalue())
+
+    def test_verify_sdist_rejects_missing_other_crate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tokie-sdist-") as directory:
+            archive = self.make_sdist(Path(directory), omit="crates/normalie/Cargo.toml")
+            stderr = StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit):
+                smoke_wheel.verify_sdist(archive, "0.2.0")
+            self.assertIn("normalie workspace crate", stderr.getvalue())
 
     def test_synthetic_fixture_shape(self) -> None:
         fixture = json.loads(smoke_wheel.FULL_TEXT)

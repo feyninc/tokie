@@ -19,8 +19,10 @@ facade; there is no full 0.1.4 guarantee.
   `Plus::new(text).pair(other).truncate(n).pad(n)` adds a pair, a cut, or
   padding. One `max_len` counts template ids; truncation drops from the
   right of the longer sequence first, and padding is fixed on the right.
-- `batch` fills one id buffer and `Vec<usize>` cumulative ends. Text `i` is
-  `ids[prev..ends[i]]`; ends are not per-text lengths.
+- `batch` appends into one id buffer and a `Vec<usize>` of cumulative ends.
+  Record `ids.len()` and `ends.len()` before the call: the first new text starts
+  at the old `ids.len()`, and the new ends are absolute `ids.len()` boundaries
+  for each text, not per-text lengths. Existing ids and ends stay in place.
 - `decode` appends into the caller's `String` and takes `Specials::Keep` or
   `Specials::Skip`. `decode_bytes` returns raw bytes. `Specials::Skip` omits
   specials in both.
