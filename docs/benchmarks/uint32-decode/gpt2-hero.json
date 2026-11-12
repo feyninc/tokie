@@ -1,0 +1,784 @@
+{
+  "schema_version": 1,
+  "task": "encode_one_text_to_ids",
+  "model": "gpt2",
+  "status": "ok",
+  "errors": [],
+  "generated_utc": "2026-11-12T05:27:50Z",
+  "meta": {
+    "claim_scope": "GPT-2 full public single-text encode to token ids on one seeded OpenWebText slice; one thread, one host, one fresh experiment. Not a universal fastest-tokenizer claim.",
+    "python": "3.12.13",
+    "platform": "Linux-7.1.7-x86_64-with-glibc2.42",
+    "cpu_model": "AMD Ryzen AI 9 HX 370 w/ Radeon 890M",
+    "cpu_count": 24,
+    "load_before": [
+      2.1435546875,
+      1.44970703125,
+      1.54052734375
+    ],
+    "env": {
+      "RAYON_NUM_THREADS": "1",
+      "TOKENIZERS_PARALLELISM": "false",
+      "OPENBLAS_NUM_THREADS": "1",
+      "OMP_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "NUMEXPR_NUM_THREADS": "1",
+      "VECLIB_MAXIMUM_THREADS": "1"
+    },
+    "host": {
+      "governors": {
+        "powersave": 24
+      },
+      "scaling_drivers": {
+        "amd-pstate-epp": 24
+      },
+      "cpus_with_freq": 24,
+      "mean_cur_freq_mhz": 1437.1,
+      "min_cur_freq_mhz": 605.3,
+      "max_cur_freq_mhz": 2779.4,
+      "load_after": [
+        2.43212890625,
+        1.591796875,
+        1.58544921875
+      ],
+      "snapshot_after": {
+        "governors": {
+          "powersave": 24
+        },
+        "scaling_drivers": {
+          "amd-pstate-epp": 24
+        },
+        "cpus_with_freq": 24,
+        "mean_cur_freq_mhz": 1590.7,
+        "min_cur_freq_mhz": 605.3,
+        "max_cur_freq_mhz": 4110.0
+      }
+    },
+    "corpus": {
+      "jsonl": "/tmp/opencode/tokie-compat/corpus/owt_20m.jsonl",
+      "jsonl_sha256": "20dc6601bee15f270b7a2c35cfde6cd2f073f8c15567c76b913453157d2c67db",
+      "jsonl_bytes": 21281368,
+      "seed": 20261111,
+      "max_chars": 1048576,
+      "documents": 179,
+      "sample_utf8_bytes": 1057339,
+      "sample_chars": 1048248,
+      "validation_texts": 459,
+      "edge_texts": 24,
+      "fuzz_texts": 256
+    },
+    "tokenizer": {
+      "path": "/home/bhavnick/.cache/huggingface/hub/models--openai-community--gpt2/blobs/4b988bccc9dc5adacd403c00b4704976196548f8",
+      "sha256": "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6",
+      "bytes": 1355256,
+      "normalizer": "none"
+    },
+    "protocol": {
+      "threads": 1,
+      "rounds": 5,
+      "passes": 10,
+      "warmup_passes": 3,
+      "round_order": "latin rotation of the six libraries, one fresh child process per library per round",
+      "timed_region": "passes x all sample documents; len(ids) and accumulation inside the clock",
+      "outside_clock": "import, model load, warmup passes, and the id-checksum pass",
+      "thread_pools": "Rayon, tokenizers, OpenBLAS/OMP/MKL, numexpr, and vecLib pools are all pinned to 1",
+      "rounds_are": "min/max ranges over rounds, not a confidence interval"
+    },
+    "libraries": {
+      "tokie": {
+        "distribution": "tokie",
+        "version": "0.2.0",
+        "module_version": null,
+        "python": "3.12.13",
+        "executable": "/tmp/opencode/gpt2-hero/envs/stable/bin/python",
+        "import_path": "/tmp/opencode/gpt2-hero/envs/stable/lib/python3.12/site-packages/tokie/__init__.py",
+        "api": "tokie.Tokenizer.open(path); threads(1); tokenizer.encode(text) -> numpy uint32 ids; len(ids) in clock",
+        "special_policy": "recognizes '<|endoftext|>' as id 50256 from the HF tokenizer.json",
+        "load_seconds": 0.07779906400537584,
+        "wheel": {
+          "file": "tokie-0.2.0-cp312-cp312-manylinux_2_34_x86_64.whl",
+          "sha256": "8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85",
+          "members": {
+            "tokie/tokie.cpython-312-x86_64-linux-gnu.so": "f9e7abb0e3d5873f5f68bda5b998b6575982ab4637fc3aed9dec17f2c0e482f3"
+          }
+        },
+        "installed_native": [
+          {
+            "path": "tokie/tokie.cpython-312-x86_64-linux-gnu.so",
+            "sha256": "f9e7abb0e3d5873f5f68bda5b998b6575982ab4637fc3aed9dec17f2c0e482f3"
+          }
+        ],
+        "installed_native_matches_wheel": true
+      },
+      "giga": {
+        "distribution": "gigatoken",
+        "version": "0.11.0",
+        "module_version": null,
+        "python": "3.12.13",
+        "executable": "/tmp/opencode/gpt2-hero/envs/stable/bin/python",
+        "import_path": "/tmp/opencode/gpt2-hero/envs/stable/lib/python3.12/site-packages/gigatoken/__init__.py",
+        "api": "gigatoken.Tokenizer(path); tokenizer.encode(text) -> numpy uint32 ids; len(ids) in clock",
+        "special_policy": "recognizes '<|endoftext|>' as id 50256 from the HF tokenizer.json",
+        "load_seconds": 0.07102803999441676,
+        "wheel": {
+          "file": "gigatoken-0.11.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+          "sha256": "11992abc7f41e41e5be03c722df1c5205b5d0fcc4bcbd4fb440d2a0b97f7ac3f",
+          "members": {
+            "gigatoken/gigatoken_rs.abi3.so": "b2acb2252bb342496d2921123caaa3e4f4be45c285d7875e4c20fa0312cdaf4d"
+          }
+        },
+        "installed_native": [
+          {
+            "path": "gigatoken/gigatoken_rs.abi3.so",
+            "sha256": "b2acb2252bb342496d2921123caaa3e4f4be45c285d7875e4c20fa0312cdaf4d"
+          }
+        ],
+        "installed_native_matches_wheel": true
+      },
+      "hf023": {
+        "distribution": "tokenizers",
+        "version": "0.23.3",
+        "module_version": "0.23.3",
+        "python": "3.12.13",
+        "executable": "/tmp/opencode/gpt2-hero/envs/stable/bin/python",
+        "import_path": "/tmp/opencode/gpt2-hero/envs/stable/lib/python3.12/site-packages/tokenizers/__init__.py",
+        "api": "tokenizers.Tokenizer.from_file(path); tokenizer.encode(text, add_special_tokens=False).ids; len(ids) in clock",
+        "special_policy": "add_special_tokens=False adds nothing; an existing '<|endoftext|>' literal still maps to 50256",
+        "load_seconds": 0.05236599699128419,
+        "wheel": {
+          "file": "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+          "sha256": "376851d22bcf9d650a5c3090bb83e6cf9e895fbf0595369fa4cd43c1f69b5f87",
+          "members": {
+            "tokenizers/tokenizers.abi3.so": "4b1458a379296762a034d3bc89299c0c35b4eefb0577acca922f481b262c65a1"
+          }
+        },
+        "installed_native": [
+          {
+            "path": "tokenizers/tokenizers.abi3.so",
+            "sha256": "4b1458a379296762a034d3bc89299c0c35b4eefb0577acca922f481b262c65a1"
+          }
+        ],
+        "installed_native_matches_wheel": true
+      },
+      "hf1": {
+        "distribution": "tokenizers",
+        "version": "1.0.0rc4",
+        "module_version": "1.0.0-rc.4",
+        "python": "3.12.13",
+        "executable": "/tmp/opencode/gpt2-hero/envs/hf1/bin/python",
+        "import_path": "/tmp/opencode/gpt2-hero/envs/hf1/lib/python3.12/site-packages/tokenizers/__init__.py",
+        "api": "tokenizers.Tokenizer.from_file(path).compile(); compiled.encode(text, add_special_tokens=False).ids; len(ids) in clock",
+        "special_policy": "add_special_tokens=False adds nothing; encode_special_tokens defaults to False, so the literal maps to 50256",
+        "load_seconds": 0.08168186200782657,
+        "wheel": {
+          "file": "tokenizers-1.0.0rc4-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "sha256": "ecea8dc0d5d08a9e855931989ca60591f7aa2c16d7573862635c15a3c132b332",
+          "members": {
+            "tokenizers/tokenizers.abi3.so": "b9817e4918e999b0cf59302950e114f27bfd8f94574d9d1693e81053d85d1d77"
+          }
+        },
+        "installed_native": [
+          {
+            "path": "tokenizers/tokenizers.abi3.so",
+            "sha256": "b9817e4918e999b0cf59302950e114f27bfd8f94574d9d1693e81053d85d1d77"
+          }
+        ],
+        "installed_native_matches_wheel": true
+      },
+      "kitoken": {
+        "distribution": "kitoken",
+        "version": "0.11.1",
+        "module_version": null,
+        "python": "3.12.13",
+        "executable": "/tmp/opencode/gpt2-hero/envs/stable/bin/python",
+        "import_path": "/tmp/opencode/gpt2-hero/envs/stable/lib/python3.12/site-packages/kitoken/__init__.py",
+        "api": "kitoken.Kitoken.from_file(path); tokenizer.encode(text, encode_specials=True) -> list[int]; len(ids) in clock",
+        "special_policy": "encode_specials=True explicitly, because the default False encodes '<|endoftext|>' as regular text (7 ids) and cannot match the HF ids",
+        "load_seconds": 0.05836019899288658,
+        "wheel": {
+          "file": "kitoken-0.11.1-cp310-abi3-manylinux_2_28_x86_64.whl",
+          "sha256": "50728d5adcc3c5b4af1d71ea30e22e8a2809bf3b8a56de0df1c184a54279d13c",
+          "members": {
+            "kitoken/kitoken.abi3.so": "a3c9b8a248e5b1a1d590ef35f876c56db1777f4af46446b8b7d4c989635f99fd"
+          }
+        },
+        "installed_native": [
+          {
+            "path": "kitoken/kitoken.abi3.so",
+            "sha256": "a3c9b8a248e5b1a1d590ef35f876c56db1777f4af46446b8b7d4c989635f99fd"
+          }
+        ],
+        "installed_native_matches_wheel": true
+      },
+      "tiktoken": {
+        "distribution": "tiktoken",
+        "version": "0.14.0",
+        "module_version": "0.14.0",
+        "python": "3.12.13",
+        "executable": "/tmp/opencode/gpt2-hero/envs/stable/bin/python",
+        "import_path": "/tmp/opencode/gpt2-hero/envs/stable/lib/python3.12/site-packages/tiktoken/__init__.py",
+        "api": "tiktoken.get_encoding('gpt2'); encoding.encode(text, allowed_special={'<|endoftext|>'}) -> list[int]; len(ids) in clock",
+        "special_policy": "allowed_special={'<|endoftext|>'} explicitly; the default raises on that literal",
+        "load_seconds": 0.14179090099059977,
+        "wheel": {
+          "file": "tiktoken-0.14.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+          "sha256": "7896eea257fe497a2b7134474d909156c6744ce8da35bce88011a960e008aa0d",
+          "members": {
+            "tiktoken/_tiktoken.cpython-312-x86_64-linux-gnu.so": "889c237c20a61bb52155821a8184989920850905f2dc1716245fd222f498e8c5"
+          }
+        },
+        "installed_native": [
+          {
+            "path": "tiktoken/_tiktoken.cpython-312-x86_64-linux-gnu.so",
+            "sha256": "889c237c20a61bb52155821a8184989920850905f2dc1716245fd222f498e8c5"
+          }
+        ],
+        "installed_native_matches_wheel": true
+      }
+    },
+    "versions": {
+      "tokie": "0.2.0",
+      "giga": "0.11.0",
+      "hf023": "0.23.3",
+      "hf1": "1.0.0rc4",
+      "kitoken": "0.11.1",
+      "tiktoken": "0.14.0"
+    },
+    "artifacts": {
+      "tokie": {
+        "wheel_file": "tokie-0.2.0-cp312-cp312-manylinux_2_34_x86_64.whl",
+        "wheel_sha256": "8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85",
+        "wheel_members_sha256": {
+          "tokie/tokie.cpython-312-x86_64-linux-gnu.so": "f9e7abb0e3d5873f5f68bda5b998b6575982ab4637fc3aed9dec17f2c0e482f3"
+        }
+      },
+      "giga": {
+        "wheel_file": "gigatoken-0.11.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "wheel_sha256": "11992abc7f41e41e5be03c722df1c5205b5d0fcc4bcbd4fb440d2a0b97f7ac3f",
+        "wheel_members_sha256": {
+          "gigatoken/gigatoken_rs.abi3.so": "b2acb2252bb342496d2921123caaa3e4f4be45c285d7875e4c20fa0312cdaf4d"
+        }
+      },
+      "hf023": {
+        "wheel_file": "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "wheel_sha256": "376851d22bcf9d650a5c3090bb83e6cf9e895fbf0595369fa4cd43c1f69b5f87",
+        "wheel_members_sha256": {
+          "tokenizers/tokenizers.abi3.so": "4b1458a379296762a034d3bc89299c0c35b4eefb0577acca922f481b262c65a1"
+        }
+      },
+      "hf1": {
+        "wheel_file": "tokenizers-1.0.0rc4-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        "wheel_sha256": "ecea8dc0d5d08a9e855931989ca60591f7aa2c16d7573862635c15a3c132b332",
+        "wheel_members_sha256": {
+          "tokenizers/tokenizers.abi3.so": "b9817e4918e999b0cf59302950e114f27bfd8f94574d9d1693e81053d85d1d77"
+        }
+      },
+      "kitoken": {
+        "wheel_file": "kitoken-0.11.1-cp310-abi3-manylinux_2_28_x86_64.whl",
+        "wheel_sha256": "50728d5adcc3c5b4af1d71ea30e22e8a2809bf3b8a56de0df1c184a54279d13c",
+        "wheel_members_sha256": {
+          "kitoken/kitoken.abi3.so": "a3c9b8a248e5b1a1d590ef35f876c56db1777f4af46446b8b7d4c989635f99fd"
+        }
+      },
+      "tiktoken": {
+        "wheel_file": "tiktoken-0.14.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "wheel_sha256": "7896eea257fe497a2b7134474d909156c6744ce8da35bce88011a960e008aa0d",
+        "wheel_members_sha256": {
+          "tiktoken/_tiktoken.cpython-312-x86_64-linux-gnu.so": "889c237c20a61bb52155821a8184989920850905f2dc1716245fd222f498e8c5"
+        }
+      }
+    },
+    "harness": {
+      "script": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_gpt2.py",
+      "sha256": "f9de7e9804acca2d6275c28a348f21855dce699e4143f2dfd3d7cec1ec625a64",
+      "git_head": "8ba81969fbd1cb36cacf6e4d763adea194da4a7c",
+      "git_status_porcelain": "?? docs/benchmarks/uint32-decode/gpt2-hero-commands.txt\n?? docs/benchmarks/uint32-decode/gpt2-hero.json\n?? scripts/bench_gpt2.py\n?? scripts/generate_gpt2_chart.py\n?? scripts/test_bench_gpt2.py\n?? scripts/test_gpt2_chart.py"
+    },
+    "api_notes": {
+      "hf023": "installed stub: Tokenizer.encode(text, add_special_tokens=False) -> Encoding; Encoding.ids is list[int]. This is the only encode API in 0.23.3.",
+      "hf1": "installed 1.0.0rc4 stub: Tokenizer.compile() -> CompiledTokenizer; encode(text, add_special_tokens=False) -> Encoding; Encoding.ids is list[int]; Encoding.ids_array returns a copy. No encode_fast or ids-only method exists, and offsets are not returned unless requested, so the documented encode(...).ids path is used.",
+      "kitoken": "installed kitoken.pyi: Kitoken.from_file(path) -> Kitoken; encode(text, encode_specials=False) -> list[int]. Default False does not match the HF ids for '<|endoftext|>'; encode_specials=True is used and disclosed.",
+      "tiktoken": "tiktoken.get_encoding('gpt2').encode(text, allowed_special=...) -> list[int]. The gpt2 ranks are the canonical OpenAI BPE; allowed_special is passed explicitly.",
+      "tokie": "installed binding: Tokenizer.open(path); threads(n) only changes batch workers; encode(text) returns a uint32 numpy array.",
+      "giga": "installed binding: Tokenizer(path); encode(text) returns a uint32 numpy array; no thread control on single-text encode."
+    },
+    "tiktoken_vocab_check": {
+      "hf_vocab_entries": 50257,
+      "hf_vocab_non_special_entries": 50256,
+      "ranks_checked": 50256,
+      "rank_mismatches": 0,
+      "first_rank_mismatch": null,
+      "hf_specials": 1,
+      "special_mismatches": 0,
+      "first_special_mismatch": null,
+      "tiktoken_n_vocab": 50257
+    },
+    "elapsed_seconds": 33.88,
+    "command": [
+      "/etc/profiles/per-user/bhavnick/bin/python3",
+      "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_gpt2.py",
+      "--corpus",
+      "/tmp/opencode/tokie-compat/corpus/owt_20m.jsonl",
+      "--tokenizer",
+      "/home/bhavnick/.cache/huggingface/hub/models--openai-community--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e/tokenizer.json",
+      "--tokie-wheel",
+      "/tmp/opencode/decode-u32-after/dist/tokie-0.2.0-cp312-cp312-manylinux_2_34_x86_64.whl",
+      "--wheels-dir",
+      "/tmp/opencode/gpt2-hero/wheels",
+      "--python",
+      "tokie=/tmp/opencode/gpt2-hero/envs/stable/bin/python",
+      "--python",
+      "giga=/tmp/opencode/gpt2-hero/envs/stable/bin/python",
+      "--python",
+      "hf023=/tmp/opencode/gpt2-hero/envs/stable/bin/python",
+      "--python",
+      "hf1=/tmp/opencode/gpt2-hero/envs/hf1/bin/python",
+      "--python",
+      "kitoken=/tmp/opencode/gpt2-hero/envs/stable/bin/python",
+      "--python",
+      "tiktoken=/tmp/opencode/gpt2-hero/envs/stable/bin/python",
+      "--rounds",
+      "5",
+      "--passes",
+      "10",
+      "--warmup",
+      "3",
+      "--expected-tokie-sha256",
+      "8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85",
+      "--output",
+      "docs/benchmarks/uint32-decode/gpt2-hero.json"
+    ]
+  },
+  "validation": {
+    "tokie": {
+      "ok": true,
+      "vs": "hf023",
+      "texts": 459,
+      "tokens": 253419,
+      "mismatches": 0,
+      "first_mismatch": null,
+      "checksum": "3f74aa9e68a7433ef98dd5103d70bd97f29c8c1b14043029610ab5932fb882b0"
+    },
+    "giga": {
+      "ok": true,
+      "vs": "hf023",
+      "texts": 459,
+      "tokens": 253419,
+      "mismatches": 0,
+      "first_mismatch": null,
+      "checksum": "3f74aa9e68a7433ef98dd5103d70bd97f29c8c1b14043029610ab5932fb882b0"
+    },
+    "hf023": {
+      "ok": true,
+      "vs": "hf023",
+      "texts": 459,
+      "tokens": 253419,
+      "mismatches": 0,
+      "first_mismatch": null,
+      "checksum": "3f74aa9e68a7433ef98dd5103d70bd97f29c8c1b14043029610ab5932fb882b0"
+    },
+    "hf1": {
+      "ok": true,
+      "vs": "hf023",
+      "texts": 459,
+      "tokens": 253419,
+      "mismatches": 0,
+      "first_mismatch": null,
+      "checksum": "3f74aa9e68a7433ef98dd5103d70bd97f29c8c1b14043029610ab5932fb882b0"
+    },
+    "kitoken": {
+      "ok": true,
+      "vs": "hf023",
+      "texts": 459,
+      "tokens": 253419,
+      "mismatches": 0,
+      "first_mismatch": null,
+      "checksum": "3f74aa9e68a7433ef98dd5103d70bd97f29c8c1b14043029610ab5932fb882b0"
+    },
+    "tiktoken": {
+      "ok": true,
+      "vs": "hf023",
+      "texts": 459,
+      "tokens": 253419,
+      "mismatches": 0,
+      "first_mismatch": null,
+      "checksum": "3f74aa9e68a7433ef98dd5103d70bd97f29c8c1b14043029610ab5932fb882b0"
+    }
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "order": [
+        "tokie",
+        "giga",
+        "hf023",
+        "hf1",
+        "kitoken",
+        "tiktoken"
+      ],
+      "libraries": {
+        "tokie": {
+          "seconds": 0.014217338000889868,
+          "process_seconds": 0.014131400999999988,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 709.244619472052,
+          "cpu_wall_ratio": 0.9939554788045061
+        },
+        "giga": {
+          "seconds": 0.01354518299922347,
+          "process_seconds": 0.013476734000000046,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 744.4395901424705,
+          "cpu_wall_ratio": 0.9949466168727769
+        },
+        "hf023": {
+          "seconds": 2.440906276999158,
+          "process_seconds": 2.427411032,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 4.131076467525573,
+          "cpu_wall_ratio": 0.9944712154144039
+        },
+        "hf1": {
+          "seconds": 0.058639954004320316,
+          "process_seconds": 0.058316094999999984,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 171.95733952321604,
+          "cpu_wall_ratio": 0.9944771613515169
+        },
+        "kitoken": {
+          "seconds": 0.314577958008158,
+          "process_seconds": 0.312778765,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 32.05428169282344,
+          "cpu_wall_ratio": 0.9942806132395603
+        },
+        "tiktoken": {
+          "seconds": 0.4114029899938032,
+          "process_seconds": 0.409574278,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 24.510202224097995,
+          "cpu_wall_ratio": 0.9955549375228636
+        }
+      }
+    },
+    {
+      "round": 2,
+      "order": [
+        "giga",
+        "hf023",
+        "hf1",
+        "kitoken",
+        "tiktoken",
+        "tokie"
+      ],
+      "libraries": {
+        "giga": {
+          "seconds": 0.014010417988174595,
+          "process_seconds": 0.013962524000000032,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 719.7194608224861,
+          "cpu_wall_ratio": 0.9965815446609096
+        },
+        "hf023": {
+          "seconds": 2.458796077989973,
+          "process_seconds": 2.441340289,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 4.101019425974455,
+          "cpu_wall_ratio": 0.992900676413864
+        },
+        "hf1": {
+          "seconds": 0.0592161280073924,
+          "process_seconds": 0.058897162999999975,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 170.28419148053501,
+          "cpu_wall_ratio": 0.9946135450235347
+        },
+        "kitoken": {
+          "seconds": 0.30003426400071476,
+          "process_seconds": 0.298371622,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 33.60806311216061,
+          "cpu_wall_ratio": 0.9944584929116269
+        },
+        "tiktoken": {
+          "seconds": 0.41386646300088614,
+          "process_seconds": 0.411533924,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 24.364309220013048,
+          "cpu_wall_ratio": 0.9943640299241131
+        },
+        "tokie": {
+          "seconds": 0.014285807003034279,
+          "process_seconds": 0.014238382999999993,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 705.8453525380083,
+          "cpu_wall_ratio": 0.9966803413328899
+        }
+      }
+    },
+    {
+      "round": 3,
+      "order": [
+        "hf023",
+        "hf1",
+        "kitoken",
+        "tiktoken",
+        "tokie",
+        "giga"
+      ],
+      "libraries": {
+        "hf023": {
+          "seconds": 2.4980511579924496,
+          "process_seconds": 2.485147111,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 4.036574850793011,
+          "cpu_wall_ratio": 0.9948343543921574
+        },
+        "hf1": {
+          "seconds": 0.0728744439984439,
+          "process_seconds": 0.07240769900000002,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 138.36908972591266,
+          "cpu_wall_ratio": 0.9935952170221176
+        },
+        "kitoken": {
+          "seconds": 0.3205354749952676,
+          "process_seconds": 0.31907544899999996,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 31.4585163482936,
+          "cpu_wall_ratio": 0.9954450408483205
+        },
+        "tiktoken": {
+          "seconds": 0.41067596500215586,
+          "process_seconds": 0.40753255,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 24.553592953251467,
+          "cpu_wall_ratio": 0.9923457536597269
+        },
+        "tokie": {
+          "seconds": 0.014602802999434061,
+          "process_seconds": 0.014553795000000008,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 690.5229414337421,
+          "cpu_wall_ratio": 0.9966439320289432
+        },
+        "giga": {
+          "seconds": 0.01352710899664089,
+          "process_seconds": 0.013481620000000027,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 745.4342596670638,
+          "cpu_wall_ratio": 0.9966371974490514
+        }
+      }
+    },
+    {
+      "round": 4,
+      "order": [
+        "hf1",
+        "kitoken",
+        "tiktoken",
+        "tokie",
+        "giga",
+        "hf023"
+      ],
+      "libraries": {
+        "hf1": {
+          "seconds": 0.05940914100210648,
+          "process_seconds": 0.059104602000000006,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 169.73095907899332,
+          "cpu_wall_ratio": 0.9948738696273074
+        },
+        "kitoken": {
+          "seconds": 0.29982128900883254,
+          "process_seconds": 0.298303107,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 33.63193625669999,
+          "cpu_wall_ratio": 0.9949363768868734
+        },
+        "tiktoken": {
+          "seconds": 0.40636630200606305,
+          "process_seconds": 0.404161396,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 24.813992770975954,
+          "cpu_wall_ratio": 0.9945740924009242
+        },
+        "tokie": {
+          "seconds": 0.015350579997175373,
+          "process_seconds": 0.014316837999999998,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 656.8853087116015,
+          "cpu_wall_ratio": 0.9326577889978365
+        },
+        "giga": {
+          "seconds": 0.014160150007228367,
+          "process_seconds": 0.013965998999999979,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 712.1090154552949,
+          "cpu_wall_ratio": 0.9862889159274951
+        },
+        "hf023": {
+          "seconds": 2.409993207998923,
+          "process_seconds": 2.3986094120000003,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 4.184065932998756,
+          "cpu_wall_ratio": 0.9952764198832017
+        }
+      }
+    },
+    {
+      "round": 5,
+      "order": [
+        "kitoken",
+        "tiktoken",
+        "tokie",
+        "giga",
+        "hf023",
+        "hf1"
+      ],
+      "libraries": {
+        "kitoken": {
+          "seconds": 0.3023805330012692,
+          "process_seconds": 0.300676087,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 33.34728720881101,
+          "cpu_wall_ratio": 0.9943632416268607
+        },
+        "tiktoken": {
+          "seconds": 0.4168777409940958,
+          "process_seconds": 0.414670985,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 24.18831587482022,
+          "cpu_wall_ratio": 0.9947064672034694
+        },
+        "tokie": {
+          "seconds": 0.014210844994522631,
+          "process_seconds": 0.014146721000000001,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 709.5686768966413,
+          "cpu_wall_ratio": 0.9954876719472103
+        },
+        "giga": {
+          "seconds": 0.013533139994251542,
+          "process_seconds": 0.013471501999999996,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 745.1020594355683,
+          "cpu_wall_ratio": 0.995445403337457
+        },
+        "hf023": {
+          "seconds": 2.4696294470049907,
+          "process_seconds": 2.458267814,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 4.083029740585331,
+          "cpu_wall_ratio": 0.9953994584010288
+        },
+        "hf1": {
+          "seconds": 0.06102717500471044,
+          "process_seconds": 0.060674951000000005,
+          "count": 2454920,
+          "checksum": "fc7b9d8422783e7cd873723b32e8aac5a59ecdb69a32307bf6ce56e6b5816335",
+          "mib_s": 165.2308251130479,
+          "cpu_wall_ratio": 0.9942284071860896
+        }
+      }
+    }
+  ],
+  "summary": {
+    "tokie": {
+      "seconds_median": 0.014285807003034279,
+      "seconds_min": 0.014210844994522631,
+      "seconds_max": 0.015350579997175373,
+      "mib_s_median": 705.8453525380083,
+      "mib_s_min": 656.8853087116015,
+      "mib_s_max": 709.5686768966413,
+      "rounds": 5,
+      "tokens_per_pass": 245492,
+      "tokens_s_median": 171843284.70058286
+    },
+    "giga": {
+      "seconds_median": 0.01354518299922347,
+      "seconds_min": 0.01352710899664089,
+      "seconds_max": 0.014160150007228367,
+      "mib_s_median": 744.4395901424705,
+      "mib_s_min": 712.1090154552949,
+      "mib_s_max": 745.4342596670638,
+      "rounds": 5,
+      "tokens_per_pass": 245492,
+      "tokens_s_median": 181239338.00973657
+    },
+    "hf023": {
+      "seconds_median": 2.458796077989973,
+      "seconds_min": 2.409993207998923,
+      "seconds_max": 2.4980511579924496,
+      "mib_s_median": 4.101019425974455,
+      "mib_s_min": 4.036574850793011,
+      "mib_s_max": 4.184065932998756,
+      "rounds": 5,
+      "tokens_per_pass": 245492,
+      "tokens_s_median": 998423.5870454366
+    },
+    "hf1": {
+      "seconds_median": 0.05940914100210648,
+      "seconds_min": 0.058639954004320316,
+      "seconds_max": 0.0728744439984439,
+      "mib_s_median": 169.73095907899332,
+      "mib_s_min": 138.36908972591266,
+      "mib_s_max": 171.95733952321604,
+      "rounds": 5,
+      "tokens_per_pass": 245492,
+      "tokens_s_median": 41322260.49040089
+    },
+    "kitoken": {
+      "seconds_median": 0.3023805330012692,
+      "seconds_min": 0.29982128900883254,
+      "seconds_max": 0.3205354749952676,
+      "mib_s_median": 33.34728720881101,
+      "mib_s_min": 31.4585163482936,
+      "mib_s_max": 33.63193625669999,
+      "rounds": 5,
+      "tokens_per_pass": 245492,
+      "tokens_s_median": 8118644.330816414
+    },
+    "tiktoken": {
+      "seconds_median": 0.4114029899938032,
+      "seconds_min": 0.40636630200606305,
+      "seconds_max": 0.4168777409940958,
+      "mib_s_median": 24.510202224097995,
+      "mib_s_min": 24.18831587482022,
+      "mib_s_max": 24.813992770975954,
+      "rounds": 5,
+      "tokens_per_pass": 245492,
+      "tokens_s_median": 5967190.467033255
+    }
+  },
+  "ranking_note": "giga has the lowest median, 5.2% below tokie; the single-run round ranges do not overlap, but the gap is close, so no robust winner is claimed."
+}
