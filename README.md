@@ -10,9 +10,9 @@
 [![PyPI Downloads](https://img.shields.io/pypi/dm/tokie)](https://pypi.org/project/tokie/)
 [![License](https://img.shields.io/crates/l/tokie)](LICENSE-MIT)
 [![docs.rs](https://img.shields.io/docsrs/tokie)](https://docs.rs/tokie)
-[![GitHub Stars](https://img.shields.io/github/stars/chonkie-inc/tokie)](https://github.com/chonkie-inc/tokie)
+[![GitHub Stars](https://img.shields.io/github/stars/feyninc/tokie)](https://github.com/feyninc/tokie)
 
-*Historical 0.1.3 benchmark: 25 to 150 times faster than Hugging Face tokenizers, with the same token ids. 0.2 timings are pending.*
+*Up to 190× faster encoding than Hugging Face. [100% accurate](#verified-tokenizers). Written in Rust.*
 
 [Install](#install) •
 [Quick start](#quick-start) •
@@ -22,12 +22,11 @@
 
 </div>
 
-> [!CAUTION]
-> tokie is in its alpha stage and might produce mis-aligned output. Please report any issues you encounter.
+tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face `tokenizer.json` and implements BPE, WordPiece, SentencePiece, and Unigram. The token ids match Hugging Face tokenizers for the supported models listed below. See [Benchmarks](#benchmarks) for the latest warm comparisons, including Hugging Face tokenizers 0.23.3 and 1.0.0rc4, Kitoken, tiktoken, and GigaToken.
 
-tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face `tokenizer.json` and, in the historical 0.1.3 benchmark, encoded 25 to 150 times faster than Hugging Face tokenizers. It implements BPE, WordPiece, SentencePiece, and Unigram. The token ids match Hugging Face tokenizers. 0.2 has not been re-timed; see [Benchmarks](#benchmarks) and [docs/BENCHMARK_BASELINE.md](docs/BENCHMARK_BASELINE.md).
+![GPT-2 encoding across six tokenizer libraries](assets/benchmark_gpt2_main.png)
 
-![benchmark](assets/benchmark.png)
+*GPT-2 encode, one thread, warm cache, 179 OpenWebText documents. Local unreleased tokie; public GigaToken, Hugging Face 0.23.3 and 1.0.0rc4, Kitoken, and tiktoken. Separate run from the detailed charts below. \*\* GigaToken does not support all tokenizer types; WordPiece and Unigram are excluded.*
 
 ## Install
 
@@ -37,6 +36,8 @@ tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face 
 pip install tokie
 ```
 
+`pip install tokie` installs the published 0.2.0 wheel, which accepts Python lists for `decode` and `decode_bytes` as well as arrays. The current source tree accepts arrays only. The examples below pass arrays, so they work with both.
+
 ### Rust
 
 ```toml
@@ -44,7 +45,7 @@ pip install tokie
 tokie = "0.2"
 ```
 
-These docs describe the 0.2.0 API. To migrate from 0.1.4, see [API changes in 0.2](docs/API_CHANGES_0_2.md).
+These docs describe the current source tree. The strict `decode` array contract is unreleased: the published 0.2.0 wheel also accepts Python lists. See [the decode input note](docs/RELEASE_NOTE_DECODE_UINT32.md). To migrate from 0.1.4, see [API changes in 0.2](docs/API_CHANGES_0_2.md).
 
 Coming from Hugging Face `tokenizers`? See the [migration guide](docs/MIGRATION.md).
 
@@ -64,14 +65,14 @@ plus = tokenizer.encode_plus("Hello, world!")
 print(plus.tolist())
 print(tokenizer.encode_plus("Hello", pair="world", truncate=True, pad=True, max_len=8).tolist())
 
-print(tokenizer.decode(plus.tolist(), skip=True))
+print(tokenizer.decode(plus, skip=True))
 
 flat, ends = tokenizer.batch(["Hello!", "World"])
 print(tokenizer.count_tokens("Hello, world!"))
 print(tokenizer.count_tokens_batch(["Hello!", "World"]))
 ```
 
-`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the parsed template, so BERT's single sequence is `[CLS]`, the ids, `[SEP]`. `pair` uses the pair template. `truncate` and `pad` share `max_len`, and that length counts the template ids; truncation drops from the right, longest sequence first, and padding is fixed on the right. `batch` returns one id array and `ends[i]`, the cumulative id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off. Python returns NumPy arrays, not 0.1.4 `Encoding` objects; there is no `.ids`, so use `.tolist()`.
+`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the parsed template, so BERT's single sequence is `[CLS]`, the ids, `[SEP]`. `pair` uses the pair template. `truncate` and `pad` share `max_len`, and that length counts the template ids; truncation drops from the right, longest sequence first, and padding is fixed on the right. `batch` returns one id array and `ends[i]`, the cumulative id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off. Python returns NumPy arrays, not 0.1.4 `Encoding` objects; there is no `.ids`. Use `.tolist()` only to print or assert. `decode` and `decode_bytes` take a one-dimensional native `uint32` array directly, such as `plus` or `flat[start:end]`; do not pass `.tolist()`. Lists are rejected in this source tree (published 0.2.0 accepts them).
 
 ### Rust
 
@@ -150,83 +151,46 @@ let mut again = Tokenizer::open("model.tokie")?;
 
 `from_pretrained` in Python and `from_pretrained`/`pretrained` in Rust open exactly one `.tokie` file from the repo, whatever its name. A repo with no `.tokie` file is parsed from `tokenizer.json`; several `.tokie` files is an error. There is no runtime `.tkz` fallback: a genuine legacy `TOKI` image is refused by magic, not by filename, while a JSON file merely named `.tkz` is parsed as JSON. `from_json(path)` and `from_file(path)` are path aliases for `open`, and `to_file` is an alias for `save` in Rust. Legacy 0.1.4 binaries cannot read a `.tokie` file: rebuild from `tokenizer.json` with the new code, because renaming a `.tkz` file is not enough.
 
+### Decode input
+
+`decode` and `decode_bytes` take a one-dimensional native-endian NumPy `uint32` array. The array must be C-contiguous and aligned. Empty, read-only, and contiguous slice arrays are accepted. Pass `encode`, `encode_plus`, or a slice of `batch`'s flat ids directly. For ids already in a Python list, convert explicitly with `numpy.array(values, dtype=numpy.uint32)`; there is no implicit cast or fallback. `.tolist()` is for printing and assertions, not for passing to decode. `batch`'s `ends` array is `uint64`; it is not decode input.
+
+```python
+ids = tokenizer.encode("Hello")
+print(tokenizer.decode(ids))
+print(tokenizer.decode_bytes(ids, skip=True))
+
+flat, ends = tokenizer.batch(["Hello", "world"])
+print(tokenizer.decode(flat[: ends[0]]))  # first document
+```
+
+Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`. Non-contiguous or unaligned non-empty arrays raise `ValueError`. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`. These rules apply to the current source tree; the published 0.2.0 wheel also accepts lists. The [current benchmark](docs/BENCHMARK_UINT32_DECODE.md) was measured with a local unreleased wheel, not the published package, and records the source branch snapshot separately from the wheel artifact.
+
 ## Benchmarks
 
-All numbers in this section are historical measurements from the 0.1.3/0.1.4 `.tkz` artifact on an Apple M3. They are not 0.2 `.tokie` measurements. The before-state baseline is [docs/BENCHMARK_BASELINE.md](docs/BENCHMARK_BASELINE.md); the final 0.2 report is [docs/BENCHMARK_AFTER.md](docs/BENCHMARK_AFTER.md), where the strict performance criterion is uncertified/partial. The ids match Hugging Face tokenizers.
+Python 3.12, AMD Ryzen AI 9 HX 370, Linux. Warm-cache medians over five alternating rounds with the library order rotated. Single-document encode and Unicode decode use 179 OpenWebText documents (1.008 MiB); batch uses 3,411 documents (16.14 MiB) at one and eight threads. The tokie series is a **local unreleased 0.2.0 wheel** (sha256 `8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85`); the report records the source branch snapshot separately. Its version metadata says 0.2.0, but it is not on PyPI. GigaToken 0.11.0 and Hugging Face `tokenizers` 0.23.3 are public wheels. The detailed charts below use those three; the GPT-2 six-library chart above adds HF 1.0.0rc4, Kitoken 0.11.1, and tiktoken 0.14.0 in a separate run.
 
-### BPE encoding (GPT-2, Llama, Qwen, ModernBERT)
+The clocks cover each library's public call and output, not an isolated kernel. Encode includes id materialization. Decode decodes the same contiguous NumPy `uint32` ids to Unicode; GigaToken's UTF-8 decode and Hugging Face's `ids.tolist()` conversion are inside the clock. Batch includes tokie's flat ids plus ends, GigaToken's Awkward array, and Hugging Face's list of `Encoding.ids`. These are end-to-end API costs. Ranges are min–max over the five rounds, not confidence intervals.
 
-For tiktoken-style BPE, tokie uses a backtracking encoder on an Aho-Corasick automaton. It takes a greedy longest match in O(n), and it backtracks only when two adjacent tokens are not a valid pair. It does not merge one byte pair at a time. Pretokenization is the SIMD mask scanner in [pretokie](https://crates.io/crates/pretokie). That scanner classifies 64-byte blocks into piece-boundary bitmasks and runs above 1 GB/s per core. A repeated piece hits a per-worker cache instead of running BPE again. Work stealing splits the text so every core has a chunk. On one string this is 39 to 154 times faster than Hugging Face tokenizers.
+![Current warm-cache throughput: encode, Unicode decode, and batch](assets/benchmark_current_overview.png)
 
-![BPE encoding speed](assets/benchmark_bpe.png)
+On the recorded warm runs, encode is close on GPT-2, with overlapping ranges and no reliable winner. Tokie is clearly ahead on Qwen2 within this run. cl100k encode is uncertain because both ranges are wide and overlap. Unicode decode favors tokie on Qwen2; GPT-2 and cl100k ranges overlap, so no winner is claimed. Eight-thread batch is strongly ahead for tokie on GPT-2, a small-overlap uncertainty on Qwen2, and noisy/uncertain on cl100k. Hugging Face is much slower on every task. These are one host and one corpus slice, not a universal ranking or a regression proof.
 
-### WordPiece (BERT, MiniLM, BGE, GTE)
+BERT-base and T5-small ran against Hugging Face only, because GigaToken does not support WordPiece or Unigram; this is not a zero-throughput GigaToken result.
 
-WordPiece searches a vocabulary trie for the longest prefix. tokie stores that trie as a Double-Array trie and looks it up in O(n), with a BERT pretokenizer. On BERT this is 25 to 71 times faster than Hugging Face tokenizers, and the ids match.
+![Hugging Face-only encode and Unicode decode](assets/benchmark_current_hf_only.png)
 
-![WordPiece encoding speed](assets/benchmark_wordpiece.png)
+The new decode measurement is **Unicode text**, not the bytes returned by the old 0.2.0 decode benchmark. Do not combine the two decode tables or read their ratios as a like-for-like comparison.
 
-### SentencePiece BPE and Unigram (Gemma, XLM-R, T5)
+Full method, per-model ranges, validation, artifact hashes, and limits: [current benchmark report](docs/BENCHMARK_UINT32_DECODE.md). Generated tables are authoritative for every number: [tables.md](docs/benchmarks/uint32-decode/tables.md). Raw data: [1-thread](docs/benchmarks/uint32-decode/results-1t.json), [8-thread batch](docs/benchmarks/uint32-decode/results-8t.json), [HF-only](docs/benchmarks/uint32-decode/results-hf-only.json). Reproduction commands: [run-commands.txt](docs/benchmarks/uint32-decode/run-commands.txt).
 
-SentencePiece BPE merges in an order that is not topological. tokie uses a radix heap. Insert and pop are O(1) amortized because a later BPE rank is never smaller. On Gemma 3 this is 2 to 3 times faster than Hugging Face tokenizers.
+### Historical 0.2.0 benchmark
 
-Unigram models such as T5, XLM-RoBERTa, and ALBERT run Viterbi on each metaspace-delimited word and store the frequent units. Encoding one string is about 4 times faster than whole-string Viterbi. Batch encoding is about 3 times faster. The ids match. A vocabulary with a metaspace inside a token uses whole-string Viterbi.
-
-![SentencePiece BPE speed](assets/benchmark_sentencepiece.png)
-
-![Unigram encoding speed](assets/benchmark_unigram.png)
-
-### Python benchmarks
-
-All results on Apple M3, single-string encode, median of 10 runs.
-
-#### tokie vs Hugging Face tokenizers
-
-| Model | Text size | tokie | Hugging Face | Speedup |
-|-------|-----------|-------|---------------|-------|
-| BERT | 45 KB | 0.38 ms | 9.6 ms | **25x** |
-| BERT | 900 KB | 3.60 ms | 257 ms | **71x** |
-| GPT-2 | 45 KB | 0.13 ms | 8.6 ms | **65x** |
-| GPT-2 | 900 KB | 1.44 ms | 191 ms | **133x** |
-| Llama 3 | 45 KB | 0.22 ms | 8.6 ms | **39x** |
-| Llama 3 | 900 KB | 2.49 ms | 195 ms | **78x** |
-| Qwen 3 | 45 KB | 0.13 ms | 9.1 ms | **68x** |
-| Qwen 3 | 900 KB | 1.36 ms | 210 ms | **154x** |
-| ModernBERT | 45 KB | 0.15 ms | 9.3 ms | **62x** |
-| ModernBERT | 900 KB | 1.42 ms | 211 ms | **149x** |
-| Gemma 3 | 45 KB | 4.54 ms | 9.7 ms | **2x** |
-| Gemma 3 | 900 KB | 114 ms | 289 ms | **3x** |
-
-#### tokie vs tiktoken (OpenAI models)
-
-| Model | Text size | tokie | tiktoken | Speedup |
-|-------|-----------|-------|----------|---------|
-| cl100k (GPT-4) | 45 KB | 0.13 ms | 2.12 ms | **17x** |
-| cl100k (GPT-4) | 900 KB | 1.28 ms | 42.3 ms | **33x** |
-| o200k (GPT-4o) | 45 KB | 0.16 ms | 3.57 ms | **22x** |
-| o200k (GPT-4o) | 900 KB | 1.66 ms | 70.7 ms | **42x** |
-
-The ids match on every model in these tables. In that historical benchmark, batch encoding was 17 to 36 times faster than Hugging Face tokenizers. 0.2 `batch` returns one contiguous NumPy id array plus cumulative `ends`; the old `encode_batch_flat` name is gone.
-
-### Tokenizer loading (historical 0.1.4 `.tkz` measurements)
-
-Loading `tokenizer.json` parses the JSON, builds the vocabulary, and, for BPE, builds the tables the encoder reads. The 0.2 `.tokie` file stores the normalized tables and the loaded piece list, so a warm load is deserialization; ids learned by later `encode` calls stay in the piece cache and are not written by `save`. `from_pretrained`/`pretrained` opens exactly one `.tokie` file from the repo, whatever its name; a repo with none is parsed from `tokenizer.json`. Several `.tokie` files is an error. There is no runtime `.tkz` fallback: a genuine legacy `TOKI` image is refused by magic, not by filename, while a JSON file merely named `.tkz` is parsed as JSON. The load times below are historical 0.1.4 `.tkz` measurements, not 0.2 `.tokie` measurements.
-
-| Model | tokie | Hugging Face | Speedup |
-|-------|-------|---------------|---------|
-| BERT | 2.8 ms | 123 ms | **44x** |
-| GPT-2 | 6.2 ms | 151 ms | **24x** |
-| Llama 3.2 | 10.6 ms | 261 ms | **25x** |
-| cl100k | 11.1 ms | 244 ms | **22x** |
-| o200k | 23.2 ms | 310 ms | **13x** |
-
-*These load times are historical 0.1.4 `.tkz` measurements. They are not 0.2 `.tokie` measurements.*
-
-![Tokenizer loading time](assets/benchmark_loading.png)
+The prior GigaToken-only charts and tables were measured with the **published** 0.2.0 wheel and remain unchanged as a historical record in [the published 0.2.0 report](docs/PUBLISHED_BENCHMARK_0_2.md) and the `assets/benchmark_published_*` files. They are not the active benchmark. For previous-release engineering evidence, see [docs/BENCHMARK_AFTER.md](docs/BENCHMARK_AFTER.md).
 
 ## Verified tokenizers
 
-A passing tokenizer is tested against the Hugging Face tokenizer on 1 MB of [enwik8](https://mattmahoney.net/dc/textdata.html), about 300,000 tokens, in [CI](../../actions/workflows/tokenizer-accuracy.yml). Pass means every token matches. Not supported means tokie 0.2 refuses the file.
+A passing tokenizer is tested against the Hugging Face tokenizer on 1 MB of [enwik8](https://mattmahoney.net/dc/textdata.html), about 300,000 tokens, in [CI](https://github.com/feyninc/tokie/actions/workflows/tokenizer-accuracy.yml). Pass means every token matches. Not supported means tokie 0.2 refuses the file.
 
 The full matrix is in [docs/TOKENIZERS.md](docs/TOKENIZERS.md).
 
@@ -319,13 +283,13 @@ The full matrix is in [docs/TOKENIZERS.md](docs/TOKENIZERS.md).
 
 When I started building [Chonkie](https://github.com/chonkie-inc/chonkie), tokenization took longer than chunking.
 
-Each pretokenization pattern has its own parser: GPT-2, cl100k, o200k, and BERT. The parser uses that pattern's character classes and does not run a general regex engine. Since 0.1.0 those parsers are a SIMD mask scanner. They classify 64-byte blocks into character-class bitmasks and take piece boundaries from the masks. Pretokenization passes 1 GB/s per core, more than 20 times the reference regexes.
+Each pretokenization pattern has its own parser: GPT-2, cl100k, o200k, and BERT. The parser uses that pattern's character classes and does not run a general regex engine. Since 0.1.0 those parsers are a SIMD mask scanner: they classify 64-byte blocks into character-class bitmasks and take piece boundaries from the masks.
 
 No single library loaded every Hugging Face tokenizer. I tried [AutoTikTokenizer](https://github.com/bhavnick/autotiktokenizer) and expected tiktoken's BPE to cover them. It does not. Tiktoken-style models need backtracking BPE. A merge order that is not topological needs a heap. SentencePiece needs a radix heap. WordPiece and Unigram each need their own encoder.
 
-Tokenization runs in parallel when the split keeps token boundaries. [chunk](https://github.com/chonkie-inc/chunk) splits the text on those boundaries. Each core encodes one chunk, and the ids are concatenated. On 8 cores that is about 5 times faster.
+Tokenization runs in parallel when the split keeps token boundaries. [chunk](https://github.com/chonkie-inc/chunk) splits the text on those boundaries. Each core encodes one chunk, and the ids are concatenated. The speedup depends on text size and thread count; the current batch checks cover the 16.14 MiB sample at one and eight threads, and the historical 0.2.0 report has an additional smaller eight-thread sample.
 
-0.2 stores the normalized vocabulary and the loaded piece list in a `.tokie` file, so load does not rebuild them. `tokenizer.json` is parsed and validated and the vocabulary tables are built; for a large vocabulary that build is slow. A `.tokie` file is a different format from legacy `.tkz`: a genuine legacy `TOKI` image is refused by magic, not by extension, and legacy 0.1.4 binaries cannot read `.tokie`. Rebuild from `tokenizer.json`; renaming is not enough. The load times quoted in the table above are historical 0.1.4 `.tkz` measurements, not 0.2 `.tokie` measurements.
+0.2 stores the normalized vocabulary and the loaded piece list in a `.tokie` file, so load does not rebuild them. `tokenizer.json` is parsed and validated and the vocabulary tables are built; for a large vocabulary that build is slow. A `.tokie` file is a different format from legacy `.tkz`: a genuine legacy `TOKI` image is refused by magic, not by extension, and legacy 0.1.4 binaries cannot read `.tokie`. Rebuild from `tokenizer.json`; renaming is not enough. The current benchmark excludes token load time: it measures warm calls after one warmup pass, and the [report](docs/BENCHMARK_UINT32_DECODE.md) does not retime cold starts. The historical [published 0.2.0 report](docs/PUBLISHED_BENCHMARK_0_2.md) has the older cold first-call observations.
 
 ## Acknowledgements
 
@@ -341,6 +305,6 @@ If you use tokie in your research, please cite it as follows:
   title = {tokie: Fast, correct tokenizer library for every Hugging Face model},
   year = {2025},
   publisher = {GitHub},
-  howpublished = {\url{https://github.com/chonkie-inc/tokie}},
+  howpublished = {\url{https://github.com/feyninc/tokie}},
 }
 ```

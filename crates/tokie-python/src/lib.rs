@@ -10,8 +10,10 @@ use numpy::Element;
 use numpy::IntoPyArray;
 use numpy::PyArray1;
 use numpy::PyArrayDescrMethods;
+use numpy::PyReadonlyArray1;
 use numpy::npyffi::{self, PY_ARRAY_API};
 use pyo3::create_exception;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString, PyStringMethods};
 use tokie_core::{Plus, Specials, Tokenizer};
@@ -20,6 +22,19 @@ create_exception!(tokie, TokieError, pyo3::exceptions::PyException);
 
 fn to_py_err(err: impl std::fmt::Display) -> PyErr {
     TokieError::new_err(err.to_string())
+}
+
+/// Copy the ids out of a NumPy array while the GIL is held.
+///
+/// The typed argument already rejects non-`uint32` dtypes, non-native byte
+/// order, and ranks other than one. This check keeps the call strict about
+/// layout: a non-empty array must also be C-contiguous and aligned so that one
+/// bulk copy can stand in for element-by-element access. Empty arrays pass as
+/// a zero-length slice, matching `decode`'s accepted empty input.
+fn copy_ids(ids: &PyReadonlyArray1<'_, u32>) -> PyResult<Vec<u32>> {
+    ids.as_slice()
+        .map(<[u32]>::to_vec)
+        .map_err(|_| PyValueError::new_err("ids must be a C-contiguous and aligned array"))
 }
 
 /// One tokenizer. Encode and batch take the lock and run without the GIL.
@@ -160,35 +175,57 @@ impl PyTokenizer {
         .map_err(to_py_err)
     }
 
-    /// Text for `ids`. `skip` omits specials.
+    /// Text for `ids`. `ids` is a 1-D `uint32` NumPy array that is
+    /// C-contiguous, aligned, and native-endian. Empty and read-only arrays are
+    /// accepted. A wrong dtype, non-native byte order, or other rank raises
+    /// `TypeError`; a non-empty non-contiguous or misaligned array raises
+    /// `ValueError`. Do not mutate `ids` while this call runs. `skip` omits
+    /// specials.
     #[pyo3(signature = (ids, skip=false))]
-    fn decode(&self, py: Python<'_>, ids: Vec<u32>, skip: bool) -> PyResult<String> {
+    fn decode(
+        &self,
+        py: Python<'_>,
+        ids: PyReadonlyArray1<'_, u32>,
+        skip: bool,
+    ) -> PyResult<String> {
         let specials = if skip { Specials::Skip } else { Specials::Keep };
+        let id_vec = copy_ids(&ids)?;
+        // Drop the readonly borrow guard before `py.detach` releases the GIL.
+        // The core call reads `id_vec`, which owns its ids, so no NumPy memory
+        // crosses the GIL release.
+        drop(ids);
         py.detach(|| {
             let tok = self.inner.lock().unwrap();
             let mut text = String::new();
-            tok.decode(&ids, &mut text, specials).map_err(|err| err.to_string())?;
+            tok.decode(&id_vec, &mut text, specials).map_err(|err| err.to_string())?;
             Ok::<String, String>(text)
         })
         .map_err(to_py_err)
     }
 
     /// Raw decoded bytes for `ids`. `skip` omits specials. Invalid UTF-8 stays
-    /// as bytes.
+    /// as bytes. `ids` is a 1-D `uint32` NumPy array that is C-contiguous,
+    /// aligned, and native-endian. Empty and read-only arrays are accepted. A
+    /// wrong dtype, non-native byte order, or other rank raises `TypeError`; a
+    /// non-empty non-contiguous or misaligned array raises `ValueError`. Do not
+    /// mutate `ids` while this call runs.
     #[pyo3(signature = (ids, skip=false))]
     fn decode_bytes<'py>(
         &self,
         py: Python<'py>,
-        ids: Vec<u32>,
+        ids: PyReadonlyArray1<'_, u32>,
         skip: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let specials = if skip { Specials::Skip } else { Specials::Keep };
+        let id_vec = copy_ids(&ids)?;
+        // Same rule as `decode`: only the owned copy reaches the core call.
+        drop(ids);
         let bytes = py
             .detach(|| {
                 self.inner
                     .lock()
                     .unwrap()
-                    .decode_bytes(&ids, specials)
+                    .decode_bytes(&id_vec, specials)
                     .map_err(|err| err.to_string())
             })
             .map_err(to_py_err)?;

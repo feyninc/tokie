@@ -73,7 +73,7 @@ tokenizer = tokie.Tokenizer.from_pretrained("tokiers/{repo_name}")
 ids = tokenizer.encode("Hello, world!")
 plus = tokenizer.encode_plus("Hello, world!")
 print(plus.tolist())
-print(tokenizer.decode(plus.tolist(), skip=True))
+print(tokenizer.decode(plus, skip=True))
 ```
 
 ## Quick Start (Rust)

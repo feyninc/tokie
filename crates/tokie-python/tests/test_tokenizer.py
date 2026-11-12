@@ -172,7 +172,7 @@ def test_empty_batch(gpt2):
 
 
 def test_decode_roundtrip(gpt2):
-    ids = gpt2.encode("Hello world").tolist()
+    ids = gpt2.encode("Hello world")
     assert gpt2.decode(ids) == "Hello world"
 
 

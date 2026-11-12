@@ -1,0 +1,2033 @@
+{
+  "meta": {
+    "generated_utc": "2026-11-12T03:09:34Z",
+    "claim_scope": "published tokie vs published gigatoken per model, output, and thread config on a seeded OpenWebText subset",
+    "python": "3.12.13",
+    "platform": "linux",
+    "cpu_model": "AMD Ryzen AI 9 HX 370 w/ Radeon 890M",
+    "cpu_count": 24,
+    "load_before": [
+      2.40087890625,
+      2.0068359375,
+      1.51708984375
+    ],
+    "env": {
+      "RAYON_NUM_THREADS": "1",
+      "TOKENIZERS_PARALLELISM": "false"
+    },
+    "packages": {
+      "tokie": {
+        "version": "0.2.0",
+        "installer": "pip",
+        "name": "tokie"
+      },
+      "gigatoken": {
+        "version": "0.11.0",
+        "installer": "pip",
+        "name": "gigatoken"
+      },
+      "tokenizers": {
+        "version": "0.23.3",
+        "installer": "pip",
+        "name": "tokenizers"
+      },
+      "numpy": {
+        "version": "2.5.4",
+        "installer": "pip",
+        "name": "numpy"
+      },
+      "awkward": {
+        "version": "2.14.0",
+        "installer": "pip",
+        "name": "awkward"
+      }
+    },
+    "import_paths": {
+      "tokie": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/tokie/__init__.py",
+      "gigatoken": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/gigatoken/__init__.py",
+      "numpy": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/numpy/__init__.py",
+      "awkward": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/awkward/__init__.py",
+      "tokenizers": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/tokenizers/__init__.py"
+    },
+    "hf_oracle": {
+      "available": true,
+      "import_error": null
+    },
+    "wheels": {
+      "tokie": [
+        {
+          "file": "tokie-0.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "sha256": "5c28027c24eb418fb9bcc9733c31ad4a6956d6129685b101e996e024669b6df7"
+        }
+      ],
+      "gigatoken": [
+        {
+          "file": "gigatoken-0.11.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+          "sha256": "11992abc7f41e41e5be03c722df1c5205b5d0fcc4bcbd4fb440d2a0b97f7ac3f"
+        }
+      ],
+      "tokenizers": [
+        {
+          "file": "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+          "sha256": "376851d22bcf9d650a5c3090bb83e6cf9e895fbf0595369fa4cd43c1f69b5f87"
+        }
+      ],
+      "numpy": [
+        {
+          "file": "numpy-2.5.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+          "sha256": "fbde6962867ee75b48b0ee29b2b9372ec5d617799dbaf38e82dc0596f2f7738a"
+        }
+      ],
+      "awkward": [
+        {
+          "file": "awkward-2.14.0-py3-none-any.whl",
+          "sha256": "bbdcecf16c8358bac2eb20285659325fc7a71e439779f1259277693357689efd"
+        }
+      ]
+    },
+    "provenance": {
+      "package_source": "public PyPI wheels installed in a clean venv; no local checkout or path install",
+      "wheels_dir": "/tmp/opencode/published-gigatoken-0.2-bench/wheels"
+    },
+    "script_sha256": "55339f11ac66efcb947458c855136a842350e4cc4dac9d77a23d922970494af0",
+    "corpus": {
+      "jsonl": "/tmp/opencode/tokie-compat/corpus/owt_20m.jsonl",
+      "jsonl_sha256": "20dc6601bee15f270b7a2c35cfde6cd2f073f8c15567c76b913453157d2c67db",
+      "jsonl_bytes": 21281368,
+      "available_documents": 4187,
+      "manifest": "/tmp/opencode/tokie-compat/corpus/manifest.json",
+      "manifest_sha256": "227927ab4de6324d427520ad496f4fd55808e27a0513d44d26fb4a17088b03a0",
+      "source": "Skylion007/openwebtext",
+      "sampling_seed": 20261111,
+      "max_chars": 1048576,
+      "max_docs": 256,
+      "sampled_documents": 179,
+      "sampled_chars": 1048248,
+      "sampled_bytes_utf8": 1057339,
+      "sampled_row_range": [
+        135,
+        62670
+      ],
+      "sampled_rows_sha256": "c9f3e026003bae02bf8281be01c8ee42a00a9d87be0626c9d471b17fae0236f4",
+      "edge_texts": 24,
+      "fuzz_texts": 256,
+      "timing_texts": 179,
+      "validation_texts": 459
+    },
+    "models": {
+      "gpt2": {
+        "path": "/home/bhavnick/.cache/huggingface/hub/models--openai-community--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e/tokenizer.json",
+        "sha256": "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6",
+        "bytes": 1355256,
+        "tokie_vocab_size": 50257,
+        "giga_vocab_size": 50257
+      },
+      "qwen2": {
+        "path": "/home/bhavnick/.cache/huggingface/hub/models--Qwen--Qwen2-7B/snapshots/453ed1575b739b5b03ce3758b23befdb0967f40e/tokenizer.json",
+        "sha256": "f7c9b2dba4a296b1aa76c16a34b8225c0c118978400d4bb66bff0902d702f5b8",
+        "bytes": 7028015,
+        "tokie_vocab_size": 151646,
+        "giga_vocab_size": 151646
+      },
+      "cl100k": {
+        "path": "/home/bhavnick/.cache/huggingface/hub/models--tokiers--cl100k/snapshots/476e8c1a1ecc43c03aeb12cfdfe24c4b87904044/tokenizer.json",
+        "sha256": "239eb2359f79c38497476671aaa835e01fb43d42743c612a8514a0dfa2ac93a2",
+        "bytes": 4233780,
+        "tokie_vocab_size": 100277,
+        "giga_vocab_size": 100277
+      }
+    },
+    "load_after": [
+      2.2314453125,
+      1.98876953125,
+      1.52001953125
+    ],
+    "limitations": [
+      "Per-model, per-output, per-thread comparison on a seeded OpenWebText slice; not a universal fastest-tokenizer claim.",
+      "Timing uses OpenWebText sample documents only. Edge cases and fuzz are correctness-only.",
+      "Cold reports the first call and the first full pass from a fresh instance; tokenizer.json load time is excluded. Warm rounds exclude one warmup pass.",
+      "tokie batch returns flat uint32 ids plus uint64 ends; gigatoken batch returns an awkward list array. Output shapes differ; both are counted as tokens + documents inside the timed loop.",
+      "HF tokenizers is an optional third oracle only; it is not timed here.",
+      "cProfile cannot see native kernel internals; cpu_per_wall only says whether the timed Python loop was CPU-bound."
+    ]
+  },
+  "validation": {
+    "gpt2": {
+      "ok": true,
+      "stats": {
+        "texts": 459,
+        "tokens": 253419,
+        "encode_mismatches": 0,
+        "decode_mismatches": 0,
+        "batch_mismatches": 0,
+        "hf_encode_mismatches": 0,
+        "hf_decode_mismatches": 0,
+        "hf_batch_ok": true
+      },
+      "first_mismatch": null
+    },
+    "qwen2": {
+      "ok": true,
+      "stats": {
+        "texts": 459,
+        "tokens": 239817,
+        "encode_mismatches": 0,
+        "decode_mismatches": 0,
+        "batch_mismatches": 0,
+        "hf_encode_mismatches": 0,
+        "hf_decode_mismatches": 0,
+        "hf_batch_ok": true
+      },
+      "first_mismatch": null
+    },
+    "cl100k": {
+      "ok": true,
+      "stats": {
+        "texts": 459,
+        "tokens": 236578,
+        "encode_mismatches": 0,
+        "decode_mismatches": 0,
+        "batch_mismatches": 0,
+        "hf_encode_mismatches": 0,
+        "hf_decode_mismatches": 0,
+        "hf_batch_ok": true
+      },
+      "first_mismatch": null
+    }
+  },
+  "benchmark": {
+    "gpt2": {
+      "encode": {
+        "threads": 1,
+        "passes_per_round": 20,
+        "input_bytes_utf8": 1057339,
+        "total_tokens": 245492,
+        "decoded_bytes_utf8": 1057339,
+        "cold": {
+          "tokie": {
+            "first_call_s": 0.0007968080026330426,
+            "remaining_pass_s": 0.003352033003466204,
+            "cold_full_pass_s": 0.0041488410060992464,
+            "count": 245492
+          },
+          "giga": {
+            "first_call_s": 0.000306506990455091,
+            "remaining_pass_s": 0.003385275005712174,
+            "cold_full_pass_s": 0.003691781996167265,
+            "count": 245492
+          }
+        },
+        "rounds": [
+          {
+            "round": 1,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.025072641001315787,
+              "passes": 20,
+              "count": 245492
+            },
+            "giga": {
+              "seconds": 0.024149985998519696,
+              "passes": 20,
+              "count": 245492
+            }
+          },
+          {
+            "round": 2,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.024579883989645168,
+              "passes": 20,
+              "count": 245492
+            },
+            "tokie": {
+              "seconds": 0.02563617100531701,
+              "passes": 20,
+              "count": 245492
+            }
+          },
+          {
+            "round": 3,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.025702074010041542,
+              "passes": 20,
+              "count": 245492
+            },
+            "giga": {
+              "seconds": 0.02510533200984355,
+              "passes": 20,
+              "count": 245492
+            }
+          },
+          {
+            "round": 4,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.02376223698956892,
+              "passes": 20,
+              "count": 245492
+            },
+            "tokie": {
+              "seconds": 0.025488143000984564,
+              "passes": 20,
+              "count": 245492
+            }
+          },
+          {
+            "round": 5,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.0253719739994267,
+              "passes": 20,
+              "count": 245492
+            },
+            "giga": {
+              "seconds": 0.02402878800057806,
+              "passes": 20,
+              "count": 245492
+            }
+          }
+        ],
+        "summary": {
+          "tokie": {
+            "seconds_median": 0.025488143000984564,
+            "seconds_min": 0.025072641001315787,
+            "seconds_max": 0.025702074010041542,
+            "mib_s_median": 791.2361822481275,
+            "mib_s_min": 784.6503341642491,
+            "mib_s_max": 804.3484912353273,
+            "tokens_s_median": 192632315.34013054,
+            "tokens_s_min": 191028941.79208162,
+            "tokens_s_max": 195824604.18678418
+          },
+          "giga": {
+            "seconds_median": 0.024149985998519696,
+            "seconds_min": 0.02376223698956892,
+            "seconds_max": 0.02510533200984355,
+            "mib_s_median": 835.0787848046591,
+            "mib_s_min": 803.3011056291159,
+            "mib_s_max": 848.7054888622765,
+            "tokens_s_median": 203306122.01187012,
+            "tokens_s_min": 195569610.39491135,
+            "tokens_s_max": 206623644.15249744
+          },
+          "giga_over_tokie_time": {
+            "median": 0.9587970053931703,
+            "min": 0.9322859256027802,
+            "max": 0.9767823406015853,
+            "median_of_medians": 0.9474988427986623,
+            "interpretation": "giga seconds / tokie seconds; below 1 means giga took less time"
+          }
+        },
+        "post_check": {
+          "tokie": {
+            "output_ok": true,
+            "checksum": 1646682
+          },
+          "giga": {
+            "output_ok": true,
+            "checksum": 1646682
+          }
+        },
+        "profile": {
+          "tokie": {
+            "wall_s": 0.0015603140054736286,
+            "process_cpu_s": 0.0015624809999996714,
+            "cpu_per_wall": 1.0013888195058436,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.001,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:219(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.001,
+                "func": "{method 'encode' of 'builtins.Tokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{built-in method numpy.asarray}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          },
+          "giga": {
+            "wall_s": 0.0014075859944568947,
+            "process_cpu_s": 0.0014030619999996219,
+            "cpu_per_wall": 0.9967859907138261,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.001,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:219(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.001,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/gigatoken/_tokenizer.py:203(encode)"
+              },
+              {
+                "cumtime_s": 0.001,
+                "func": "{method 'encode' of 'builtins.BPETokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{built-in method numpy.asarray}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          }
+        }
+      },
+      "decode": {
+        "threads": 1,
+        "passes_per_round": 20,
+        "input_bytes_utf8": 1057339,
+        "total_tokens": 245492,
+        "decoded_bytes_utf8": 1057339,
+        "cold": {
+          "tokie": {
+            "first_call_s": 0.0008758570038480684,
+            "remaining_pass_s": 0.008877852000296116,
+            "cold_full_pass_s": 0.009753709004144184,
+            "count": 1057339
+          },
+          "giga": {
+            "first_call_s": 0.0003883099998347461,
+            "remaining_pass_s": 0.003159390005748719,
+            "cold_full_pass_s": 0.003547700005583465,
+            "count": 1057339
+          }
+        },
+        "rounds": [
+          {
+            "round": 1,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.1886872760078404,
+              "passes": 20,
+              "count": 1057339
+            },
+            "giga": {
+              "seconds": 0.05150465700717177,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 2,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.05013072499423288,
+              "passes": 20,
+              "count": 1057339
+            },
+            "tokie": {
+              "seconds": 0.18880293300026096,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 3,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.1910278970026411,
+              "passes": 20,
+              "count": 1057339
+            },
+            "giga": {
+              "seconds": 0.05090246599866077,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 4,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.0505067810008768,
+              "passes": 20,
+              "count": 1057339
+            },
+            "tokie": {
+              "seconds": 0.18830084000364877,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 5,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.19782824299181812,
+              "passes": 20,
+              "count": 1057339
+            },
+            "giga": {
+              "seconds": 0.0509065840014955,
+              "passes": 20,
+              "count": 1057339
+            }
+          }
+        ],
+        "summary": {
+          "tokie": {
+            "seconds_median": 0.18880293300026096,
+            "seconds_min": 0.18830084000364877,
+            "seconds_max": 0.19782824299181812,
+            "mib_s_median": 106.81582452252204,
+            "mib_s_min": 101.94267843508797,
+            "mib_s_max": 107.10064256910682,
+            "tokens_s_median": 26005104.486344043,
+            "tokens_s_min": 24818700.938485634,
+            "tokens_s_max": 26074445.551622927
+          },
+          "giga": {
+            "seconds_median": 0.05090246599866077,
+            "seconds_min": 0.05013072499423288,
+            "seconds_max": 0.05150465700717177,
+            "mib_s_median": 396.19182617250704,
+            "mib_s_min": 391.55956242724193,
+            "mib_s_max": 402.29102936399624,
+            "tokens_s_median": 96455837.7216769,
+            "tokens_s_min": 95328078.76608767,
+            "tokens_s_max": 97940733.96235216
+          },
+          "giga_over_tokie_time": {
+            "median": 0.26646613817853526,
+            "min": 0.2573271805462121,
+            "max": 0.2729630640543649,
+            "median_of_medians": 0.2696063307374066,
+            "interpretation": "giga seconds / tokie seconds; below 1 means giga took less time"
+          }
+        },
+        "post_check": {
+          "tokie": {
+            "output_ok": true,
+            "checksum": "a315720d60330b5c"
+          },
+          "giga": {
+            "output_ok": true,
+            "checksum": "a315720d60330b5c"
+          }
+        },
+        "profile": {
+          "tokie": {
+            "wall_s": 0.009622862009564415,
+            "process_cpu_s": 0.009576862999999491,
+            "cpu_per_wall": 0.9952198203071806,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.01,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:221(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.01,
+                "func": "{method 'decode_bytes' of 'builtins.Tokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          },
+          "giga": {
+            "wall_s": 0.0027181409968761727,
+            "process_cpu_s": 0.002711085999999696,
+            "cpu_per_wall": 0.9974044772200616,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.003,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:221(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.003,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/gigatoken/_tokenizer.py:287(decode)"
+              },
+              {
+                "cumtime_s": 0.003,
+                "func": "{method 'decode' of 'builtins.BPETokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'partition' of 'str' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          }
+        }
+      },
+      "batch": {
+        "threads": 1,
+        "passes_per_round": 20,
+        "input_bytes_utf8": 1057339,
+        "total_tokens": 245492,
+        "decoded_bytes_utf8": 1057339,
+        "cold": {
+          "tokie": {
+            "first_call_s": 0.0037826519983354956,
+            "remaining_pass_s": 0.0,
+            "cold_full_pass_s": 0.0037826519983354956,
+            "count": 245671
+          },
+          "giga": {
+            "first_call_s": 0.013189309000154026,
+            "remaining_pass_s": 0.0,
+            "cold_full_pass_s": 0.013189309000154026,
+            "count": 245671
+          }
+        },
+        "rounds": [
+          {
+            "round": 1,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.023553765000542626,
+              "passes": 20,
+              "count": 245671
+            },
+            "giga": {
+              "seconds": 0.02432713999587577,
+              "passes": 20,
+              "count": 245671
+            }
+          },
+          {
+            "round": 2,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.023273247992619872,
+              "passes": 20,
+              "count": 245671
+            },
+            "tokie": {
+              "seconds": 0.02457631799916271,
+              "passes": 20,
+              "count": 245671
+            }
+          },
+          {
+            "round": 3,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.02346688200486824,
+              "passes": 20,
+              "count": 245671
+            },
+            "giga": {
+              "seconds": 0.025920985994162038,
+              "passes": 20,
+              "count": 245671
+            }
+          },
+          {
+            "round": 4,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.026700632006395608,
+              "passes": 20,
+              "count": 245671
+            },
+            "tokie": {
+              "seconds": 0.02429630100959912,
+              "passes": 20,
+              "count": 245671
+            }
+          },
+          {
+            "round": 5,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.023765432997606695,
+              "passes": 20,
+              "count": 245671
+            },
+            "giga": {
+              "seconds": 0.03168184799142182,
+              "passes": 20,
+              "count": 245671
+            }
+          }
+        ],
+        "summary": {
+          "tokie": {
+            "seconds_median": 0.023765432997606695,
+            "seconds_min": 0.02346688200486824,
+            "seconds_max": 0.02457631799916271,
+            "mib_s_median": 848.591353783636,
+            "mib_s_min": 820.5924484448985,
+            "mib_s_max": 859.3873253596134,
+            "tokens_s_median": 206595857.12132603,
+            "tokens_s_min": 199779316.0133781,
+            "tokens_s_max": 209224216.45029137
+          },
+          "giga": {
+            "seconds_median": 0.025920985994162038,
+            "seconds_min": 0.023273247992619872,
+            "seconds_max": 0.03168184799142182,
+            "mib_s_median": 778.0236818628516,
+            "mib_s_min": 636.5519134538432,
+            "mib_s_max": 866.5374496541486,
+            "tokens_s_median": 189415634.15472704,
+            "tokens_s_min": 154973283.16610157,
+            "tokens_s_max": 210964967.22575846
+          },
+          "giga_over_tokie_time": {
+            "median": 1.0989587260977123,
+            "min": 0.9469786317630153,
+            "max": 1.33310628064771,
+            "median_of_medians": 1.0907011875934438,
+            "interpretation": "giga seconds / tokie seconds; below 1 means giga took less time"
+          }
+        },
+        "post_check": {
+          "tokie": {
+            "output_ok": true,
+            "checksum": 1024472169
+          },
+          "giga": {
+            "output_ok": true,
+            "checksum": 1024472169
+          }
+        },
+        "profile": {
+          "tokie": {
+            "wall_s": 0.0014822269877186045,
+            "process_cpu_s": 0.0014829510000007318,
+            "cpu_per_wall": 1.0004884624879498,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.001,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:224(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.001,
+                "func": "{method 'batch' of 'builtins.Tokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          },
+          "giga": {
+            "wall_s": 0.001500680999015458,
+            "process_cpu_s": 0.0014938520000002953,
+            "cpu_per_wall": 0.9954493999593232,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.001,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:226(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.001,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/gigatoken/_tokenizer.py:206(encode_batch)"
+              },
+              {
+                "cumtime_s": 0.001,
+                "func": "{method 'encode_batch' of 'builtins.BPETokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/awkward/_dispatch.py:37(dispatch)"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{built-in method builtins.next}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          }
+        }
+      }
+    },
+    "qwen2": {
+      "encode": {
+        "threads": 1,
+        "passes_per_round": 20,
+        "input_bytes_utf8": 1057339,
+        "total_tokens": 233519,
+        "decoded_bytes_utf8": 1057339,
+        "cold": {
+          "tokie": {
+            "first_call_s": 0.0014901019894750789,
+            "remaining_pass_s": 0.007429940000292845,
+            "cold_full_pass_s": 0.008920041989767924,
+            "count": 233519
+          },
+          "giga": {
+            "first_call_s": 0.0003583329962566495,
+            "remaining_pass_s": 0.004239200003212318,
+            "cold_full_pass_s": 0.004597532999468967,
+            "count": 233519
+          }
+        },
+        "rounds": [
+          {
+            "round": 1,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.03104268599417992,
+              "passes": 20,
+              "count": 233519
+            },
+            "giga": {
+              "seconds": 0.03510140698926989,
+              "passes": 20,
+              "count": 233519
+            }
+          },
+          {
+            "round": 2,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.03588725399458781,
+              "passes": 20,
+              "count": 233519
+            },
+            "tokie": {
+              "seconds": 0.03270229599729646,
+              "passes": 20,
+              "count": 233519
+            }
+          },
+          {
+            "round": 3,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.03137625299859792,
+              "passes": 20,
+              "count": 233519
+            },
+            "giga": {
+              "seconds": 0.036212947001331486,
+              "passes": 20,
+              "count": 233519
+            }
+          },
+          {
+            "round": 4,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.0350016400043387,
+              "passes": 20,
+              "count": 233519
+            },
+            "tokie": {
+              "seconds": 0.032019281992688775,
+              "passes": 20,
+              "count": 233519
+            }
+          },
+          {
+            "round": 5,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.031266316000255756,
+              "passes": 20,
+              "count": 233519
+            },
+            "giga": {
+              "seconds": 0.03528376999020111,
+              "passes": 20,
+              "count": 233519
+            }
+          }
+        ],
+        "summary": {
+          "tokie": {
+            "seconds_median": 0.03137625299859792,
+            "seconds_min": 0.03104268599417992,
+            "seconds_max": 0.03270229599729646,
+            "mib_s_median": 642.7517320692994,
+            "mib_s_min": 616.6888392900793,
+            "mib_s_max": 649.658375711252,
+            "tokens_s_median": 148850788.53133613,
+            "tokens_s_min": 142815048.8389594,
+            "tokens_s_max": 150450254.23623565
+          },
+          "giga": {
+            "seconds_median": 0.03528376999020111,
+            "seconds_min": 0.0350016400043387,
+            "seconds_max": 0.036212947001331486,
+            "mib_s_median": 571.5699021474777,
+            "mib_s_min": 556.9041635841415,
+            "mib_s_max": 576.1770293675811,
+            "tokens_s_median": 132366240.94582418,
+            "tokens_s_min": 128969895.76209521,
+            "tokens_s_max": 133433176.25748605
+          },
+          "giga_over_tokie_time": {
+            "median": 1.1284914407540847,
+            "min": 1.09314256366932,
+            "max": 1.1541514215527806,
+            "median_of_medians": 1.1245374006825417,
+            "interpretation": "giga seconds / tokie seconds; below 1 means giga took less time"
+          }
+        },
+        "post_check": {
+          "tokie": {
+            "output_ok": true,
+            "checksum": 2744875
+          },
+          "giga": {
+            "output_ok": true,
+            "checksum": 2744875
+          }
+        },
+        "profile": {
+          "tokie": {
+            "wall_s": 0.002196058994741179,
+            "process_cpu_s": 0.002196208999999172,
+            "cpu_per_wall": 1.0000683065702478,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.002,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:219(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.002,
+                "func": "{method 'encode' of 'builtins.Tokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{built-in method numpy.asarray}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          },
+          "giga": {
+            "wall_s": 0.0019366009946679696,
+            "process_cpu_s": 0.0019303710000002638,
+            "cpu_per_wall": 0.9967830261964861,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.002,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:219(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.002,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/gigatoken/_tokenizer.py:203(encode)"
+              },
+              {
+                "cumtime_s": 0.002,
+                "func": "{method 'encode' of 'builtins.BPETokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{built-in method numpy.asarray}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          }
+        }
+      },
+      "decode": {
+        "threads": 1,
+        "passes_per_round": 20,
+        "input_bytes_utf8": 1057339,
+        "total_tokens": 233519,
+        "decoded_bytes_utf8": 1057339,
+        "cold": {
+          "tokie": {
+            "first_call_s": 0.0041913799941539764,
+            "remaining_pass_s": 0.008687103007105179,
+            "cold_full_pass_s": 0.012878483001259156,
+            "count": 1057339
+          },
+          "giga": {
+            "first_call_s": 0.0003727709990926087,
+            "remaining_pass_s": 0.0034312409989070147,
+            "cold_full_pass_s": 0.0038040119979996234,
+            "count": 1057339
+          }
+        },
+        "rounds": [
+          {
+            "round": 1,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.17939832199772354,
+              "passes": 20,
+              "count": 1057339
+            },
+            "giga": {
+              "seconds": 0.053713171000708826,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 2,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.050001010997220874,
+              "passes": 20,
+              "count": 1057339
+            },
+            "tokie": {
+              "seconds": 0.17874030499660876,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 3,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.1895480259991018,
+              "passes": 20,
+              "count": 1057339
+            },
+            "giga": {
+              "seconds": 0.05228713000542484,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 4,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.05031705500732642,
+              "passes": 20,
+              "count": 1057339
+            },
+            "tokie": {
+              "seconds": 0.1766047300043283,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 5,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.17568308601039462,
+              "passes": 20,
+              "count": 1057339
+            },
+            "giga": {
+              "seconds": 0.05189944100857247,
+              "passes": 20,
+              "count": 1057339
+            }
+          }
+        ],
+        "summary": {
+          "tokie": {
+            "seconds_median": 0.17874030499660876,
+            "seconds_min": 0.17568308601039462,
+            "seconds_max": 0.1895480259991018,
+            "mib_s_median": 112.8292858237877,
+            "mib_s_min": 106.39594295109633,
+            "mib_s_max": 114.79272944636305,
+            "tokens_s_median": 26129417.20161332,
+            "tokens_s_min": 24639560.213737763,
+            "tokens_s_max": 26584118.631224796
+          },
+          "giga": {
+            "seconds_median": 0.05189944100857247,
+            "seconds_min": 0.050001010997220874,
+            "seconds_max": 0.053713171000708826,
+            "mib_s_median": 388.5810823542832,
+            "mib_s_min": 375.4598841395386,
+            "mib_s_max": 403.3346638093833,
+            "tokens_s_median": 89989023.1809736,
+            "tokens_s_min": 86950368.2800326,
+            "tokens_s_max": 93405711.34170839
+          },
+          "giga_over_tokie_time": {
+            "median": 0.28491340524171255,
+            "min": 0.2758516198194151,
+            "max": 0.2994073211085576,
+            "median_of_medians": 0.2903622717302466,
+            "interpretation": "giga seconds / tokie seconds; below 1 means giga took less time"
+          }
+        },
+        "post_check": {
+          "tokie": {
+            "output_ok": true,
+            "checksum": "a315720d60330b5c"
+          },
+          "giga": {
+            "output_ok": true,
+            "checksum": "a315720d60330b5c"
+          }
+        },
+        "profile": {
+          "tokie": {
+            "wall_s": 0.009399784001288936,
+            "process_cpu_s": 0.009357836999999591,
+            "cpu_per_wall": 0.9955374505112466,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.009,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:221(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.009,
+                "func": "{method 'decode_bytes' of 'builtins.Tokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          },
+          "giga": {
+            "wall_s": 0.00291859800927341,
+            "process_cpu_s": 0.00291204200000017,
+            "cpu_per_wall": 0.9977537128263608,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.003,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:221(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.003,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/gigatoken/_tokenizer.py:287(decode)"
+              },
+              {
+                "cumtime_s": 0.003,
+                "func": "{method 'decode' of 'builtins.BPETokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'partition' of 'str' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          }
+        }
+      },
+      "batch": {
+        "threads": 1,
+        "passes_per_round": 20,
+        "input_bytes_utf8": 1057339,
+        "total_tokens": 233519,
+        "decoded_bytes_utf8": 1057339,
+        "cold": {
+          "tokie": {
+            "first_call_s": 0.0088751669973135,
+            "remaining_pass_s": 0.0,
+            "cold_full_pass_s": 0.0088751669973135,
+            "count": 233698
+          },
+          "giga": {
+            "first_call_s": 0.032902994003961794,
+            "remaining_pass_s": 0.0,
+            "cold_full_pass_s": 0.032902994003961794,
+            "count": 233698
+          }
+        },
+        "rounds": [
+          {
+            "round": 1,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.029679923987714574,
+              "passes": 20,
+              "count": 233698
+            },
+            "giga": {
+              "seconds": 0.03499375500541646,
+              "passes": 20,
+              "count": 233698
+            }
+          },
+          {
+            "round": 2,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.03428577400336508,
+              "passes": 20,
+              "count": 233698
+            },
+            "tokie": {
+              "seconds": 0.030380411000805907,
+              "passes": 20,
+              "count": 233698
+            }
+          },
+          {
+            "round": 3,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.0326215639943257,
+              "passes": 20,
+              "count": 233698
+            },
+            "giga": {
+              "seconds": 0.03465256400522776,
+              "passes": 20,
+              "count": 233698
+            }
+          },
+          {
+            "round": 4,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.03382944500481244,
+              "passes": 20,
+              "count": 233698
+            },
+            "tokie": {
+              "seconds": 0.03019625500019174,
+              "passes": 20,
+              "count": 233698
+            }
+          },
+          {
+            "round": 5,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.02935074400738813,
+              "passes": 20,
+              "count": 233698
+            },
+            "giga": {
+              "seconds": 0.03494206799950916,
+              "passes": 20,
+              "count": 233698
+            }
+          }
+        ],
+        "summary": {
+          "tokie": {
+            "seconds_median": 0.03019625500019174,
+            "seconds_min": 0.02935074400738813,
+            "seconds_max": 0.0326215639943257,
+            "mib_s_median": 667.8689446941451,
+            "mib_s_min": 618.2150237861464,
+            "mib_s_max": 687.1083389101453,
+            "tokens_s_median": 154667524.1671639,
+            "tokens_s_min": 143168488.2065244,
+            "tokens_s_max": 159123053.1949847
+          },
+          "giga": {
+            "seconds_median": 0.03465256400522776,
+            "seconds_min": 0.03382944500481244,
+            "seconds_max": 0.03499375500541646,
+            "mib_s_median": 581.9812051324947,
+            "mib_s_min": 576.3068569683882,
+            "mib_s_max": 596.141643997543,
+            "tokens_s_median": 134777328.43363097,
+            "tokens_s_min": 133463242.20641945,
+            "tokens_s_max": 138056654.4717364
+          },
+          "giga_over_tokie_time": {
+            "median": 1.1285487218212937,
+            "min": 1.0622594309474354,
+            "max": 1.1905002473093558,
+            "median_of_medians": 1.1475782015023956,
+            "interpretation": "giga seconds / tokie seconds; below 1 means giga took less time"
+          }
+        },
+        "post_check": {
+          "tokie": {
+            "output_ok": true,
+            "checksum": 1760531839
+          },
+          "giga": {
+            "output_ok": true,
+            "checksum": 1760531839
+          }
+        },
+        "profile": {
+          "tokie": {
+            "wall_s": 0.0021058889979030937,
+            "process_cpu_s": 0.0021106499999987705,
+            "cpu_per_wall": 1.0022608039172138,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.002,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:224(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.002,
+                "func": "{method 'batch' of 'builtins.Tokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          },
+          "giga": {
+            "wall_s": 0.0024429430050076917,
+            "process_cpu_s": 0.0024344890000005392,
+            "cpu_per_wall": 0.9965394178293056,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.002,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:226(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.002,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/gigatoken/_tokenizer.py:206(encode_batch)"
+              },
+              {
+                "cumtime_s": 0.002,
+                "func": "{method 'encode_batch' of 'builtins.BPETokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/awkward/_dispatch.py:37(dispatch)"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{built-in method builtins.next}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          }
+        }
+      }
+    },
+    "cl100k": {
+      "encode": {
+        "threads": 1,
+        "passes_per_round": 20,
+        "input_bytes_utf8": 1057339,
+        "total_tokens": 229730,
+        "decoded_bytes_utf8": 1057339,
+        "cold": {
+          "tokie": {
+            "first_call_s": 0.0013684930017916486,
+            "remaining_pass_s": 0.006771862012101337,
+            "cold_full_pass_s": 0.008140355013892986,
+            "count": 229730
+          },
+          "giga": {
+            "first_call_s": 0.0003785209992201999,
+            "remaining_pass_s": 0.004011962999356911,
+            "cold_full_pass_s": 0.0043904839985771105,
+            "count": 229730
+          }
+        },
+        "rounds": [
+          {
+            "round": 1,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.029724969004746526,
+              "passes": 20,
+              "count": 229730
+            },
+            "giga": {
+              "seconds": 0.026853068004129454,
+              "passes": 20,
+              "count": 229730
+            }
+          },
+          {
+            "round": 2,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.026570809000986628,
+              "passes": 20,
+              "count": 229730
+            },
+            "tokie": {
+              "seconds": 0.030441685987170786,
+              "passes": 20,
+              "count": 229730
+            }
+          },
+          {
+            "round": 3,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.029836618996341713,
+              "passes": 20,
+              "count": 229730
+            },
+            "giga": {
+              "seconds": 0.026801161002367735,
+              "passes": 20,
+              "count": 229730
+            }
+          },
+          {
+            "round": 4,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.026819826001883484,
+              "passes": 20,
+              "count": 229730
+            },
+            "tokie": {
+              "seconds": 0.030229367010178976,
+              "passes": 20,
+              "count": 229730
+            }
+          },
+          {
+            "round": 5,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.0299220390006667,
+              "passes": 20,
+              "count": 229730
+            },
+            "giga": {
+              "seconds": 0.027093289987533353,
+              "passes": 20,
+              "count": 229730
+            }
+          }
+        ],
+        "summary": {
+          "tokie": {
+            "seconds_median": 0.0299220390006667,
+            "seconds_min": 0.029724969004746526,
+            "seconds_max": 0.030441685987170786,
+            "mib_s_median": 673.9895285960963,
+            "mib_s_min": 662.4843633559756,
+            "mib_s_max": 678.4579306869266,
+            "tokens_s_median": 153552369.87351117,
+            "tokens_s_min": 150931193.55926374,
+            "tokens_s_max": 154570388.25730407
+          },
+          "giga": {
+            "seconds_median": 0.026819826001883484,
+            "seconds_min": 0.026570809000986628,
+            "seconds_max": 0.027093289987533353,
+            "mib_s_median": 751.9489857718345,
+            "mib_s_min": 744.3592479899276,
+            "mib_s_max": 758.9961208913328,
+            "tokens_s_median": 171313564.81124574,
+            "tokens_s_min": 169584424.85627064,
+            "tokens_s_max": 172919085.7466701
+          },
+          "giga_over_tokie_time": {
+            "median": 0.8982640092583494,
+            "min": 0.8728428843325077,
+            "max": 0.9054626921290251,
+            "median_of_medians": 0.8963234758595798,
+            "interpretation": "giga seconds / tokie seconds; below 1 means giga took less time"
+          }
+        },
+        "post_check": {
+          "tokie": {
+            "output_ok": true,
+            "checksum": 2818975
+          },
+          "giga": {
+            "output_ok": true,
+            "checksum": 2818975
+          }
+        },
+        "profile": {
+          "tokie": {
+            "wall_s": 0.0019101310026599094,
+            "process_cpu_s": 0.00191340999999845,
+            "cpu_per_wall": 1.0017166347930977,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.002,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:219(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.002,
+                "func": "{method 'encode' of 'builtins.Tokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{built-in method numpy.asarray}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          },
+          "giga": {
+            "wall_s": 0.0015131450054468587,
+            "process_cpu_s": 0.0015071070000001185,
+            "cpu_per_wall": 0.9960096319751213,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.001,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:219(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.001,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/gigatoken/_tokenizer.py:203(encode)"
+              },
+              {
+                "cumtime_s": 0.001,
+                "func": "{method 'encode' of 'builtins.BPETokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{built-in method numpy.asarray}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          }
+        }
+      },
+      "decode": {
+        "threads": 1,
+        "passes_per_round": 20,
+        "input_bytes_utf8": 1057339,
+        "total_tokens": 229730,
+        "decoded_bytes_utf8": 1057339,
+        "cold": {
+          "tokie": {
+            "first_call_s": 0.0037318260001484305,
+            "remaining_pass_s": 0.00854217101004906,
+            "cold_full_pass_s": 0.01227399701019749,
+            "count": 1057339
+          },
+          "giga": {
+            "first_call_s": 0.00037678799708373845,
+            "remaining_pass_s": 0.003768435009988025,
+            "cold_full_pass_s": 0.004145223007071763,
+            "count": 1057339
+          }
+        },
+        "rounds": [
+          {
+            "round": 1,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.17695471899060067,
+              "passes": 20,
+              "count": 1057339
+            },
+            "giga": {
+              "seconds": 0.055022473010467365,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 2,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.0568279269937193,
+              "passes": 20,
+              "count": 1057339
+            },
+            "tokie": {
+              "seconds": 0.178782073999173,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 3,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.1715847519953968,
+              "passes": 20,
+              "count": 1057339
+            },
+            "giga": {
+              "seconds": 0.05300878699927125,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 4,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.049536968988832086,
+              "passes": 20,
+              "count": 1057339
+            },
+            "tokie": {
+              "seconds": 0.1744775309925899,
+              "passes": 20,
+              "count": 1057339
+            }
+          },
+          {
+            "round": 5,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.1738848870008951,
+              "passes": 20,
+              "count": 1057339
+            },
+            "giga": {
+              "seconds": 0.05532352899899706,
+              "passes": 20,
+              "count": 1057339
+            }
+          }
+        ],
+        "summary": {
+          "tokie": {
+            "seconds_median": 0.1744775309925899,
+            "seconds_min": 0.1715847519953968,
+            "seconds_max": 0.178782073999173,
+            "mib_s_median": 115.58589146673484,
+            "mib_s_min": 112.80292542521151,
+            "mib_s_max": 117.53457534055471,
+            "tokens_s_median": 26333476.716810796,
+            "tokens_s_min": 25699444.56523786,
+            "tokens_s_max": 26777437.6602139
+          },
+          "giga": {
+            "seconds_median": 0.055022473010467365,
+            "seconds_min": 0.049536968988832086,
+            "seconds_max": 0.0568279269937193,
+            "mib_s_median": 366.52552779401253,
+            "mib_s_min": 354.8808134937292,
+            "mib_s_max": 407.1129375162207,
+            "tokens_s_median": 83504062.0425391,
+            "tokens_s_min": 80851092.81758247,
+            "tokens_s_max": 92750931.14873125
+          },
+          "giga_over_tokie_time": {
+            "median": 0.31094097588541847,
+            "min": 0.28391603610516436,
+            "max": 0.31816180205880845,
+            "median_of_medians": 0.3153556374706161,
+            "interpretation": "giga seconds / tokie seconds; below 1 means giga took less time"
+          }
+        },
+        "post_check": {
+          "tokie": {
+            "output_ok": true,
+            "checksum": "a315720d60330b5c"
+          },
+          "giga": {
+            "output_ok": true,
+            "checksum": "a315720d60330b5c"
+          }
+        },
+        "profile": {
+          "tokie": {
+            "wall_s": 0.009232779004378244,
+            "process_cpu_s": 0.009214959000001244,
+            "cpu_per_wall": 0.998069919753462,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.009,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:221(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.009,
+                "func": "{method 'decode_bytes' of 'builtins.Tokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          },
+          "giga": {
+            "wall_s": 0.0037391700025182217,
+            "process_cpu_s": 0.0037185960000005736,
+            "cpu_per_wall": 0.9944977087150912,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.004,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:221(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.004,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/gigatoken/_tokenizer.py:287(decode)"
+              },
+              {
+                "cumtime_s": 0.004,
+                "func": "{method 'decode' of 'builtins.BPETokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'partition' of 'str' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          }
+        }
+      },
+      "batch": {
+        "threads": 1,
+        "passes_per_round": 20,
+        "input_bytes_utf8": 1057339,
+        "total_tokens": 229730,
+        "decoded_bytes_utf8": 1057339,
+        "cold": {
+          "tokie": {
+            "first_call_s": 0.007851130998460576,
+            "remaining_pass_s": 0.0,
+            "cold_full_pass_s": 0.007851130998460576,
+            "count": 229909
+          },
+          "giga": {
+            "first_call_s": 0.023157390009146184,
+            "remaining_pass_s": 0.0,
+            "cold_full_pass_s": 0.023157390009146184,
+            "count": 229909
+          }
+        },
+        "rounds": [
+          {
+            "round": 1,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.028795321006327868,
+              "passes": 20,
+              "count": 229909
+            },
+            "giga": {
+              "seconds": 0.027597427993896417,
+              "passes": 20,
+              "count": 229909
+            }
+          },
+          {
+            "round": 2,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.039008263003779575,
+              "passes": 20,
+              "count": 229909
+            },
+            "tokie": {
+              "seconds": 0.0288560249900911,
+              "passes": 20,
+              "count": 229909
+            }
+          },
+          {
+            "round": 3,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.02848442598769907,
+              "passes": 20,
+              "count": 229909
+            },
+            "giga": {
+              "seconds": 0.026992790997610427,
+              "passes": 20,
+              "count": 229909
+            }
+          },
+          {
+            "round": 4,
+            "order": [
+              "giga",
+              "tokie"
+            ],
+            "giga": {
+              "seconds": 0.026062101998832077,
+              "passes": 20,
+              "count": 229909
+            },
+            "tokie": {
+              "seconds": 0.029123517000698484,
+              "passes": 20,
+              "count": 229909
+            }
+          },
+          {
+            "round": 5,
+            "order": [
+              "tokie",
+              "giga"
+            ],
+            "tokie": {
+              "seconds": 0.02851989299233537,
+              "passes": 20,
+              "count": 229909
+            },
+            "giga": {
+              "seconds": 0.027293806997477077,
+              "passes": 20,
+              "count": 229909
+            }
+          }
+        ],
+        "summary": {
+          "tokie": {
+            "seconds_median": 0.028795321006327868,
+            "seconds_min": 0.02848442598769907,
+            "seconds_max": 0.029123517000698484,
+            "mib_s_median": 700.3617343339066,
+            "mib_s_min": 692.4692838509058,
+            "mib_s_max": 708.0058755406372,
+            "tokens_s_median": 159560645.25171715,
+            "tokens_s_min": 157762539.45874068,
+            "tokens_s_max": 161302179.7239013
+          },
+          "giga": {
+            "seconds_median": 0.027293806997477077,
+            "seconds_min": 0.026062101998832077,
+            "seconds_max": 0.039008263003779575,
+            "mib_s_median": 738.8907294082326,
+            "mib_s_min": 516.9966414228527,
+            "mib_s_max": 773.8109904411053,
+            "tokens_s_median": 168338553.88604107,
+            "tokens_s_min": 117785301.01570587,
+            "tokens_s_max": 176294298.90980774
+          },
+          "giga_over_tokie_time": {
+            "median": 0.9570094461719123,
+            "min": 0.8948816861029186,
+            "max": 1.3518238571381422,
+            "median_of_medians": 0.9478556252760361,
+            "interpretation": "giga seconds / tokie seconds; below 1 means giga took less time"
+          }
+        },
+        "post_check": {
+          "tokie": {
+            "output_ok": true,
+            "checksum": 1812579827
+          },
+          "giga": {
+            "output_ok": true,
+            "checksum": 1812579827
+          }
+        },
+        "profile": {
+          "tokie": {
+            "wall_s": 0.0018011359934462234,
+            "process_cpu_s": 0.001802941999999419,
+            "cpu_per_wall": 1.0010027041599119,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.002,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:224(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.002,
+                "func": "{method 'batch' of 'builtins.Tokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{method 'disable' of '_lsprof.Profiler' objects}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          },
+          "giga": {
+            "wall_s": 0.0017271770047955215,
+            "process_cpu_s": 0.0017213490000003162,
+            "cpu_per_wall": 0.996625704963056,
+            "cpu_bound": true,
+            "top": [
+              {
+                "cumtime_s": 0.002,
+                "func": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_published.py:226(<lambda>)"
+              },
+              {
+                "cumtime_s": 0.002,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/gigatoken/_tokenizer.py:206(encode_batch)"
+              },
+              {
+                "cumtime_s": 0.002,
+                "func": "{method 'encode_batch' of 'builtins.BPETokenizer' objects}"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "/tmp/opencode/published-gigatoken-0.2-bench/venv/lib/python3.12/site-packages/awkward/_dispatch.py:37(dispatch)"
+              },
+              {
+                "cumtime_s": 0.0,
+                "func": "{built-in method builtins.next}"
+              }
+            ],
+            "note": "cProfile sees Python frames only; native kernel internals are not attributed."
+          }
+        }
+      }
+    }
+  },
+  "status": {
+    "gpt2": "ok",
+    "qwen2": "ok",
+    "cl100k": "ok"
+  },
+  "errors": []
+}

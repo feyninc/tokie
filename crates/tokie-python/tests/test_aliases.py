@@ -78,6 +78,11 @@ ANGLE_PAD = {
 ANGLE_PAD_TEXT = json.dumps(ANGLE_PAD)
 
 
+def ids(*values: int) -> numpy.ndarray:
+    """A `uint32` array, the only input `decode` and `decode_bytes` take."""
+    return numpy.array(values, dtype=numpy.uint32)
+
+
 @pytest.fixture(scope="module")
 def full() -> tokie.Tokenizer:
     return tokie.Tokenizer.json(FULL_TEXT)
@@ -97,7 +102,7 @@ def test_from_json_and_from_file_are_path_aliases(tmp_path):
     assert from_json.vocab_size == from_file.vocab_size == opened.vocab_size == 11
     for tok in (from_json, from_file):
         assert tok.encode("a").tolist() == opened.encode("a").tolist()
-        assert tok.decode(tok.encode("a").tolist()) == "a"
+        assert tok.decode(tok.encode("a")) == "a"
 
     # The string is the json text, not a filename, and must raise.
     with pytest.raises(tokie.TokieError):
@@ -121,7 +126,7 @@ def test_get_vocab_uses_raw_spellings(full):
     # The raw spelling is not the decoded text.
     assert "\u00e9" not in vocab
     assert full.token(3) == "\u00c3\u00a9"
-    assert full.decode([3]) == "\u00e9"
+    assert full.decode(numpy.array([3], dtype=numpy.uint32)) == "\u00e9"
     assert all(isinstance(key, str) for key in vocab)
     assert all(type(value) is int for value in vocab.values())
 
@@ -157,35 +162,30 @@ def test_num_special_tokens_to_add_without_template():
 
 
 def test_decode_bytes_keeps_invalid_utf8(full):
-    assert isinstance(full.decode_bytes([2]), bytes)
-    assert full.decode_bytes([2]) == b"\xc3"
+    assert isinstance(full.decode_bytes(ids(2)), bytes)
+    assert full.decode_bytes(ids(2)) == b"\xc3"
     # decode is the lossy view of the same bytes.
-    assert full.decode([2]) == "\ufffd"
-    assert full.decode_bytes([3]) == "\u00e9".encode()
+    assert full.decode(ids(2)) == "\ufffd"
+    assert full.decode_bytes(ids(3)) == "\u00e9".encode()
 
-    kept = full.decode_bytes([2, 4, 3])
+    kept = full.decode_bytes(ids(2, 4, 3))
     assert kept == b"\xc3[MASK]\xc3\xa9"
     # [MASK] is an added special, so skip drops it and keeps the raw bytes.
-    assert full.decode_bytes([2, 4, 3], skip=True) == b"\xc3\xc3\xa9"
-    assert full.decode_bytes([2, 4, 3], True) == b"\xc3\xc3\xa9"
+    assert full.decode_bytes(ids(2, 4, 3), skip=True) == b"\xc3\xc3\xa9"
+    assert full.decode_bytes(ids(2, 4, 3), True) == b"\xc3\xc3\xa9"
 
 
 def test_decode_bytes_unknown_id_raises(full):
     with pytest.raises(tokie.TokieError):
-        full.decode_bytes([99])
+        full.decode_bytes(ids(99))
     with pytest.raises(tokie.TokieError):
-        full.decode([99])
+        full.decode(ids(99))
 
 
-def test_decode_accepts_encoded_array_and_sequences(full):
-    ids = full.encode("a")
-    assert full.decode(ids) == "a"
-    assert full.decode(ids.tolist()) == "a"
-    assert full.decode(tuple(ids.tolist())) == "a"
-
-    assert full.decode_bytes(ids) == b"a"
-    assert full.decode_bytes(ids.tolist()) == b"a"
-    assert full.decode_bytes(tuple(ids.tolist())) == b"a"
+def test_decode_accepts_encoded_array(full):
+    encoded = full.encode("a")
+    assert full.decode(encoded) == "a"
+    assert full.decode_bytes(encoded) == b"a"
 
 
 def test_batch_and_count_accept_sequences(full):
