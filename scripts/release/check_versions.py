@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Validate a tokie release version against the tag and every manifest.
 
-The release workflow passes either a published GitHub release tag (``v0.2.0``)
-or a manual version input (``0.2.0``). This script rejects anything that is not
-a strict SemVer release before a later job can write to a registry.
+The release workflow passes either a published GitHub release tag
+(``v0.2.0`` or ``python-v0.3.0``) or a manual version input (``0.3.0``) plus a
+target. This script rejects anything that is not a strict SemVer release before
+a later job can write to a registry.
 
-It checks:
-
-* the tag is exactly ``v`` plus the version;
-* every workspace member has the expected version (normalie is 0.1.0);
-* ``crates/tokie-python/pyproject.toml`` has the same version;
-* ``tokie`` pins ``normalie`` 0.1.0 and ``pretokie`` to the release version;
-* ``tokie-cli`` pins ``tokie`` to the release version.
+``--target all`` checks a coordinated Rust and Python release: every workspace
+member except normalie (0.1.0) carries the release version. ``--target python``
+checks a Python-only release: only ``tokie-python`` and ``pyproject.toml``
+carry the release version, while the Rust crates keep their own versions and
+must keep their dependency pins consistent with those actual versions.
 
 Only the standard library is used.
 """
@@ -39,6 +38,15 @@ PRERELEASE_IDENTIFIER = re.compile(r"[0-9A-Za-z-]+")
 
 NORMALIE_VERSION = "0.1.0"
 EXPECTED_PACKAGES = ("normalie", "pretokie", "tokie", "tokie-python", "tokie-cli")
+PYTHON_PACKAGE = "tokie-python"
+RELEASE_TARGETS = ("all", "python")
+# (manifest package, dependency) pairs whose version pin must match the
+# dependency's actual package version, whatever that version is.
+DEPENDENCY_EDGES = (
+    ("tokie", "normalie"),
+    ("tokie", "pretokie"),
+    ("tokie-cli", "tokie"),
+)
 
 
 class VersionError(Exception):
@@ -80,6 +88,22 @@ def version_from_tag(tag: str) -> str:
     if not tag.startswith("v"):
         fail(f"release tag {tag!r} must start with 'v' (for example v0.2.0)")
     return parse_semver(tag[1:], "release tag")
+
+
+def parse_release_tag(tag: str) -> tuple[str, str]:
+    if tag.startswith("python-v"):
+        return "python", version_from_tag(tag[len("python-") :])
+    if tag.startswith("v"):
+        return "all", version_from_tag(tag)
+    fail(
+        f"release tag {tag!r} must start with 'v' or 'python-v' "
+        "(for example v0.2.0 or python-v0.3.0)"
+    )
+
+
+def release_tag(target: str, version: str) -> str:
+    prefix = "python-" if target == "python" else ""
+    return f"{prefix}v{version}"
 
 
 def read_toml(path: Path) -> dict:
@@ -136,7 +160,7 @@ def requirement_pins_exact(requirement: str, version: str) -> bool:
     }
 
 
-def check_versions(root: Path, version: str) -> None:
+def check_workspace_members(root: Path) -> None:
     workspace = read_toml(root / "Cargo.toml")
     members = workspace.get("workspace", {}).get("members")
     if not isinstance(members, list) or not members:
@@ -150,13 +174,8 @@ def check_versions(root: Path, version: str) -> None:
             f"found {sorted(member_names)}, expected {sorted(expected_names)}"
         )
 
-    for package in EXPECTED_PACKAGES:
-        manifest = root / "crates" / package / "Cargo.toml"
-        found = package_version(manifest, package)
-        expected = NORMALIE_VERSION if package == "normalie" else version
-        if found != expected:
-            fail(f"{package} version is {found!r}, expected {expected!r}")
 
+def check_pyproject(root: Path, version: str) -> None:
     pyproject = read_toml(root / "crates" / "tokie-python" / "pyproject.toml")
     project = pyproject.get("project")
     if not isinstance(project, dict):
@@ -169,31 +188,63 @@ def check_versions(root: Path, version: str) -> None:
             f"{project.get('version')!r}, expected {version!r}"
         )
 
-    tokie_manifest = root / "crates" / "tokie" / "Cargo.toml"
-    normalie_requirement = dependency_requirement(tokie_manifest, "normalie")
-    if not requirement_pins_exact(normalie_requirement, NORMALIE_VERSION):
-        fail(
-            "tokie must pin normalie "
-            f"{NORMALIE_VERSION!r}, found {normalie_requirement!r}"
-        )
-    pretokie_requirement = dependency_requirement(tokie_manifest, "pretokie")
-    if not requirement_pins_exact(pretokie_requirement, version):
-        fail(
-            f"tokie must pin pretokie {version!r}, found {pretokie_requirement!r}"
-        )
 
-    cli_manifest = root / "crates" / "tokie-cli" / "Cargo.toml"
-    tokie_requirement = dependency_requirement(cli_manifest, "tokie")
-    if not requirement_pins_exact(tokie_requirement, version):
-        fail(
-            f"tokie-cli must pin tokie {version!r}, found {tokie_requirement!r}"
-        )
+def check_dependency_pins(root: Path, versions: dict[str, str]) -> None:
+    for package, dependency in DEPENDENCY_EDGES:
+        manifest = root / "crates" / package / "Cargo.toml"
+        requirement = dependency_requirement(manifest, dependency)
+        actual = versions[dependency]
+        if not requirement_pins_exact(requirement, actual):
+            fail(
+                f"{package} must pin {dependency} {actual!r}, "
+                f"found {requirement!r}"
+            )
+
+
+def check_versions(root: Path, version: str, target: str = "all") -> dict[str, str]:
+    if target not in RELEASE_TARGETS:
+        fail(f"unknown release target {target!r}")
+
+    check_workspace_members(root)
+    versions = {
+        package: package_version(root / "crates" / package / "Cargo.toml", package)
+        for package in EXPECTED_PACKAGES
+    }
+
+    if target == "all":
+        for package, found in versions.items():
+            expected = NORMALIE_VERSION if package == "normalie" else version
+            if found != expected:
+                fail(f"{package} version is {found!r}, expected {expected!r}")
+    else:
+        if versions["normalie"] != NORMALIE_VERSION:
+            fail(
+                f"normalie version is {versions['normalie']!r}, "
+                f"expected {NORMALIE_VERSION!r}"
+            )
+        if versions[PYTHON_PACKAGE] != version:
+            fail(
+                f"{PYTHON_PACKAGE} version is {versions[PYTHON_PACKAGE]!r}, "
+                f"expected {version!r}"
+            )
+
+    check_pyproject(root, version)
+    check_dependency_pins(root, versions)
+    return versions
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", help="release version, for example 0.2.0")
-    parser.add_argument("--tag", help="release tag, for example v0.2.0")
+    parser.add_argument("--version", help="release version, for example 0.3.0")
+    parser.add_argument(
+        "--tag",
+        help="release tag, for example v0.2.0 or python-v0.3.0",
+    )
+    parser.add_argument(
+        "--target",
+        choices=RELEASE_TARGETS,
+        help="release target; inferred from --tag when omitted (default: all)",
+    )
     parser.add_argument(
         "--root",
         type=Path,
@@ -203,7 +254,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--github-output",
         type=Path,
-        help="append version=<version> to this GitHub Actions output file",
+        help="append version, tag, and target to this GitHub Actions output file",
     )
     return parser.parse_args(argv)
 
@@ -211,28 +262,44 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
 
-    if args.version and args.tag:
-        tag_version = version_from_tag(args.tag)
-        version = parse_semver(args.version, "--version")
-        if tag_version != version:
-            fail(f"tag version {tag_version!r} does not match --version {version!r}")
-    elif args.tag:
-        version = version_from_tag(args.tag)
+    target = args.target
+    if args.tag:
+        tag_target, tag_version = parse_release_tag(args.tag)
+        if target is not None and target != tag_target:
+            fail(
+                f"release tag {args.tag!r} is a {tag_target!r} tag, "
+                f"but --target is {target!r}"
+            )
+        target = tag_target
+        if args.version:
+            version = parse_semver(args.version, "--version")
+            if version != tag_version:
+                fail(
+                    f"tag version {tag_version!r} does not match "
+                    f"--version {version!r}"
+                )
+        else:
+            version = tag_version
     elif args.version:
         version = parse_semver(args.version, "--version")
+        target = target or "all"
     else:
         fail("pass --version or --tag")
 
-    check_versions(args.root, version)
+    versions = check_versions(args.root, version, target)
+    tag = release_tag(target, version)
 
     if args.github_output:
         with args.github_output.open("a", encoding="utf-8") as handle:
             handle.write(f"version={version}\n")
+            handle.write(f"tag={tag}\n")
+            handle.write(f"target={target}\n")
 
+    print(f"release target: {target}")
     print(f"release version: {version}")
-    print("normalie: 0.1.0")
-    for package in ("pretokie", "tokie", "tokie-python", "tokie-cli"):
-        print(f"{package}: {version}")
+    print(f"release tag: {tag}")
+    for package in EXPECTED_PACKAGES:
+        print(f"{package}: {versions[package]}")
     return 0
 
 

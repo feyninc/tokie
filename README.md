@@ -33,10 +33,10 @@ tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face 
 ### Python
 
 ```bash
-pip install tokie
+pip install -U tokie
 ```
 
-`pip install tokie` installs the published 0.2.0 wheel, which accepts Python lists for `decode` and `decode_bytes` as well as arrays. The current source tree accepts arrays only. The examples below pass arrays, so they work with both.
+The Python package is 0.3.0. Add a floor with `pip install "tokie>=0.3.0"` when a resolver needs one. `decode` and `decode_bytes` take NumPy arrays; Python 0.2.0 also accepted lists. The examples below pass arrays.
 
 ### Rust
 
@@ -45,7 +45,7 @@ pip install tokie
 tokie = "0.2"
 ```
 
-These docs describe the current source tree. The strict `decode` array contract is unreleased: the published 0.2.0 wheel also accepts Python lists. See [the decode input note](docs/RELEASE_NOTE_DECODE_UINT32.md). To migrate from 0.1.4, see [API changes in 0.2](docs/API_CHANGES_0_2.md).
+These docs describe Python 0.3.0 and Rust 0.2.0. Python 0.3.0 requires arrays for `decode`; Python 0.2.0 also accepted lists. See [the decode input note](docs/RELEASE_NOTE_DECODE_UINT32.md) and the [Python 0.3.0 release notes](docs/PYTHON_RELEASE_0_3.md). For the Rust 0.1.4 to 0.2 changes, see [API changes in 0.2](docs/API_CHANGES_0_2.md).
 
 Coming from Hugging Face `tokenizers`? See the [migration guide](docs/MIGRATION.md).
 
@@ -72,7 +72,7 @@ print(tokenizer.count_tokens("Hello, world!"))
 print(tokenizer.count_tokens_batch(["Hello!", "World"]))
 ```
 
-`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the parsed template, so BERT's single sequence is `[CLS]`, the ids, `[SEP]`. `pair` uses the pair template. `truncate` and `pad` share `max_len`, and that length counts the template ids; truncation drops from the right, longest sequence first, and padding is fixed on the right. `batch` returns one id array and `ends[i]`, the cumulative id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off. Python returns NumPy arrays, not 0.1.4 `Encoding` objects; there is no `.ids`. Use `.tolist()` only to print or assert. `decode` and `decode_bytes` take a one-dimensional native `uint32` array directly, such as `plus` or `flat[start:end]`; do not pass `.tolist()`. Lists are rejected in this source tree (published 0.2.0 accepts them).
+`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the parsed template, so BERT's single sequence is `[CLS]`, the ids, `[SEP]`. `pair` uses the pair template. `truncate` and `pad` share `max_len`, and that length counts the template ids; truncation drops from the right, longest sequence first, and padding is fixed on the right. `batch` returns one id array and `ends[i]`, the cumulative id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off. Python returns NumPy arrays, not 0.1.4 `Encoding` objects; there is no `.ids`. Use `.tolist()` only to print or assert. `decode` and `decode_bytes` take a one-dimensional native `uint32` array directly, such as `plus` or `flat[start:end]`; do not pass `.tolist()`. Lists, tuples, and arrays of another dtype are rejected.
 
 ### Rust
 
@@ -153,7 +153,7 @@ let mut again = Tokenizer::open("model.tokie")?;
 
 ### Decode input
 
-`decode` and `decode_bytes` take a one-dimensional native-endian NumPy `uint32` array. The array must be C-contiguous and aligned. Empty, read-only, and contiguous slice arrays are accepted. Pass `encode`, `encode_plus`, or a slice of `batch`'s flat ids directly. For ids already in a Python list, convert explicitly with `numpy.array(values, dtype=numpy.uint32)`; there is no implicit cast or fallback. `.tolist()` is for printing and assertions, not for passing to decode. `batch`'s `ends` array is `uint64`; it is not decode input.
+`decode` and `decode_bytes` take a one-dimensional native-endian NumPy `uint32` array. The array must be C-contiguous and aligned. Empty, read-only, and contiguous slice arrays are accepted. Pass `encode`, `encode_plus`, or a slice of `batch`'s flat ids directly. For ids already in a Python list, convert explicitly with `numpy.asarray(values, dtype=numpy.uint32)`; there is no implicit cast or fallback. `.tolist()` is for printing and assertions, not for passing to decode. `batch`'s `ends` array is `uint64`; it is not decode input.
 
 ```python
 ids = tokenizer.encode("Hello")
@@ -164,11 +164,11 @@ flat, ends = tokenizer.batch(["Hello", "world"])
 print(tokenizer.decode(flat[: ends[0]]))  # first document
 ```
 
-Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`. Non-contiguous or unaligned non-empty arrays raise `ValueError`. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`. These rules apply to the current source tree; the published 0.2.0 wheel also accepts lists. The [current benchmark](docs/BENCHMARK_UINT32_DECODE.md) was measured with a local unreleased wheel, not the published package, and records the source branch snapshot separately from the wheel artifact.
+Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`. Non-contiguous or unaligned non-empty arrays raise `ValueError`. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`. These rules are the Python 0.3.0 contract; 0.2.0 also accepted lists. The [current benchmark](docs/BENCHMARK_UINT32_DECODE.md) was measured with the pre-version-bump development wheel, not the released package, and records the source branch snapshot separately from the wheel artifact.
 
 ## Benchmarks
 
-Python 3.12, AMD Ryzen AI 9 HX 370, Linux. Warm-cache medians over five alternating rounds with the library order rotated. Single-document encode and Unicode decode use 179 OpenWebText documents (1.008 MiB); batch uses 3,411 documents (16.14 MiB) at one and eight threads. The tokie series is a **local unreleased 0.2.0 wheel** (sha256 `8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85`); the report records the source branch snapshot separately. Its version metadata says 0.2.0, but it is not on PyPI. GigaToken 0.11.0 and Hugging Face `tokenizers` 0.23.3 are public wheels. The detailed charts below use those three; the GPT-2 six-library chart above adds HF 1.0.0rc4, Kitoken 0.11.1, and tiktoken 0.14.0 in a separate run.
+Python 3.12, AMD Ryzen AI 9 HX 370, Linux. Warm-cache medians over five alternating rounds with the library order rotated. Single-document encode and Unicode decode use 179 OpenWebText documents (1.008 MiB); batch uses 3,411 documents (16.14 MiB) at one and eight threads. The tokie series is a **local unreleased 0.2.0 wheel** (sha256 `8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85`); the report records the source branch snapshot separately. Its version metadata says 0.2.0, but it is not on PyPI. The benchmarks use that pre-version-bump development wheel: the binding implementation is the same, the artifact and version stay as measured, and there was no retiming for the release. GigaToken 0.11.0 and Hugging Face `tokenizers` 0.23.3 are public wheels. The detailed charts below use those three; the GPT-2 six-library chart above adds HF 1.0.0rc4, Kitoken 0.11.1, and tiktoken 0.14.0 in a separate run.
 
 The clocks cover each library's public call and output, not an isolated kernel. Encode includes id materialization. Decode decodes the same contiguous NumPy `uint32` ids to Unicode; GigaToken's UTF-8 decode and Hugging Face's `ids.tolist()` conversion are inside the clock. Batch includes tokie's flat ids plus ends, GigaToken's Awkward array, and Hugging Face's list of `Encoding.ids`. These are end-to-end API costs. Ranges are min–max over the five rounds, not confidence intervals.
 

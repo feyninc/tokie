@@ -1,9 +1,9 @@
 # Migrating from Hugging Face `tokenizers`
 
 > [!NOTE]
-> This guide describes the unreleased source tree. The strict `decode` array contract is not in the published 0.2.0 wheel, which also accepts Python lists. See [the decode input note](RELEASE_NOTE_DECODE_UINT32.md).
+> This guide targets Python 0.3.0 and Rust 0.2.0. Python 0.3.0 requires a one-dimensional native `uint32` NumPy array for `decode` and `decode_bytes`; Python 0.2.0 also accepted lists. See [the decode input note](RELEASE_NOTE_DECODE_UINT32.md) and the [Python 0.3.0 release notes](PYTHON_RELEASE_0_3.md).
 
-`encode` appends ids and leaves the template off. `encode_plus` applies the template. Hugging Face `encode` adds the template by default, so use `encode_plus` where you relied on that. Coming from tokie 0.1.4 rather than Hugging Face? See [API.md](API.md) and [API_CHANGES_0_2.md](API_CHANGES_0_2.md).
+`encode` appends ids and leaves the template off. `encode_plus` applies the template. Hugging Face `encode` adds the template by default, so use `encode_plus` where you relied on that. For GPT-2 the template is empty, so `encode` and `encode_plus` match and both take the same text strings. Coming from tokie 0.2.0 Python, `encode`, `encode_plus`, `batch`, and the vocabulary calls are unchanged; only the `decode` input changed. Coming from tokie 0.1.4 rather than Hugging Face? See [API.md](API.md) and [API_CHANGES_0_2.md](API_CHANGES_0_2.md).
 
 ## Python
 
@@ -30,7 +30,7 @@ again = tokie.Tokenizer.open("model.tokie")
 
 `encode` and `encode_plus` return a `uint32` array. `batch` returns `(uint32 ids, uint64 ends)`. There is no `Encoding` and no `.ids`; use `.tolist()` only to print or assert. `decode` and `decode_bytes` take a one-dimensional native-endian NumPy `uint32` array that is C-contiguous and aligned; pass `plus` or `flat[start:end]` directly. `decode` returns a `str` and is lossy when the bytes are not UTF-8. `decode_bytes` returns raw bytes. Both keep specials by default; `skip=True` omits them. `ends[i]` is the cumulative id count after text `i`.
 
-Hugging Face `tokenizers` `encode` returns an `Encoding` object, not a list; its `.ids` is a Python `list[int]`. To reuse those ids with tokie, convert the ids list once: `tokie_ids = numpy.array(hf_tokenizer.encode(text).ids, dtype=numpy.uint32)`. Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`; non-contiguous or unaligned non-empty arrays raise `ValueError`. Empty and read-only arrays are accepted. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`.
+Hugging Face `tokenizers` `encode` returns an `Encoding` object, not a list; its `.ids` is a Python `list[int]`. To reuse those ids with tokie, convert the ids list once: `tokie_ids = numpy.asarray(hf_tokenizer.encode(text).ids, dtype=numpy.uint32)`. That allocates a fresh aligned, C-contiguous array, so it is already valid decode input. For an arbitrary existing array, copy explicitly with `numpy.array(values, dtype=numpy.uint32, copy=True, order="C")`; `numpy.ascontiguousarray` alone leaves an already C-contiguous but misaligned buffer unaligned. Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`; non-contiguous or unaligned non-empty arrays raise `ValueError`. Empty and read-only arrays are accepted. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`.
 
 `count_tokens` and `count_tokens_batch` measure `encode`, not `encode_plus`. The template is excluded in both 0.1.4 and 0.2.
 

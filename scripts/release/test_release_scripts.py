@@ -18,7 +18,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -81,13 +81,71 @@ def fake_workspace(
     return temp, root
 
 
-class VersionTests(unittest.TestCase):
-    def test_repo_manifests_match_020(self) -> None:
-        check_versions.check_versions(ROOT, "0.2.0")
+def fake_release_workspace(
+    *,
+    python: str = "0.3.0",
+    pyproject: str | None = None,
+    normalie: str = "0.1.0",
+    pretokie: str = "0.2.0",
+    tokie: str = "0.2.0",
+    cli: str = "0.2.0",
+    tokie_pretokie: str | None = None,
+    cli_tokie: str | None = None,
+) -> tuple[tempfile.TemporaryDirectory, Path]:
+    """Build a full workspace with independent Rust and Python versions."""
+    temp = tempfile.TemporaryDirectory(prefix="tokie-fake-release-")
+    root = Path(temp.name)
+    (root / "Cargo.toml").write_text(
+        "[workspace]\nmembers = [\n"
+        + "".join(f'  "crates/{name}",\n' for name in check_versions.EXPECTED_PACKAGES)
+        + "]\n",
+        encoding="utf-8",
+    )
+    versions = {
+        "normalie": normalie,
+        "pretokie": pretokie,
+        "tokie": tokie,
+        "tokie-python": python,
+        "tokie-cli": cli,
+    }
+    for name, version in versions.items():
+        crate = root / "crates" / name
+        crate.mkdir(parents=True)
+        manifest = f'[package]\nname = "{name}"\nversion = "{version}"\n'
+        if name == "tokie":
+            manifest += (
+                "[dependencies]\n"
+                f'normalie = {{ version = "{normalie}", path = "../normalie" }}\n'
+                f'pretokie = {{ version = "{tokie_pretokie or pretokie}", path = "../pretokie" }}\n'
+            )
+        elif name == "tokie-cli":
+            manifest += (
+                "[dependencies]\n"
+                f'tokie = {{ version = "{cli_tokie or tokie}", path = "../tokie" }}\n'
+            )
+        (crate / "Cargo.toml").write_text(manifest, encoding="utf-8")
+    (root / "crates" / "tokie-python" / "pyproject.toml").write_text(
+        '[project]\nname = "tokie"\n'
+        f'version = "{python if pyproject is None else pyproject}"\n',
+        encoding="utf-8",
+    )
+    return temp, root
 
-    def test_wrong_release_version_is_rejected(self) -> None:
-        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
-            check_versions.check_versions(ROOT, "0.3.0")
+
+class VersionTests(unittest.TestCase):
+    def test_repo_python_release_matches_python_only(self) -> None:
+        check_versions.check_versions(ROOT, "0.3.0", "python")
+
+    def test_repo_all_release_rejects_split_versions(self) -> None:
+        # The repo currently ships Python 0.3.0 against Rust 0.2.0, so neither
+        # an all-0.2 nor an all-0.3 coordinated release is valid.
+        for version in ("0.2.0", "0.3.0"):
+            with (
+                self.subTest(version=version),
+                redirect_stderr(StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                check_versions.check_versions(ROOT, version, "all")
 
     def test_semver_rejects_shell_metacharacters(self) -> None:
         for value in ("0.2.0; rm -rf /", "0.2", "v0.2.0", "0.2.0+local"):
@@ -102,6 +160,16 @@ class VersionTests(unittest.TestCase):
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             check_versions.version_from_tag("0.2.0")
         self.assertEqual(check_versions.version_from_tag("v0.2.0"), "0.2.0")
+
+    def test_version_from_tag_stays_v_only(self) -> None:
+        # parse_release_tag handles the python- prefix and delegates the
+        # remaining v-prefixed tag to this helper.
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            check_versions.version_from_tag("python-v0.3.0")
+        self.assertEqual(
+            check_versions.version_from_tag("python-v0.3.0"[len("python-") :]),
+            "0.3.0",
+        )
 
     def test_semver_prerelease_identifiers(self) -> None:
         for value in ("0.2.0-0", "0.2.0-rc.1", "0.2.0-01a"):
@@ -137,6 +205,267 @@ class VersionTests(unittest.TestCase):
                 check_versions.requirement_pins_exact(requirement, "0.1.0"),
                 requirement,
             )
+
+    def test_semver_rejects_non_ascii_numeric_prerelease(self) -> None:
+        # The core pattern is ASCII-only; Unicode digits must not slip through
+        # the leading-zero guard via isdigit().
+        for value in ("0.3.0-٠١", "0.3.0-١"):
+            with (
+                self.subTest(value=value),
+                redirect_stderr(StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                check_versions.parse_semver(value, "version")
+
+
+class PythonTargetTests(unittest.TestCase):
+    def assert_rejected(
+        self, root: Path, version: str = "0.3.0", target: str = "python"
+    ) -> None:
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            check_versions.check_versions(root, version, target)
+
+    def test_independent_rust_versions_are_accepted(self) -> None:
+        temp, root = fake_release_workspace()
+        self.addCleanup(temp.cleanup)
+        check_versions.check_versions(root, "0.3.0", "python")
+
+    def test_all_target_still_accepts_coordinated_versions(self) -> None:
+        temp, root = fake_release_workspace(python="0.2.0", pyproject="0.2.0")
+        self.addCleanup(temp.cleanup)
+        check_versions.check_versions(root, "0.2.0", "all")
+
+    def test_python_cargo_version_mismatch_is_rejected(self) -> None:
+        temp, root = fake_release_workspace(python="0.3.1")
+        self.addCleanup(temp.cleanup)
+        self.assert_rejected(root)
+
+    def test_pyproject_version_mismatch_is_rejected(self) -> None:
+        temp, root = fake_release_workspace(pyproject="0.2.9")
+        self.addCleanup(temp.cleanup)
+        self.assert_rejected(root)
+
+    def test_wrong_rust_dependency_pin_is_rejected(self) -> None:
+        temp, root = fake_release_workspace(tokie_pretokie="0.3.0")
+        self.addCleanup(temp.cleanup)
+        self.assert_rejected(root)
+
+    def test_wrong_cli_dependency_pin_is_rejected(self) -> None:
+        temp, root = fake_release_workspace(cli_tokie="0.3.0")
+        self.addCleanup(temp.cleanup)
+        self.assert_rejected(root)
+
+    def test_normalie_drift_is_rejected(self) -> None:
+        temp, root = fake_release_workspace(normalie="0.2.0")
+        self.addCleanup(temp.cleanup)
+        self.assert_rejected(root)
+
+
+class ReleaseTagTests(unittest.TestCase):
+    def test_parse_release_tag_selects_target(self) -> None:
+        self.assertEqual(
+            check_versions.parse_release_tag("v0.2.0"), ("all", "0.2.0")
+        )
+        self.assertEqual(
+            check_versions.parse_release_tag("python-v0.3.0"),
+            ("python", "0.3.0"),
+        )
+
+    def test_parse_release_tag_rejects_bad_prefix_and_injection(self) -> None:
+        for tag in (
+            "0.3.0",
+            "python-0.3.0",
+            "Python-v0.3.0",
+            "v0.3.0; rm -rf /",
+            "python-v0.3.0\nx",
+        ):
+            with (
+                self.subTest(tag=tag),
+                redirect_stderr(StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                check_versions.parse_release_tag(tag)
+
+    def test_explicit_target_conflict_is_rejected(self) -> None:
+        temp, root = fake_release_workspace()
+        self.addCleanup(temp.cleanup)
+        for tag, target in (("python-v0.3.0", "all"), ("v0.2.0", "python")):
+            with (
+                self.subTest(tag=tag),
+                redirect_stderr(StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                check_versions.main(
+                    ["--tag", tag, "--target", target, "--root", str(root)]
+                )
+
+    def test_python_github_outputs_are_exact(self) -> None:
+        temp, root = fake_release_workspace()
+        self.addCleanup(temp.cleanup)
+        with tempfile.TemporaryDirectory(prefix="tokie-output-") as directory:
+            output = Path(directory) / "output"
+            with redirect_stdout(StringIO()):
+                code = check_versions.main(
+                    [
+                        "--version",
+                        "0.3.0",
+                        "--target",
+                        "python",
+                        "--root",
+                        str(root),
+                        "--github-output",
+                        str(output),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                "version=0.3.0\ntag=python-v0.3.0\ntarget=python\n",
+            )
+
+    def test_all_github_outputs_are_exact(self) -> None:
+        temp, root = fake_release_workspace(python="0.2.0", pyproject="0.2.0")
+        self.addCleanup(temp.cleanup)
+        with tempfile.TemporaryDirectory(prefix="tokie-output-") as directory:
+            output = Path(directory) / "output"
+            with redirect_stdout(StringIO()):
+                code = check_versions.main(
+                    ["--tag", "v0.2.0", "--root", str(root), "--github-output", str(output)]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                "version=0.2.0\ntag=v0.2.0\ntarget=all\n",
+            )
+
+
+class WorkflowGateTests(unittest.TestCase):
+    WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+    UPLOAD_NEEDS = {
+        "validate-version",
+        "build-wheels",
+        "build-pyemscripten",
+        "smoke-pyemscripten",
+        "build-sdist",
+        "publish-crates",
+    }
+    PUBLISH_CRATES_IF = (
+        "needs.validate-version.outputs.target == 'all' && "
+        "(github.event_name == 'release' || "
+        "(github.event_name == 'workflow_dispatch' && inputs.publish "
+        "&& github.ref == 'refs/heads/main'))"
+    )
+    UPLOAD_IF = (
+        "always() && !cancelled() && github.event_name == 'release' "
+        "&& needs.validate-version.result == 'success' "
+        "&& needs.build-wheels.result == 'success' "
+        "&& needs.build-pyemscripten.result == 'success' "
+        "&& needs.smoke-pyemscripten.result == 'success' "
+        "&& needs.build-sdist.result == 'success' "
+        "&& ((needs.validate-version.outputs.target == 'all' "
+        "&& needs.publish-crates.result == 'success') "
+        "|| (needs.validate-version.outputs.target == 'python' "
+        "&& needs.publish-crates.result == 'skipped'))"
+    )
+
+    @staticmethod
+    def job_block(text: str, job: str) -> str:
+        lines = text.splitlines()
+        try:
+            start = lines.index(f"  {job}:")
+        except ValueError as exc:
+            raise AssertionError(f"missing job {job!r}") from exc
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            line = lines[index]
+            if line.strip() and len(line) - len(line.lstrip()) <= 2:
+                end = index
+                break
+        return "\n".join(lines[start:end])
+
+    @staticmethod
+    def if_expression(block: str) -> str:
+        lines = block.splitlines()
+        for index, line in enumerate(lines):
+            if not line.strip().startswith("if:"):
+                continue
+            value = line.split("if:", 1)[1].strip()
+            if value in {">-", ">", "|", "|-"}:
+                indent = len(line) - len(line.lstrip())
+                parts = []
+                for follow in lines[index + 1 :]:
+                    if follow.strip() and len(follow) - len(follow.lstrip()) <= indent:
+                        break
+                    if follow.strip():
+                        parts.append(follow.strip())
+                value = " ".join(parts)
+            return " ".join(value.split())
+        raise AssertionError("missing if expression")
+
+    @staticmethod
+    def needs_list(block: str) -> list[str]:
+        lines = block.splitlines()
+        for index, line in enumerate(lines):
+            if line.strip() != "needs:":
+                continue
+            indent = len(line) - len(line.lstrip())
+            items = []
+            for follow in lines[index + 1 :]:
+                if follow.strip() and len(follow) - len(follow.lstrip()) <= indent:
+                    break
+                item = follow.strip()
+                if item.startswith("- "):
+                    items.append(item[2:].strip())
+            return items
+        raise AssertionError("missing needs list")
+
+    def text(self) -> str:
+        return self.WORKFLOW.read_text(encoding="utf-8")
+
+    def gate_errors(self, text: str) -> list[str]:
+        errors = []
+        publish = self.job_block(text, "publish-crates")
+        if self.if_expression(publish) != self.PUBLISH_CRATES_IF:
+            errors.append("publish-crates gate changed")
+        upload = self.job_block(text, "upload-pypi")
+        needs = self.needs_list(upload)
+        if len(needs) != 6 or set(needs) != self.UPLOAD_NEEDS:
+            errors.append(f"upload-pypi needs changed: {needs}")
+        if self.if_expression(upload) != self.UPLOAD_IF:
+            errors.append("upload-pypi gate changed")
+        return errors
+
+    def test_workflow_gates_are_intact(self) -> None:
+        self.assertEqual(self.gate_errors(self.text()), [])
+
+    def test_gate_check_catches_removed_target_guard(self) -> None:
+        publish = self.job_block(self.text(), "publish-crates")
+        mutated = publish.replace(
+            "needs.validate-version.outputs.target == 'all' && ", "", 1
+        )
+        self.assertTrue(self.gate_errors(self.text().replace(publish, mutated)))
+
+    def test_gate_check_catches_removed_needed_job(self) -> None:
+        upload = self.job_block(self.text(), "upload-pypi")
+        mutated = upload.replace("      - smoke-pyemscripten\n", "", 1)
+        self.assertTrue(self.gate_errors(self.text().replace(upload, mutated)))
+
+    def test_dispatch_exposes_target_choice(self) -> None:
+        text = self.text()
+        self.assertIn("type: choice", text)
+        self.assertIn("default: all", text)
+        self.assertIn("          - python\n", text)
+
+    def test_manual_python_publish_is_rejected(self) -> None:
+        block = self.job_block(self.text(), "validate-version")
+        self.assertIn(
+            "steps.check.outputs.target == 'python' && inputs.publish", block
+        )
+
+    def test_ancestry_uses_validated_tag(self) -> None:
+        block = self.job_block(self.text(), "validate-version")
+        self.assertIn("TAG: ${{ steps.check.outputs.tag }}", block)
+        self.assertNotIn('tag="v$VERSION"', block)
 
 
 class WheelTests(unittest.TestCase):
