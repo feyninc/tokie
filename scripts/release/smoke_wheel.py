@@ -332,6 +332,18 @@ def smoke_check(expected_version: str, wheel: Path | None) -> None:
             fail("save/open did not round-trip the tokenizer")
         if reopened.vocab_size != tok.vocab_size:
             fail("save/open changed vocab_size")
+        # Saving over the same path reruns the temporary write and flush. On
+        # Windows the flush needs a writable handle, so a read-only reopen
+        # fails here.
+        tok.save(str(saved))
+        again = tokie.Tokenizer.open(str(saved))
+        if again.get_vocab() != tok.get_vocab():
+            fail("saving twice changed the tokenizer vocab")
+        if again.vocab_size != tok.vocab_size:
+            fail("saving twice changed vocab_size")
+        leftovers = sorted(path.name for path in Path(directory).iterdir() if path.suffix == ".tmp")
+        if leftovers:
+            fail(f"save left temporary files behind: {leftovers}")
 
     print(
         f"smoke ok: tokie {installed} on Python "

@@ -422,7 +422,12 @@ impl Tokenizer {
         tmp_name.push(".tmp");
         let tmp = Path::new(&tmp_name);
         fs::write(tmp, &bytes).map_err(|err| format!("write {}: {err}", tmp.display()))?;
-        let file = fs::File::open(tmp).map_err(|err| format!("open {}: {err}", tmp.display()))?;
+        // `sync_all` needs a writable handle: Windows refuses to flush a
+        // handle opened read-only, so the temporary must be reopened for writing.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(tmp)
+            .map_err(|err| format!("open {}: {err}", tmp.display()))?;
         file.sync_all()
             .map_err(|err| format!("sync {}: {err}", tmp.display()))?;
         fs::rename(tmp, path).map_err(|err| format!("rename {}: {err}", path.display()))?;
