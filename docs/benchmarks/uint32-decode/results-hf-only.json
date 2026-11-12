@@ -1,0 +1,1138 @@
+{
+ "schema_version": 1,
+ "meta": {
+  "generated_utc": "2026-11-12T04:46:57Z",
+  "argv": [
+   "scripts/bench_current.py",
+   "--corpus",
+   "/tmp/opencode/tokie-compat/corpus/owt_20m.jsonl",
+   "--hf-only-model",
+   "bert-base-uncased=/home/bhavnick/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/tokenizer.json",
+   "--hf-only-model",
+   "t5-small=/home/bhavnick/.cache/huggingface/hub/models--t5-small/snapshots/main/tokenizer.json",
+   "--threads",
+   "1",
+   "--tasks",
+   "encode,decode",
+   "--rounds",
+   "5",
+   "--passes-encode",
+   "10",
+   "--passes-decode",
+   "10",
+   "--max-chars",
+   "1048576",
+   "--max-docs",
+   "256",
+   "--batch-max-chars",
+   "16777216",
+   "--batch-max-docs",
+   "4187",
+   "--tokie-wheel",
+   "/tmp/opencode/decode-u32-after/dist/tokie-0.2.0-cp312-cp312-manylinux_2_34_x86_64.whl",
+   "--expected-tokie-wheel-sha256",
+   "8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85",
+   "--wheels-dir",
+   "/tmp/opencode/published-gigatoken-0.2-bench/wheels",
+   "--output",
+   "docs/benchmarks/uint32-decode/results-hf-only.json"
+  ],
+  "claim_scope": "current-state warm throughput on one seeded OpenWebText slice; local unreleased tokie wheel vs public gigatoken 0.11.0 and public HF tokenizers 0.23.3; not a regression study",
+  "python": "3.12.13",
+  "platform": "linux",
+  "executable": "/tmp/opencode/decode-u32-vs-gigatoken/venv/bin/python",
+  "cpu_model": "AMD Ryzen AI 9 HX 370 w/ Radeon 890M",
+  "cpu_count_logical": 24,
+  "load_before": [
+   3.42431640625,
+   2.62744140625,
+   1.93310546875
+  ],
+  "host": {
+   "label": "one pre-validation snapshot; not sampled during timing and not causal proof",
+   "governors": {
+    "powersave": 24
+   },
+   "scaling_drivers": {
+    "amd-pstate-epp": 24
+   },
+   "cpus_with_freq": 24,
+   "mean_cur_freq_mhz": 1547.2,
+   "min_cur_freq_mhz": 605.3,
+   "max_cur_freq_mhz": 2793.3
+  },
+  "env": {
+   "RAYON_NUM_THREADS": "1",
+   "TOKENIZERS_PARALLELISM": "false",
+   "LD_LIBRARY_PATH": "/nix/store/604gsr59rj7dzd0nrhp143rpvf7gyiaz-gcc-15.3.0-lib/lib:/nix/store/483x61iy35irm4wr2b7dwzihljhp6da2-zlib-1.3.2/lib"
+  },
+  "artifacts": {
+   "tokie": {
+    "version": "0.2.0",
+    "kind": "local_unreleased",
+    "wheel_sha256": "8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85",
+    "wheel_file": "tokie-0.2.0-cp312-cp312-manylinux_2_34_x86_64.whl",
+    "wheel_bytes": 2380513,
+    "wheel": {
+     "file": "tokie-0.2.0-cp312-cp312-manylinux_2_34_x86_64.whl",
+     "path": "/tmp/opencode/decode-u32-after/dist/tokie-0.2.0-cp312-cp312-manylinux_2_34_x86_64.whl",
+     "sha256": "8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85",
+     "bytes": 2380513
+    },
+    "expected_wheel_sha256": "8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85",
+    "wheel_sha256_matches_expected": true,
+    "wheel_metadata_version": "0.2.0",
+    "installed_metadata": {
+     "version": "0.2.0",
+     "name": "tokie",
+     "installer": "uv",
+     "direct_url": "{\"url\":\"file:///tmp/opencode/decode-u32-after/dist/tokie-0.2.0-cp312-cp312-manylinux_2_34_x86_64.whl\",\"archive_info\":{}}"
+    },
+    "import_path": "/tmp/opencode/decode-u32-vs-gigatoken/venv/lib/python3.12/site-packages/tokie/__init__.py",
+    "installed_native": {
+     "tokie.cpython-312-x86_64-linux-gnu.so": "f9e7abb0e3d5873f5f68bda5b998b6575982ab4637fc3aed9dec17f2c0e482f3"
+    },
+    "wheel_native_members": {
+     "tokie.cpython-312-x86_64-linux-gnu.so": "f9e7abb0e3d5873f5f68bda5b998b6575982ab4637fc3aed9dec17f2c0e482f3"
+    },
+    "installed_matches_wheel": true,
+    "provenance": "local build installed from --tokie-wheel; the 0.2.0 version string does not identify this artifact and it is not claimed as published"
+   },
+   "giga": {
+    "version": "0.11.0",
+    "kind": "pypi",
+    "import_path": "/tmp/opencode/decode-u32-vs-gigatoken/venv/lib/python3.12/site-packages/gigatoken/__init__.py",
+    "wheel_sha256": "11992abc7f41e41e5be03c722df1c5205b5d0fcc4bcbd4fb440d2a0b97f7ac3f",
+    "wheel": {
+     "file": "gigatoken-0.11.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+     "path": "/tmp/opencode/published-gigatoken-0.2-bench/wheels/gigatoken-0.11.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+     "sha256": "11992abc7f41e41e5be03c722df1c5205b5d0fcc4bcbd4fb440d2a0b97f7ac3f",
+     "bytes": 5415971
+    },
+    "installed_artifacts": {
+     "installed_native": {
+      "gigatoken_rs.abi3.so": "b2acb2252bb342496d2921123caaa3e4f4be45c285d7875e4c20fa0312cdaf4d"
+     },
+     "wheel_native_members": {
+      "gigatoken_rs.abi3.so": "b2acb2252bb342496d2921123caaa3e4f4be45c285d7875e4c20fa0312cdaf4d"
+     },
+     "installed_matches_wheel": true
+    }
+   },
+   "hf": {
+    "version": "0.23.3",
+    "kind": "pypi",
+    "import_path": "/tmp/opencode/decode-u32-vs-gigatoken/venv/lib/python3.12/site-packages/tokenizers/__init__.py",
+    "wheel_sha256": "376851d22bcf9d650a5c3090bb83e6cf9e895fbf0595369fa4cd43c1f69b5f87",
+    "wheel": {
+     "file": "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+     "path": "/tmp/opencode/published-gigatoken-0.2-bench/wheels/tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+     "sha256": "376851d22bcf9d650a5c3090bb83e6cf9e895fbf0595369fa4cd43c1f69b5f87",
+     "bytes": 3396193
+    },
+    "installed_artifacts": {
+     "installed_native": {
+      "tokenizers.abi3.so": "4b1458a379296762a034d3bc89299c0c35b4eefb0577acca922f481b262c65a1"
+     },
+     "wheel_native_members": {
+      "tokenizers.abi3.so": "4b1458a379296762a034d3bc89299c0c35b4eefb0577acca922f481b262c65a1"
+     },
+     "installed_matches_wheel": true
+    }
+   },
+   "numpy": {
+    "version": "2.5.4",
+    "kind": "pypi",
+    "import_path": "/tmp/opencode/decode-u32-vs-gigatoken/venv/lib/python3.12/site-packages/numpy/__init__.py"
+   },
+   "awkward": {
+    "version": "2.14.0",
+    "kind": "pypi",
+    "import_path": "/tmp/opencode/decode-u32-vs-gigatoken/venv/lib/python3.12/site-packages/awkward/__init__.py"
+   }
+  },
+  "wheels_dir": "/tmp/opencode/published-gigatoken-0.2-bench/wheels",
+  "wheels": {
+   "tokie": [
+    {
+     "file": "tokie-0.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+     "path": "/tmp/opencode/published-gigatoken-0.2-bench/wheels/tokie-0.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+     "sha256": "5c28027c24eb418fb9bcc9733c31ad4a6956d6129685b101e996e024669b6df7",
+     "bytes": 2363053
+    }
+   ],
+   "gigatoken": [
+    {
+     "file": "gigatoken-0.11.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+     "path": "/tmp/opencode/published-gigatoken-0.2-bench/wheels/gigatoken-0.11.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+     "sha256": "11992abc7f41e41e5be03c722df1c5205b5d0fcc4bcbd4fb440d2a0b97f7ac3f",
+     "bytes": 5415971
+    }
+   ],
+   "tokenizers": [
+    {
+     "file": "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+     "path": "/tmp/opencode/published-gigatoken-0.2-bench/wheels/tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+     "sha256": "376851d22bcf9d650a5c3090bb83e6cf9e895fbf0595369fa4cd43c1f69b5f87",
+     "bytes": 3396193
+    }
+   ],
+   "numpy": [
+    {
+     "file": "numpy-2.5.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+     "path": "/tmp/opencode/published-gigatoken-0.2-bench/wheels/numpy-2.5.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+     "sha256": "fbde6962867ee75b48b0ee29b2b9372ec5d617799dbaf38e82dc0596f2f7738a",
+     "bytes": 16727283
+    }
+   ],
+   "awkward": [
+    {
+     "file": "awkward-2.14.0-py3-none-any.whl",
+     "path": "/tmp/opencode/published-gigatoken-0.2-bench/wheels/awkward-2.14.0-py3-none-any.whl",
+     "sha256": "bbdcecf16c8358bac2eb20285659325fc7a71e439779f1259277693357689efd",
+     "bytes": 1000180
+    }
+   ]
+  },
+  "tokie_wheel_in_wheels_dir_not_used": [
+   {
+    "file": "tokie-0.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "path": "/tmp/opencode/published-gigatoken-0.2-bench/wheels/tokie-0.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "sha256": "5c28027c24eb418fb9bcc9733c31ad4a6956d6129685b101e996e024669b6df7",
+    "bytes": 2363053
+   }
+  ],
+  "harness": {
+   "script_path": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2/scripts/bench_current.py",
+   "sha256_at_start": "ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59",
+   "sha256_at_end": "ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59",
+   "unchanged": true
+  },
+  "tokie_source": {
+   "repo": "/home/bhavnick/.local/share/opencode/worktree/e68f38/tokie-release-0.2",
+   "branch": "bhavnick/uint32-only-decode",
+   "head_commit": "d5674e47e92d2a3c6f00b2e2814c222c3f3423e7",
+   "worktree_dirty": true,
+   "dirty_files": [
+    "docs/benchmarks/uint32-decode/",
+    "scripts/bench_current.py",
+    "scripts/generate_benchmark_dashboard.py",
+    "scripts/test_benchmark_dashboard.py"
+   ],
+   "source_changes": [],
+   "generator_or_output_changes": [
+    "docs/benchmarks/uint32-decode/",
+    "scripts/bench_current.py",
+    "scripts/generate_benchmark_dashboard.py",
+    "scripts/test_benchmark_dashboard.py"
+   ],
+   "binding_source_sha256": "f6f0a4461eb5985cd80f569b803933b1f601f413d579746d44813ab1fca8d534"
+  },
+  "samples": {
+   "single": {
+    "documents": 179,
+    "chars": 1048248,
+    "input_bytes_utf8": 1057339,
+    "max_chars": 1048576,
+    "max_docs": 256,
+    "sampling_seed": 20261111,
+    "rows_sha256": "c9f3e026003bae02bf8281be01c8ee42a00a9d87be0626c9d471b17fae0236f4",
+    "row_range": [
+     135,
+     62670
+    ],
+    "validation_texts": 459,
+    "edge_texts": 24,
+    "fuzz_texts": 256
+   },
+   "batch": {
+    "documents": 3411,
+    "chars": 16777020,
+    "input_bytes_utf8": 16924074,
+    "max_chars": 16777216,
+    "max_docs": 4187,
+    "sampling_seed": 20261111,
+    "rows_sha256": "5995a89cd85810c43e86c0a5abaabf6a051c8ed4f2903e7cfc684ae5b8638fe9",
+    "row_range": [
+     0,
+     62790
+    ]
+   }
+  },
+  "tasks": {
+   "encode": {
+    "description": "raw UTF-8 text -> ids",
+    "adapters": {
+     "tokie": "Tokenizer.encode(text) -> np.uint32 ids",
+     "giga": "Tokenizer.encode(text) -> np.uint32 ids",
+     "hf": "Tokenizer.encode(text, add_special_tokens=False).ids -> list"
+    },
+    "counted_inside_clock": "len(ids); HF .ids materialization is included",
+    "count_unit": "ids"
+   },
+   "decode": {
+    "description": "the same precomputed 1-D contiguous np.uint32 ids -> str",
+    "input": "one shared contiguous uint32 array per document, built outside every clock",
+    "adapters": {
+     "tokie": "Tokenizer.decode(ids) -> str",
+     "giga": "Tokenizer.decode(ids) -> bytes; .decode('utf-8','replace') inside clock",
+     "hf": "Tokenizer.decode(ids.tolist(), skip_special_tokens=False); array-to-list inside clock"
+    },
+    "counted_inside_clock": "len(str) characters; decoded UTF-8 bytes computed outside clock",
+    "count_unit": "characters",
+    "throughput_numerator": "decoded_bytes_utf8",
+    "note": "adapters differ by library; not comparable to an earlier bytes-only decode benchmark"
+   },
+   "batch": {
+    "description": "the same documents -> ragged ids",
+    "adapters": {
+     "tokie": "Tokenizer.batch(texts) -> (flat uint32, ends uint64)",
+     "giga": "Tokenizer.encode_batch(texts, parallel=n>1) -> awkward Array with leading 0 offset",
+     "hf": "Tokenizer.encode_batch(texts, add_special_tokens=False) -> list[Encoding]; [e.ids] inside clock"
+    },
+    "counted_inside_clock": "all ids + documents",
+    "count_unit": "ids",
+    "count_includes_documents": true,
+    "note": "public output types differ; Giga is not flattened inside any clock; one pass per round; batch input is the larger seeded sample"
+   }
+  },
+  "timing": {
+   "warmth": "warm throughput only; cold starts were not retimed and old cold data stays frozen",
+   "rounds": 5,
+   "passes_per_round": {
+    "encode": 10,
+    "decode": 10,
+    "batch": 1
+   },
+   "warmup_passes_per_library": 1,
+   "orders": {
+    "three_libraries": [
+     [
+      "tokie",
+      "giga",
+      "hf"
+     ],
+     [
+      "hf",
+      "giga",
+      "tokie"
+     ],
+     [
+      "giga",
+      "hf",
+      "tokie"
+     ],
+     [
+      "tokie",
+      "hf",
+      "giga"
+     ],
+     [
+      "giga",
+      "tokie",
+      "hf"
+     ]
+    ],
+    "two_libraries": [
+     [
+      "tokie",
+      "hf"
+     ],
+     [
+      "hf",
+      "tokie"
+     ]
+    ]
+   },
+   "single_operation_threads": 1,
+   "batch_threads": 1,
+   "env_set_before_native_imports": true,
+   "profile": "one unprofiled process CPU vs wall pass per library and task after rounds; no cProfile or perf trace"
+  },
+  "corpus": {
+   "jsonl": "/tmp/opencode/tokie-compat/corpus/owt_20m.jsonl",
+   "jsonl_sha256": "20dc6601bee15f270b7a2c35cfde6cd2f073f8c15567c76b913453157d2c67db",
+   "jsonl_bytes": 21281368,
+   "available_documents": 4187,
+   "manifest": "/tmp/opencode/tokie-compat/corpus/manifest.json",
+   "manifest_sha256": "227927ab4de6324d427520ad496f4fd55808e27a0513d44d26fb4a17088b03a0",
+   "manifest_embedded": {
+    "dataset": "Skylion007/openwebtext",
+    "parquet": "plain_text/train-00000-of-00080.parquet",
+    "source_path": "/home/bhavnick/.cache/huggingface/hub/datasets--Skylion007--openwebtext/blobs/caed9f4b7053d7cd4d1a13ce9ec9224d84a3bba1f11579193562a7e31ebe656e",
+    "source_sha256": "caed9f4b7053d7cd4d1a13ce9ec9224d84a3bba1f11579193562a7e31ebe656e",
+    "source_rows": 100173,
+    "selection": {
+     "stride": 15,
+     "start": 0,
+     "full_documents": true
+    },
+    "documents": 4187,
+    "text_bytes": 20974828,
+    "joined_text_bytes": 20979014,
+    "joined_text_sha256": "577e89123da82c3f6b7bb2333f8b1e0469e5b75f7d6ea8234189bfc912c4e67b",
+    "jsonl_bytes": 21281368,
+    "jsonl_sha256": "20dc6601bee15f270b7a2c35cfde6cd2f073f8c15567c76b913453157d2c67db",
+    "doc_hashes_sha256": "4d906bc4da58539f31ad80d4c8d432e1cce1d16fe04e797dd02eb7713ddddb52",
+    "first_row": 0,
+    "last_row": 62790,
+    "target_bytes": 20971520
+   },
+   "source": {
+    "dataset": "Skylion007/openwebtext",
+    "parquet": "plain_text/train-00000-of-00080.parquet",
+    "source_sha256": "caed9f4b7053d7cd4d1a13ce9ec9224d84a3bba1f11579193562a7e31ebe656e",
+    "source_rows": 100173,
+    "selection": {
+     "stride": 15,
+     "start": 0,
+     "full_documents": true
+    }
+   }
+  },
+  "load_after": [
+   3.5,
+   2.7197265625,
+   1.994140625
+  ]
+ },
+ "models": {
+  "bert-base-uncased": {
+   "path": "/home/bhavnick/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/tokenizer.json",
+   "tokenizer_json": "/home/bhavnick/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/tokenizer.json",
+   "tokenizer_json_sha256": "ce64fce797c24f68df90b40a3f74f579b336a493db14bd583fd520ea0d8c9a98",
+   "tokenizer_json_bytes": 466062,
+   "algorithm": "WordPiece",
+   "libraries": [
+    "tokie",
+    "hf"
+   ],
+   "giga_refusal": {
+    "attempted": true,
+    "supported": false,
+    "error_type": "RuntimeError",
+    "error": "Unsupported model type \"WordPiece (untyped legacy file)\": gigatoken supports BPE tokenizers (byte-level, or SentencePiece-style with byte_fallback) Location: src/load_tokenizer/hf.rs:241:24"
+   }
+  },
+  "t5-small": {
+   "path": "/home/bhavnick/.cache/huggingface/hub/models--t5-small/snapshots/main/tokenizer.json",
+   "tokenizer_json": "/home/bhavnick/.cache/huggingface/hub/models--t5-small/snapshots/main/tokenizer.json",
+   "tokenizer_json_sha256": "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066",
+   "tokenizer_json_bytes": 1389353,
+   "algorithm": "Unigram",
+   "libraries": [
+    "tokie",
+    "hf"
+   ],
+   "giga_refusal": {
+    "attempted": true,
+    "supported": false,
+    "error_type": "RuntimeError",
+    "error": "Unsupported model type \"Unigram (untyped legacy file)\": gigatoken supports BPE tokenizers (byte-level, or SentencePiece-style with byte_fallback) Location: src/load_tokenizer/hf.rs:241:24"
+   }
+  }
+ },
+ "validation": {
+  "bert-base-uncased": {
+   "ok": true,
+   "first_mismatch": null,
+   "encode_mismatches": 0,
+   "decode_mismatches": 0,
+   "batch_mismatches": 0,
+   "validation_texts": 459,
+   "stats": {
+    "texts": 459,
+    "tokens": 241425,
+    "timing_documents": 179,
+    "timing_tokens": 237031,
+    "decode_chars": 1068968,
+    "decoded_bytes_utf8": 1077930,
+    "encode_mismatches_tokie_vs_hf": 0,
+    "decode_mismatches_tokie_vs_hf": 0,
+    "encode_mismatches_tokie_vs_giga": null,
+    "decode_mismatches_tokie_vs_giga": null,
+    "batch_mismatches": 0,
+    "small_batch_run": false,
+    "large_batch_run": false
+   }
+  },
+  "t5-small": {
+   "ok": true,
+   "first_mismatch": null,
+   "encode_mismatches": 0,
+   "decode_mismatches": 0,
+   "batch_mismatches": 0,
+   "validation_texts": 459,
+   "stats": {
+    "texts": 459,
+    "tokens": 266973,
+    "timing_documents": 179,
+    "timing_tokens": 260561,
+    "decode_chars": 1049898,
+    "decoded_bytes_utf8": 1058422,
+    "encode_mismatches_tokie_vs_hf": 0,
+    "decode_mismatches_tokie_vs_hf": 0,
+    "encode_mismatches_tokie_vs_giga": null,
+    "decode_mismatches_tokie_vs_giga": null,
+    "batch_mismatches": 0,
+    "small_batch_run": false,
+    "large_batch_run": false
+   }
+  }
+ },
+ "benchmark": {
+  "bert-base-uncased": {
+   "encode": {
+    "threads": 1,
+    "documents": 179,
+    "input_bytes_utf8": 1057339,
+    "decoded_bytes_utf8": 0,
+    "throughput_numerator": "input_bytes_utf8",
+    "count_unit": "ids",
+    "count_includes_documents": false,
+    "passes_per_round": 10,
+    "rounds": [
+     {
+      "round": 1,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.0393600579991471,
+       "count": 237031,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 2.7548392589960713,
+       "count": 237031,
+       "passes": 10
+      }
+     },
+     {
+      "round": 2,
+      "order": [
+       "hf",
+       "tokie"
+      ],
+      "tokie": {
+       "seconds": 0.03934085198852699,
+       "count": 237031,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 2.831660821000696,
+       "count": 237031,
+       "passes": 10
+      }
+     },
+     {
+      "round": 3,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.03795519800041802,
+       "count": 237031,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 2.867272210001829,
+       "count": 237031,
+       "passes": 10
+      }
+     },
+     {
+      "round": 4,
+      "order": [
+       "hf",
+       "tokie"
+      ],
+      "tokie": {
+       "seconds": 0.0378317869908642,
+       "count": 237031,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 2.7621547379967524,
+       "count": 237031,
+       "passes": 10
+      }
+     },
+     {
+      "round": 5,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.03791226798784919,
+       "count": 237031,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 2.8070903589978116,
+       "count": 237031,
+       "passes": 10
+      }
+     }
+    ],
+    "summary": {
+     "tokie": {
+      "count_unit": "ids",
+      "seconds_median": 0.03795519800041802,
+      "seconds_min": 0.0378317869908642,
+      "seconds_max": 0.0393600579991471,
+      "mib_s_median": 265.6703432356122,
+      "mib_s_min": 256.18789689195023,
+      "mib_s_max": 266.53698602135046,
+      "count_s_median": 62450207.74160879,
+      "count_s_min": 60221201.9111192,
+      "count_s_max": 62653926.46063464,
+      "tokens_s_median": 62450207.74160879,
+      "tokens_s_min": 60221201.9111192,
+      "tokens_s_max": 62653926.46063464
+     },
+     "hf": {
+      "count_unit": "ids",
+      "seconds_median": 2.8070903589978116,
+      "seconds_min": 2.7548392589960713,
+      "seconds_max": 2.867272210001829,
+      "mib_s_median": 3.5921788010937843,
+      "mib_s_min": 3.5167817150992606,
+      "mib_s_max": 3.6603117395754596,
+      "count_s_median": 844401.0334053689,
+      "count_s_min": 826677.701451474,
+      "count_s_max": 860416.8073544143,
+      "tokens_s_median": 844401.0334053689,
+      "tokens_s_min": 826677.701451474,
+      "tokens_s_max": 860416.8073544143
+     }
+    },
+    "post_check": {
+     "tokie": {
+      "output_ok": true,
+      "checksum": "e5e2c33a609fb852c4a8b8648a0ebde5cfe6eb028677978f2c33aace68dca92e"
+     },
+     "hf": {
+      "output_ok": true,
+      "checksum": "e5e2c33a609fb852c4a8b8648a0ebde5cfe6eb028677978f2c33aace68dca92e"
+     }
+    },
+    "profile": {
+     "tokie": {
+      "wall_s": 0.004716813986306079,
+      "process_cpu_s": 0.004706268999999708,
+      "cpu_per_wall": 0.9977643836842017,
+      "passes": 1,
+      "cProfile": false,
+      "note": "one unprofiled pass after timed rounds; native internals not attributed"
+     },
+     "hf": {
+      "wall_s": 0.2799187109922059,
+      "process_cpu_s": 0.2785368229999996,
+      "cpu_per_wall": 0.9950632525160322,
+      "passes": 1,
+      "cProfile": false,
+      "note": "one unprofiled pass after timed rounds; native internals not attributed"
+     }
+    },
+    "cold": "not measured; warm throughput only"
+   },
+   "decode": {
+    "threads": 1,
+    "documents": 179,
+    "input_bytes_utf8": 1057339,
+    "decoded_bytes_utf8": 1077930,
+    "throughput_numerator": "decoded_bytes_utf8",
+    "count_unit": "characters",
+    "count_includes_documents": false,
+    "passes_per_round": 10,
+    "rounds": [
+     {
+      "round": 1,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.028443964998587035,
+       "count": 1068968,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 1.3134720010129968,
+       "count": 1068968,
+       "passes": 10
+      }
+     },
+     {
+      "round": 2,
+      "order": [
+       "hf",
+       "tokie"
+      ],
+      "tokie": {
+       "seconds": 0.02876821499376092,
+       "count": 1068968,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 1.3409496949898312,
+       "count": 1068968,
+       "passes": 10
+      }
+     },
+     {
+      "round": 3,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.027844568001455627,
+       "count": 1068968,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 1.3660703399946215,
+       "count": 1068968,
+       "passes": 10
+      }
+     },
+     {
+      "round": 4,
+      "order": [
+       "hf",
+       "tokie"
+      ],
+      "tokie": {
+       "seconds": 0.028959243005374447,
+       "count": 1068968,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 1.3578424629959045,
+       "count": 1068968,
+       "passes": 10
+      }
+     },
+     {
+      "round": 5,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.02749834899441339,
+       "count": 1068968,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 1.3099425599939423,
+       "count": 1068968,
+       "passes": 10
+      }
+     }
+    ],
+    "summary": {
+     "tokie": {
+      "count_unit": "characters",
+      "seconds_median": 0.028443964998587035,
+      "seconds_min": 0.02749834899441339,
+      "seconds_max": 0.028959243005374447,
+      "mib_s_median": 361.41028718564905,
+      "mib_s_min": 354.97963661999285,
+      "mib_s_max": 373.8385006651265,
+      "count_s_median": 375815397.0633494,
+      "count_s_min": 369128433.2955851,
+      "count_s_max": 388738974.9170662,
+      "tokens_s_median": 375815397.0633494,
+      "tokens_s_min": 369128433.2955851,
+      "tokens_s_max": 388738974.9170662,
+      "chars_s_median": 375815397.0633494,
+      "chars_s_min": 369128433.2955851,
+      "chars_s_max": 388738974.9170662
+     },
+     "hf": {
+      "count_unit": "characters",
+      "seconds_median": 1.3409496949898312,
+      "seconds_min": 1.3099425599939423,
+      "seconds_max": 1.3660703399946215,
+      "mib_s_median": 7.6661649555137465,
+      "mib_s_min": 7.52519197428616,
+      "mib_s_max": 7.847627730245996,
+      "count_s_median": 7971723.353933171,
+      "count_s_min": 7825131.4643447185,
+      "count_s_max": 8160418.881305325,
+      "tokens_s_median": 7971723.353933171,
+      "tokens_s_min": 7825131.4643447185,
+      "tokens_s_max": 8160418.881305325,
+      "chars_s_median": 7971723.353933171,
+      "chars_s_min": 7825131.4643447185,
+      "chars_s_max": 8160418.881305325
+     }
+    },
+    "post_check": {
+     "tokie": {
+      "output_ok": true,
+      "checksum": "2677df7929ffa186a8bf5c1d1f482fe1db9cc8bac4ac31d42cf1093a46b8779c"
+     },
+     "hf": {
+      "output_ok": true,
+      "checksum": "2677df7929ffa186a8bf5c1d1f482fe1db9cc8bac4ac31d42cf1093a46b8779c"
+     }
+    },
+    "profile": {
+     "tokie": {
+      "wall_s": 0.0036418039962882176,
+      "process_cpu_s": 0.0036039019999982713,
+      "cpu_per_wall": 0.9895925216380188,
+      "passes": 1,
+      "cProfile": false,
+      "note": "one unprofiled pass after timed rounds; native internals not attributed"
+     },
+     "hf": {
+      "wall_s": 0.13004584799637087,
+      "process_cpu_s": 0.12939732499999934,
+      "cpu_per_wall": 0.9950131203236137,
+      "passes": 1,
+      "cProfile": false,
+      "note": "one unprofiled pass after timed rounds; native internals not attributed"
+     }
+    },
+    "cold": "not measured; warm throughput only"
+   }
+  },
+  "t5-small": {
+   "encode": {
+    "threads": 1,
+    "documents": 179,
+    "input_bytes_utf8": 1057339,
+    "decoded_bytes_utf8": 0,
+    "throughput_numerator": "input_bytes_utf8",
+    "count_unit": "ids",
+    "count_includes_documents": false,
+    "passes_per_round": 10,
+    "rounds": [
+     {
+      "round": 1,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.09179026300262194,
+       "count": 260561,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 3.6507507739879657,
+       "count": 260561,
+       "passes": 10
+      }
+     },
+     {
+      "round": 2,
+      "order": [
+       "hf",
+       "tokie"
+      ],
+      "tokie": {
+       "seconds": 0.09400759299751371,
+       "count": 260561,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 3.494368186002248,
+       "count": 260561,
+       "passes": 10
+      }
+     },
+     {
+      "round": 3,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.09464290698815603,
+       "count": 260561,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 3.6571456090023275,
+       "count": 260561,
+       "passes": 10
+      }
+     },
+     {
+      "round": 4,
+      "order": [
+       "hf",
+       "tokie"
+      ],
+      "tokie": {
+       "seconds": 0.0992103830067208,
+       "count": 260561,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 3.550158580997959,
+       "count": 260561,
+       "passes": 10
+      }
+     },
+     {
+      "round": 5,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.15613920200848952,
+       "count": 260561,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 3.8745845270022983,
+       "count": 260561,
+       "passes": 10
+      }
+     }
+    ],
+    "summary": {
+     "tokie": {
+      "count_unit": "ids",
+      "seconds_median": 0.09464290698815603,
+      "seconds_min": 0.09179026300262194,
+      "seconds_max": 0.15613920200848952,
+      "mib_s_median": 106.54333009454767,
+      "mib_s_min": 64.58064567153623,
+      "mib_s_max": 109.85446767985236,
+      "count_s_median": 27530959.085249525,
+      "count_s_min": 16687737.393830981,
+      "count_s_max": 28386562.0902031,
+      "tokens_s_median": 27530959.085249525,
+      "tokens_s_min": 16687737.393830981,
+      "tokens_s_max": 28386562.0902031
+     },
+     "hf": {
+      "count_unit": "ids",
+      "seconds_median": 3.6507507739879657,
+      "seconds_min": 3.494368186002248,
+      "seconds_max": 3.8745845270022983,
+      "mib_s_median": 2.762053918386684,
+      "mib_s_min": 2.6024907729005387,
+      "mib_s_max": 2.8856634285818767,
+      "count_s_median": 713718.9475012323,
+      "count_s_min": 672487.5872087161,
+      "count_s_max": 745659.8335680715,
+      "tokens_s_median": 713718.9475012323,
+      "tokens_s_min": 672487.5872087161,
+      "tokens_s_max": 745659.8335680715
+     }
+    },
+    "post_check": {
+     "tokie": {
+      "output_ok": true,
+      "checksum": "9fa106790d6ac180ae06c48f42f088691628f174a12ed595b564966bea6a82da"
+     },
+     "hf": {
+      "output_ok": true,
+      "checksum": "9fa106790d6ac180ae06c48f42f088691628f174a12ed595b564966bea6a82da"
+     }
+    },
+    "profile": {
+     "tokie": {
+      "wall_s": 0.009785831003682688,
+      "process_cpu_s": 0.00975421700000112,
+      "cpu_per_wall": 0.9967694104190363,
+      "passes": 1,
+      "cProfile": false,
+      "note": "one unprofiled pass after timed rounds; native internals not attributed"
+     },
+     "hf": {
+      "wall_s": 0.38534964800055604,
+      "process_cpu_s": 0.38366996300000267,
+      "cpu_per_wall": 0.9956411404311158,
+      "passes": 1,
+      "cProfile": false,
+      "note": "one unprofiled pass after timed rounds; native internals not attributed"
+     }
+    },
+    "cold": "not measured; warm throughput only"
+   },
+   "decode": {
+    "threads": 1,
+    "documents": 179,
+    "input_bytes_utf8": 1057339,
+    "decoded_bytes_utf8": 1058422,
+    "throughput_numerator": "decoded_bytes_utf8",
+    "count_unit": "characters",
+    "count_includes_documents": false,
+    "passes_per_round": 10,
+    "rounds": [
+     {
+      "round": 1,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.032835099002113566,
+       "count": 1049898,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 0.40795883000828326,
+       "count": 1049898,
+       "passes": 10
+      }
+     },
+     {
+      "round": 2,
+      "order": [
+       "hf",
+       "tokie"
+      ],
+      "tokie": {
+       "seconds": 0.032677895011147484,
+       "count": 1049898,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 0.3975073479959974,
+       "count": 1049898,
+       "passes": 10
+      }
+     },
+     {
+      "round": 3,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.03518306299520191,
+       "count": 1049898,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 0.403842032988905,
+       "count": 1049898,
+       "passes": 10
+      }
+     },
+     {
+      "round": 4,
+      "order": [
+       "hf",
+       "tokie"
+      ],
+      "tokie": {
+       "seconds": 0.035434505000011995,
+       "count": 1049898,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 0.41373787200427614,
+       "count": 1049898,
+       "passes": 10
+      }
+     },
+     {
+      "round": 5,
+      "order": [
+       "tokie",
+       "hf"
+      ],
+      "tokie": {
+       "seconds": 0.03204832100891508,
+       "count": 1049898,
+       "passes": 10
+      },
+      "hf": {
+       "seconds": 0.37692128999333363,
+       "count": 1049898,
+       "passes": 10
+      }
+     }
+    ],
+    "summary": {
+     "tokie": {
+      "count_unit": "characters",
+      "seconds_median": 0.032835099002113566,
+      "seconds_min": 0.03204832100891508,
+      "seconds_max": 0.035434505000011995,
+      "mib_s_median": 307.41185743169603,
+      "mib_s_min": 284.86072468600713,
+      "mib_s_max": 314.95873903614097,
+      "count_s_median": 319748693.29080415,
+      "count_s_min": 296292554.3900344,
+      "count_s_max": 327598441.02533275,
+      "tokens_s_median": 319748693.29080415,
+      "tokens_s_min": 296292554.3900344,
+      "tokens_s_max": 327598441.02533275,
+      "chars_s_median": 319748693.29080415,
+      "chars_s_min": 296292554.3900344,
+      "chars_s_max": 327598441.02533275
+     },
+     "hf": {
+      "count_unit": "characters",
+      "seconds_median": 0.403842032988905,
+      "seconds_min": 0.37692128999333363,
+      "seconds_max": 0.41373787200427614,
+      "mib_s_median": 24.99467105612227,
+      "mib_s_min": 24.396845094927727,
+      "mib_s_max": 26.779858397947976,
+      "count_s_median": 25997739.567363076,
+      "count_s_min": 25375922.07631282,
+      "count_s_max": 27854568.788581003,
+      "tokens_s_median": 25997739.567363076,
+      "tokens_s_min": 25375922.07631282,
+      "tokens_s_max": 27854568.788581003,
+      "chars_s_median": 25997739.567363076,
+      "chars_s_min": 25375922.07631282,
+      "chars_s_max": 27854568.788581003
+     }
+    },
+    "post_check": {
+     "tokie": {
+      "output_ok": true,
+      "checksum": "79574a90a43336004217a8d84474e80d52e35b0f1ec7e3e702b9c9325e367e4c"
+     },
+     "hf": {
+      "output_ok": true,
+      "checksum": "79574a90a43336004217a8d84474e80d52e35b0f1ec7e3e702b9c9325e367e4c"
+     }
+    },
+    "profile": {
+     "tokie": {
+      "wall_s": 0.004110856010811403,
+      "process_cpu_s": 0.004082279000002131,
+      "cpu_per_wall": 0.9930484038521137,
+      "passes": 1,
+      "cProfile": false,
+      "note": "one unprofiled pass after timed rounds; native internals not attributed"
+     },
+     "hf": {
+      "wall_s": 0.03888999900664203,
+      "process_cpu_s": 0.03873388000000233,
+      "cpu_per_wall": 0.9959856258516995,
+      "passes": 1,
+      "cProfile": false,
+      "note": "one unprofiled pass after timed rounds; native internals not attributed"
+     }
+    },
+    "cold": "not measured; warm throughput only"
+   }
+  }
+ },
+ "status": {
+  "bert-base-uncased": "ok",
+  "t5-small": "ok"
+ },
+ "errors": []
+}
