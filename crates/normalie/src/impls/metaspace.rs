@@ -12,8 +12,12 @@ pub struct MetaspaceNever;
 pub struct MetaspaceWords;
 
 impl Metaspace {
-    pub fn write(text: &str, at_start: bool, out: &mut String) -> bool {
-        <Self as Formula>::drive(&Self, text, at_start, out)
+    /// `always` prepends the mark to every segment, so the caller's
+    /// `at_start` is irrelevant. Drive with a true initial start: the formula's
+    /// `at_start` gate then makes the first window rewrite (prepend) instead
+    /// of copy. Later windows still see `at_start == false` from the kernel.
+    pub fn write(text: &str, _at_start: bool, out: &mut String) -> bool {
+        <Self as Formula>::drive(&Self, text, true, out)
     }
 }
 
