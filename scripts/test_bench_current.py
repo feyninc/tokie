@@ -62,5 +62,21 @@ class BatchCountTests(unittest.TestCase):
         self.assertEqual(bc.count_batch("hf", []), 0)
 
 
+class BatchMismatchFieldTests(unittest.TestCase):
+    def test_batch_not_run_omits_key(self):
+        result = bc.batch_mismatch_result(False, 0)
+        validation = {"ok": True, **result}
+        stats = {"small_batch_run": False, **result}
+        self.assertNotIn("batch_mismatches", validation)
+        self.assertNotIn("batch_mismatches", stats)
+
+    def test_batch_validated_zero_emits_key(self):
+        result = bc.batch_mismatch_result(True, 0)
+        validation = {"ok": True, **result}
+        stats = {"small_batch_run": True, **result}
+        self.assertEqual(validation["batch_mismatches"], 0)
+        self.assertEqual(stats["batch_mismatches"], 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

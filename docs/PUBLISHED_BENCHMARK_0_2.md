@@ -34,6 +34,8 @@ about BERT or T5 versus GigaToken.
 
 Raw evidence is included as [results-1t.json](benchmarks/published-0.2/results-1t.json), [independent-results-1t.json](benchmarks/published-0.2/independent-results-1t.json), [results-decode-inputs.json](benchmarks/published-0.2/results-decode-inputs.json), [results-8t.json](benchmarks/published-0.2/results-8t.json), [results-8t-large.json](benchmarks/published-0.2/results-8t-large.json), and [hf-results.json](benchmarks/published-0.2/hf-results.json). The GigaToken JSON files hold per-round times, cold passes, profiles, wheel hashes, import paths, model paths, and corpus metadata; the HF JSON holds the corresponding HF run.
 
+`hf-results.json` has its own producer: [hf-producer.py](benchmarks/published-0.2/hf-producer.py), sha256 `649f6cc1af31dc278ca831d1fcfbb0807599e62654ca5973025d588b4a0d01c6`, a byte-for-byte archive of the historical HF harness. The script takes no flags, so that hash also pins the invocation. It is not `scripts/bench_published.py`, which produced the GigaToken JSON. [hf-producer-command.md](benchmarks/published-0.2/hf-producer-command.md) records the exact invocation, the Python 3.12.13 / HF 0.23.3 / NumPy 2.5.4 environment, and why the original absolute corpus and HF cache paths are preserved.
+
 Model paths, `tokenizer.json` sha256 values, byte sizes, and vocab sizes are recorded in each JSON.
 
 ## Correctness
@@ -150,17 +152,21 @@ GigaToken's 825.5–1847.5 range is much wider than the 0.968 median gap.
 
 Single-observation first pass, tokie measured first, model load excluded; for batch this is one full call over all documents:
 
-| Model | Sample | tokie ms | GigaToken ms | tokie/Giga time |
-| --- | --- | ---: | ---: | ---: |
-| gpt2 | 1.008 MiB | 6.91 | 13.53 | 0.51 |
-| qwen2 | 1.008 MiB | 8.87 | 32.02 | 0.28 |
-| cl100k | 1.008 MiB | 9.43 | 23.60 | 0.40 |
-| gpt2 | 16.14 MiB | 114.78 | 34.94 | 3.29 |
-| qwen2 | 16.14 MiB | 295.31 | 78.19 | 3.78 |
-| cl100k | 16.14 MiB | 207.50 | 53.56 | 3.87 |
+| Model | Sample | tokie ms | GigaToken ms |
+| --- | --- | ---: | ---: |
+| gpt2 | 1.008 MiB | 6.91 | 13.53 |
+| qwen2 | 1.008 MiB | 8.87 | 32.02 |
+| cl100k | 1.008 MiB | 9.43 | 23.60 |
+| gpt2 | 16.14 MiB | 114.78 | 34.94 |
+| qwen2 | 16.14 MiB | 295.31 | 78.19 |
+| cl100k | 16.14 MiB | 207.50 | 53.56 |
 
-On the large sample GigaToken's first pass was 3.3–3.9× faster. That is not
-tokenizer load time, and it is separate from the warm-cache medians above.
+These are raw single observations of one full call per implementation, not a
+controlled comparison: tokie was measured first, so warm-up, allocator, and
+CPU-frequency state are not balanced between the two sides. On the large
+sample the GPT-2 call was 114.78 ms for tokie and 34.94 ms for GigaToken, Qwen2
+295.31/78.19, and cl100k 207.50/53.56. The first pass is not tokenizer load
+time, and it is separate from the warm-cache medians above.
 
 ## Hugging Face check
 

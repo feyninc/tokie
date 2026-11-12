@@ -60,6 +60,16 @@ def sha256_file(path):
             h.update(chunk)
     return h.hexdigest()
 
+def write_results(results, output):
+    """Serialize strictly, then write; non-finite values leave the path untouched."""
+    # json.dumps with allow_nan=False builds the whole payload before the file is
+    # opened, so a NaN/Infinity cannot leave a truncated or invalid results file.
+    payload = json.dumps(results, indent=2, allow_nan=False)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(payload)
+    return payload
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--corpus", required=True, type=Path, help="OpenWebText JSONL with row/text fields")
@@ -567,8 +577,12 @@ def main():
         "HF tokenizers is required by default; --allow-no-hf is an explicit opt-out. When present, HF ids, decode, or batch mismatches fail validation.",
         "cProfile cannot see native kernel internals; cpu_per_wall only says whether the timed Python loop was CPU-bound.",
     ]
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(results, indent=2))
+    try:
+        write_results(results, args.output)
+    except ValueError as exc:
+        print(f"bench_published: {args.output} not written: results contain a "
+              f"non-finite number: {exc}", file=sys.stderr)
+        return 1
     print(json.dumps({"status": results["status"],
                       "validation": {k: v["stats"] for k, v in results["validation"].items()},
                       "errors": results["errors"], "output": str(args.output)}, indent=2))

@@ -96,17 +96,23 @@ add `--check` to validate only and write nothing.
 | --- | --- |
 | tokie | local unreleased `tokie-0.2.0-cp312-cp312-manylinux_2_34_x86_64.whl`, 2,380,513 bytes, sha256 `8786f91b1aed3acbac9d8090234e55f0400f829da6ea8a2817bcd460332a1d85`; installed `.so` sha256 `f9e7abb0e3d5873f5f68bda5b998b6575982ab4637fc3aed9dec17f2c0e482f3`, matching the wheel member |
 | tokie source | branch `bhavnick/uint32-only-decode`, recorded commit `d5674e47e92d2a3c6f00b2e2814c222c3f3423e7`; binding source sha256 `f6f0a4461eb5985cd80f569b803933b1f601f413d579746d44813ab1fca8d534`; no source changes (`source_changes: []`) |
-| harness | recorded producer `scripts/bench_current.py` sha256 `ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59`, archived in commit `a04f4006cda1d435adbe6e76cac93453fb90045f`; current harness sha256 `dfbe15540efb2ef0a428180ff51038b156a72900d23c57d7d518fc654569e310` applies only a derived unit-label correction |
+| harness | recorded producer `scripts/bench_current.py` sha256 `ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59`, archived in commit `a04f4006cda1d435adbe6e76cac93453fb90045f`; current harness sha256 `fc9dce40a3006ac6261bd322dbecbff8ab12bc4062e75050656613951c947776` applies derived unit-label and HF-only validation-key corrections |
 | GigaToken / HF | GigaToken 0.11.0 wheel sha256 `11992abc7f41e41e5be03c722df1c5205b5d0fcc4bcbd4fb440d2a0b97f7ac3f`; `tokenizers` 0.23.3 wheel sha256 `376851d22bcf9d650a5c3090bb83e6cf9e895fbf0595369fa4cd43c1f69b5f87` |
 | Python stack | Python 3.12.13, NumPy 2.5.4, Awkward 2.14.0, Linux |
-| results files after unit-label correction | `results-1t.json` `7e6b5547…`, `results-8t.json` `61142fe1…`, `results-hf-only.json` `2faa206e…` |
+| results files after derived corrections | `results-1t.json` `7e6b5547…`, `results-8t.json` `61142fe1…`, `results-hf-only.json` `6ebcf6b3…` |
 
 The recording JSON reports `source_changes: []`; tokenizer hashes and import
 paths are in each JSON. Each file carries `meta.summary_correction`: producer
 archive `a04f400`, corrected harness `dfbe1554…`, `measurements_changed: false`.
 The correction removed token/s alias fields and renamed batch count units only;
-seconds, counts, MiB/s, profiles, validation, and outputs are unchanged. The
-original producer is readable with `git show a04f400:scripts/bench_current.py`.
+seconds, counts, MiB/s, profiles, encode/decode validation, and outputs are
+unchanged. The original producer is readable with
+`git show a04f400:scripts/bench_current.py`.
+HF-only JSON also carries `meta.validation_correction`: its default
+`validation.*.batch_mismatches: 0` and `validation.*.stats.batch_mismatches: 0`
+keys were removed because BERT/T5 batch validation was not run; this is a
+semantic key removal from both paths, not a physical measurement change
+(`corrected_by_script_sha256: fc9dce40…`).
 
 ## Method
 Each library runs its public Python call over preloaded inputs. The clock includes

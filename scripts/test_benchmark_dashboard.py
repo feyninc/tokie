@@ -10,6 +10,7 @@ import copy
 import importlib.util
 import json
 import math
+import statistics
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,21 +24,21 @@ SPEC.loader.exec_module(dashboard)
 MIB = 1024.0 * 1024.0
 
 
-def _task(libs, task, threads, passes, input_bytes, decoded_bytes, counts, bases):
-    rounds = []
-    for index in range(5):
+def _task(libs, task, threads, passes, input_bytes, decoded_bytes, counts, bases, rounds=5):
+    rounds_entries = []
+    for index in range(rounds):
         order = libs[index % len(libs):] + libs[:index % len(libs)]
         entry = {"round": index + 1, "order": order}
         for lib in libs:
             seconds = bases[lib] * (1.0 + 0.03 * (index - 2) / 2.0)
             entry[lib] = {"seconds": seconds, "count": counts[lib]}
-        rounds.append(entry)
+        rounds_entries.append(entry)
     unit = decoded_bytes if task == "decode" else input_bytes
     count_unit = {"encode": "ids", "decode": "characters", "batch": "ids_and_documents"}[task]
     summary = {}
     for lib in libs:
-        values = [round_entry[lib]["seconds"] for round_entry in rounds]
-        median = sorted(values)[2]
+        values = [round_entry[lib]["seconds"] for round_entry in rounds_entries]
+        median = statistics.median(values)
         low, high = min(values), max(values)
         count_values = {
             "count_s_median": counts[lib] * passes / median,
@@ -68,7 +69,7 @@ def _task(libs, task, threads, passes, input_bytes, decoded_bytes, counts, bases
         "decoded_bytes_utf8": decoded_bytes,
         "throughput_numerator": "decoded_bytes_utf8" if task == "decode" else "input_bytes_utf8",
         "count_unit": count_unit,
-        "rounds": rounds,
+        "rounds": rounds_entries,
         "summary": summary,
         "post_check": {lib: {"output_ok": True, "checksum": 101 + i} for i, lib in enumerate(libs)},
         "profile": {lib: {"cpu_per_wall": 1.0} for lib in libs},
@@ -97,7 +98,11 @@ def _payload(labels, benchmark, samples, tasks_note=""):
                 "giga": {"version": "0.11.0", "kind": "pypi"},
                 "hf": {"name": "HuggingFace tokenizers", "version": "0.23.3", "kind": "pypi"},
             },
-            "host": {"cpu_model": "Test CPU", "cpu_count": 4},
+            "cpu_model": "Test CPU",
+            "cpu_count_logical": 4,
+            "platform": "linux",
+            "host": {"cpu_model": "Test CPU", "cpu_count": 4,
+                      "mean_cur_freq_mhz": 1000.0, "load_before": [0.5]},
             "samples": samples,
             "tasks": {
                 "encode": {"title": "Encode", "ordinal": 1, "unit": "MiB/s", "sample": "single"},
@@ -117,25 +122,25 @@ def _payload(labels, benchmark, samples, tasks_note=""):
     }
 
 
-def _streams(label, scale):
+def _streams(label, scale, rounds=5):
     three = ["tokie", "giga", "hf"]
     encode_counts = {"tokie": 200_000, "giga": 200_000, "hf": 200_000}
     decode_counts = {"tokie": 210_000, "giga": 210_000, "hf": 210_000}
     batch_counts = {"tokie": 300_000, "giga": 300_000, "hf": 300_000}
     return {
         "encode": _task(three, "encode", 1, 2, 1_000_000, 0, encode_counts,
-                        {"tokie": 0.02 * scale, "giga": 0.026 * scale, "hf": 0.4 * scale}),
+                        {"tokie": 0.02 * scale, "giga": 0.026 * scale, "hf": 0.4 * scale}, rounds=rounds),
         "decode": _task(three, "decode", 1, 2, 1_000_000, 1_050_000, decode_counts,
-                        {"tokie": 0.03 * scale, "giga": 0.02 * scale, "hf": 0.5 * scale}),
+                        {"tokie": 0.03 * scale, "giga": 0.02 * scale, "hf": 0.5 * scale}, rounds=rounds),
         "batch": _task(three, "batch", 1, 2, 4_000_000, 0, batch_counts,
-                       {"tokie": 0.05 * scale, "giga": 0.04 * scale, "hf": 1.0 * scale}),
+                       {"tokie": 0.05 * scale, "giga": 0.04 * scale, "hf": 1.0 * scale}, rounds=rounds),
     }
 
 
-def fixture():
+def fixture(rounds=5):
     """One 1-thread file (the shape every individual input has)."""
     three = ["tokie", "giga", "hf"]
-    benchmark = {"alpha": _streams("alpha", 1.0), "beta": _streams("beta", 1.6)}
+    benchmark = {"alpha": _streams("alpha", 1.0, rounds), "beta": _streams("beta", 1.6, rounds)}
     return _payload(["alpha", "beta"], benchmark, {
         "single": {"documents": 10, "input_bytes_utf8": 1_000_000},
         "batch": {"documents": 20, "input_bytes_utf8": 4_000_000},
@@ -165,6 +170,8 @@ def fixture_files():
                             {"tokie": 210_000, "hf": 210_000}, {"tokie": 0.06, "hf": 1.0}),
         }
     }, {"single": {"documents": 10, "input_bytes_utf8": 1_000_000}})
+    hf_only["validation"]["gamma"]["stats"] = {"batch_mismatches": 0}
+    hf_only["validation"]["gamma"].pop("batch_mismatches", None)
     return [one, eight, hf_only]
 
 
@@ -194,6 +201,52 @@ class DashboardTests(unittest.TestCase):
         payload = fixture()
         payload["benchmark"]["alpha"]["encode"]["summary"]["tokie"]["mib_s_median"] *= 1.2
         self.assert_rejected(payload, "does not match rounds")
+
+    def test_gib_unit_is_rejected_before_write(self):
+        payload = fixture()
+        payload["meta"]["tasks"]["encode"]["unit"] = "GiB/s"
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(payload, directory)[0]
+            out = Path(directory) / "out"
+            tables = Path(directory) / "tables.md"
+            code = dashboard.main(["--results", str(path), "--output-dir", str(out),
+                                   "--tables-out", str(tables)])
+            self.assertEqual(code, 2)
+            self.assertFalse(out.exists())
+            self.assertFalse(tables.exists())
+
+    def test_stable_host_conflict_fails_before_write(self):
+        for field, value in (("cpu_model", "Other CPU"), ("cpu_count_logical", 8),
+                             ("platform", "darwin")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                payloads = fixture_files()
+                payloads[1]["meta"][field] = value
+                paths = self.write(payloads, directory)
+                args = ["--output-dir", str(Path(directory) / "out"),
+                        "--tables-out", str(Path(directory) / "tables.md")]
+                for path in paths:
+                    args.extend(["--results", str(path)])
+                code = dashboard.main(args)
+                self.assertEqual(code, 2)
+                self.assertFalse((Path(directory) / "out").exists())
+                self.assertFalse((Path(directory) / "tables.md").exists())
+
+    def test_dynamic_host_snapshot_may_differ(self):
+        payloads = fixture_files()
+        payloads[1]["meta"]["host"]["mean_cur_freq_mhz"] = 9999.0
+        payloads[1]["meta"]["host"]["load_before"] = [9.9, 9.8]
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = dashboard.load_dataset(self.write(payloads, directory))
+            self.assertEqual(dataset["host"]["cpu_model"], "Test CPU")
+
+    def test_twenty_round_subtitle_uses_actual_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = dashboard.load_dataset(self.write(fixture(rounds=20), directory))
+            out = Path(directory) / "figures"
+            dashboard.render(dataset, "faceted", str(out))
+            svg = (out / "benchmark_current_overview.svg").read_text()
+            self.assertIn("observed 20-round min\u2013max", svg)
+            self.assertNotIn("observed 5-round min\u2013max", svg)
 
     def test_two_percent_summary_drift_is_rejected(self):
         payload = fixture()
@@ -367,6 +420,14 @@ class DashboardTests(unittest.TestCase):
             labels = [dashboard._legend_name(lib, dataset["artifacts"]) for lib in ("tokie", "giga", "hf")]
             self.assertEqual(labels, ["Tokie 0.2.0\nLOCAL, UNRELEASED", "** GigaToken\n0.11.0",
                                       "HuggingFace tokenizers\n0.23.3"])
+
+    def test_hf_only_missing_batch_mismatch_is_n_a(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = dashboard.load_dataset(self.write(fixture_files(), directory))
+            self.assertNotIn("batch_mismatches", dataset["validation"]["gamma"])
+            tables = Path(directory) / "tables.md"
+            dashboard.write_tables(dataset, str(tables))
+            self.assertIn("| Gamma | 0 | 0 | N/A | ok |", tables.read_text())
 
     def test_giga_coverage_note_only_in_overview_and_escaped_tables(self):
         with tempfile.TemporaryDirectory() as directory:

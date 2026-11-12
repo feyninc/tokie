@@ -411,6 +411,26 @@
     "encode: retained tokens_s_*; count_unit ids"
    ],
    "note": "Units-only correction derived from unchanged rounds and counts; no seconds, counts, checksums, validation, profiles, or MiB/s values changed."
+  },
+  "validation_correction": {
+   "kind": "derived_validation_key_removal",
+   "reason": "HF-only batch validation was not executed; the default batch counter zero was emitted in validation and validation.stats",
+   "removed_keys": [
+    "validation.bert-base-uncased.batch_mismatches",
+    "validation.bert-base-uncased.stats.batch_mismatches",
+    "validation.t5-small.batch_mismatches",
+    "validation.t5-small.stats.batch_mismatches"
+   ],
+   "original_producer_sha256": "ef47ef80782996ae20273ff0276556997705e8df17d107521e559f79238d8d59",
+   "original_producer_commit": "a04f4006cda1d435adbe6e76cac93453fb90045f",
+   "precorrection_commit": "8c6a2f07c6776664aa88fdaaa50ba30a44c44fbb",
+   "precorrection_file_sha256": "2faa206e035410a3cb45bbacefbd4a4bca2da0156c9c9504044f494a7c0564fe",
+   "corrected_by_script_sha256": "fc9dce40a3006ac6261bd322dbecbff8ab12bc4062e75050656613951c947776",
+   "measurements_changed": false,
+   "timings_counts_encode_decode_checks_changed": false,
+   "retained_evidence": "validation.*.stats.small_batch_run and large_batch_run remain false",
+   "note": "Semantic key removal only from validation top-level and validation.stats; batch was not run for HF-only. Seconds, counts, MiB/s, profiles, encode/decode validation, and status are unchanged. summary_correction history is preserved.",
+   "removed_scope": "validation top-level and validation.stats"
   }
  },
  "models": {
@@ -455,7 +475,6 @@
    "first_mismatch": null,
    "encode_mismatches": 0,
    "decode_mismatches": 0,
-   "batch_mismatches": 0,
    "validation_texts": 459,
    "stats": {
     "texts": 459,
@@ -468,7 +487,6 @@
     "decode_mismatches_tokie_vs_hf": 0,
     "encode_mismatches_tokie_vs_giga": null,
     "decode_mismatches_tokie_vs_giga": null,
-    "batch_mismatches": 0,
     "small_batch_run": false,
     "large_batch_run": false
    }
@@ -478,7 +496,6 @@
    "first_mismatch": null,
    "encode_mismatches": 0,
    "decode_mismatches": 0,
-   "batch_mismatches": 0,
    "validation_texts": 459,
    "stats": {
     "texts": 459,
@@ -491,7 +508,6 @@
     "decode_mismatches_tokie_vs_hf": 0,
     "encode_mismatches_tokie_vs_giga": null,
     "decode_mismatches_tokie_vs_giga": null,
-    "batch_mismatches": 0,
     "small_batch_run": false,
     "large_batch_run": false
    }

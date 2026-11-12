@@ -300,6 +300,9 @@ def mismatch(kind, lib, index, texts, **extra):
             "text_sha256": sha256_text(texts[index]),
             "text_bytes_utf8": len(texts[index].encode("utf-8")), **extra}
 
+def batch_mismatch_result(batch_ran, batch_bad):
+    return {"batch_mismatches": batch_bad} if batch_ran else {}
+
 def validate_model(label, path, mode, tasks, timing_texts, validation_texts,
                    batch_texts, threads, tokie, gigatoken, hf_mod, np, ak):
     algorithm = model_algorithm(path)
@@ -362,9 +365,10 @@ def validate_model(label, path, mode, tasks, timing_texts, validation_texts,
     expected_decoded_bytes = sum(len(s.encode("utf-8")) for s in expected_decoded)
 
     batch_bad = 0
+    batch_ran = "batch" in tasks and mode == "shared"
     batch_stats = {"small_batch_run": False, "large_batch_run": False}
     large_flat = large_ends = None
-    if "batch" in tasks and mode == "shared":
+    if batch_ran:
         tv = batch_call("tokie", t, validation_texts, threads)
         small_flat, small_ends = batch_parts("tokie", tv, np, ak)
         hfv = hf.encode_batch(validation_texts, add_special_tokens=False)
@@ -426,7 +430,7 @@ def validate_model(label, path, mode, tasks, timing_texts, validation_texts,
              "decode_mismatches_tokie_vs_hf": hf_dec_bad,
              "encode_mismatches_tokie_vs_giga": enc_bad if g is not None else None,
              "decode_mismatches_tokie_vs_giga": giga_dec_bad if g is not None else None,
-             "batch_mismatches": batch_bad, **batch_stats}
+             **batch_mismatch_result(batch_ran, batch_bad), **batch_stats}
     return {
         "ok": ok,
         "algorithm": algorithm,
@@ -435,7 +439,7 @@ def validate_model(label, path, mode, tasks, timing_texts, validation_texts,
         "validation": {"ok": ok, "first_mismatch": first,
                        "encode_mismatches": enc_bad + hf_enc_bad,
                        "decode_mismatches": dec_bad,
-                       "batch_mismatches": batch_bad,
+                       **batch_mismatch_result(batch_ran, batch_bad),
                        "validation_texts": len(validation_texts), "stats": stats},
         "timing_ids": timing_ids,
         "expected_decoded": expected_decoded,

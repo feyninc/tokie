@@ -427,8 +427,14 @@ def load_giga_results(path):
                 title = _decode_title(op, body.get("ids_input"), where)
 
             threads = _count(body.get("threads"), f"{where}.threads")
-            if threads != env_threads:
-                _die(f"{where}.threads is {threads} but meta.env.RAYON_NUM_THREADS is {env_threads}")
+            expected_threads = env_threads if op == "batch" else 1
+            if threads != expected_threads:
+                if op == "batch":
+                    expected_note = "batch follows meta.env.RAYON_NUM_THREADS"
+                else:
+                    expected_note = "single encode/decode runs on one thread"
+                _die(f"{where}.threads is {threads} but expected {expected_threads} "
+                     f"({expected_note})")
             passes = _count(body.get("passes_per_round"), f"{where}.passes_per_round")
             input_bytes = _count(body.get("input_bytes_utf8"), f"{where}.input_bytes_utf8")
             decoded_bytes = _count(body.get("decoded_bytes_utf8"), f"{where}.decoded_bytes_utf8")
@@ -583,6 +589,12 @@ def _first_pass_caption(facts, entry):
     ))
 
 
+def _first_pass_title(entry):
+    """Name the batch thread count the recorded first pass actually used."""
+    threads = entry["threads"]
+    return f"First inference pass ({threads}-thread batch, lower is better)"
+
+
 def chart_published_first_pass(spec, out_dir):
     """One fresh-instance first pass per model; model loading is excluded."""
     group = spec["group"]
@@ -595,7 +607,7 @@ def chart_published_first_pass(spec, out_dir):
             bars.append((f"{label} \u00b7 {side}", millis, color, f"{millis:.1f}"))
 
     _horiz_chart(
-        "First inference pass (8-thread batch, lower is better)",
+        _first_pass_title(group[0]),
         bars,
         "ms",
         _first_pass_caption(spec["facts"], group[0]),
@@ -631,6 +643,12 @@ def _first_pass_spec(facts, entries):
         "facts": facts,
         "group": batch,
     }
+
+
+def _without_decode_ops(entries):
+    """Drop both decode variants; the supplemental file replaces both charts."""
+    return [entry for entry in entries
+            if entry["op"] not in ("decode", "decode_list")]
 
 
 def _check_decode_override(base_files, facts, entries, where):
@@ -719,8 +737,9 @@ def main(argv=None):
 
     for path, facts, entries in base_files:
         if decode_plan is not None:
-            # The supplemental file is the explicit replacement for decode.
-            entries = [entry for entry in entries if entry["op"] != "decode"]
+            # The supplemental file is the explicit replacement for both decode
+            # charts; keep every other operation from the base run.
+            entries = _without_decode_ops(entries)
         for spec in _giga_chart_specs(facts, entries):
             add("op", spec, path)
 

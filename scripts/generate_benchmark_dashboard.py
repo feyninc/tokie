@@ -80,6 +80,13 @@ def _definitions(tasks):
     return {key: value for key, value in tasks.items() if key in TASK_TITLES and isinstance(value, dict)}
 
 
+def _host_identity(meta):
+    """Stable host identity only; load/frequency snapshots are intentionally excluded."""
+    fields = ["cpu_model", "cpu_count_logical", "platform"]
+    fields.extend(key for key in ("machine", "architecture", "arch", "system", "os") if key in meta)
+    return tuple(meta.get(key) for key in fields)
+
+
 def validate_file(path, data):
     """Return human-readable problems; an empty list means the file is valid."""
     errors = []
@@ -95,14 +102,20 @@ def validate_file(path, data):
     for key in ("artifacts", "host", "samples", "tasks"):
         if not (isinstance(meta.get(key), dict) and meta[key]):
             bad(f"meta.{key} must be a non-empty object")
+    if not (isinstance(meta.get("cpu_model"), str) and meta["cpu_model"].strip()):
+        bad("meta.cpu_model must be a non-empty string")
+    if not (_is_int(meta.get("cpu_count_logical")) and meta["cpu_count_logical"] > 0):
+        bad("meta.cpu_count_logical must be a positive integer")
+    if not (isinstance(meta.get("platform"), str) and meta["platform"].strip()):
+        bad("meta.platform must be a non-empty string")
     for task, definition in _definitions(meta.get("tasks")).items():
         if not isinstance(definition, dict):
             bad(f"meta.tasks.{task} must be an object")
             continue
         if "ordinal" in definition and not _is_int(definition["ordinal"]):
             bad(f"meta.tasks.{task}.ordinal must be an integer")
-        if "unit" in definition and not (isinstance(definition["unit"], str) and definition["unit"].strip()):
-            bad(f"meta.tasks.{task}.unit must be a non-empty string")
+        if "unit" in definition and definition["unit"] != "MiB/s":
+            bad(f"meta.tasks.{task}.unit must be exactly MiB/s")
     artifacts = meta.get("artifacts") if isinstance(meta.get("artifacts"), dict) else {}
     models = data.get("models") if isinstance(data.get("models"), dict) else {}
     if not models:
@@ -330,9 +343,13 @@ def load_dataset(paths):
                 else:
                     benchmark[key] = entry
     artifacts = payloads[0]["meta"]["artifacts"]
+    reference_host = _host_identity(payloads[0]["meta"])
     for path, data in zip(paths[1:], payloads[1:]):
         if json.dumps(data["meta"]["artifacts"], sort_keys=True) != json.dumps(artifacts, sort_keys=True):
             errors.append(f"{path}: meta.artifacts conflicts with the first results file")
+        if _host_identity(data["meta"]) != reference_host:
+            errors.append(f"{path}: stable host identity (cpu_model/cpu_count_logical/platform) "
+                          "conflicts with the first results file")
     if errors:
         raise ValueError("\n".join(errors))
     position = {label: index for index, label in enumerate(order)}
@@ -540,6 +557,21 @@ def _common_unit(dataset, tasks):
     return units.pop() if len(units) == 1 else None
 
 
+def _round_range(dataset, labels, tasks):
+    rounds = {len(dataset["benchmark"][(label, task, threads)]["rounds"])
+              for label in labels for task, threads in tasks if (label, task, threads) in dataset["benchmark"]}
+    return (min(rounds), max(rounds)) if rounds else (None, None)
+
+
+def _round_text(dataset, labels, tasks):
+    low, high = _round_range(dataset, labels, tasks)
+    if low is None:
+        return "observed unknown-round min\u2013max"
+    if low == high:
+        return f"observed {low}-round min\u2013max"
+    return f"per-series observed min\u2013max over {low}\u2013{high} rounds"
+
+
 def _decorate(fig, dataset, labels, libraries, tasks):
     artifacts = dataset["artifacts"]
     unit = _common_unit(dataset, tasks)
@@ -549,7 +581,8 @@ def _decorate(fig, dataset, labels, libraries, tasks):
              else "Historical published Tokie preview \u2014 not current data")
     fig.text(0.012, 0.974, "Tokenizer throughput by task", fontsize=17, color=TEXT, ha="left",
              va="top", fontweight="bold")
-    fig.text(0.012, 0.938, f"{scope}  \u00b7  median + observed 5-round min\u2013max (not CI)"
+    round_text = _round_text(dataset, labels, tasks)
+    fig.text(0.012, 0.938, f"{scope}  \u00b7  median + {round_text} (not CI)"
              f"  \u00b7  {unit_text}  \u00b7  log scale per task; no universal winner",
              fontsize=10, color=MUTED, ha="left", va="top")
     handles = [Line2D([], [], color=LIB_STYLE[lib][0], marker=LIB_STYLE[lib][1], markersize=6.8,
@@ -591,9 +624,9 @@ def _footer(fig, dataset, labels, libraries, tasks):
     cpu = cpu or (f"{count} CPUs" if count else "CPU not recorded")
     if count and not str(cpu).endswith("CPUs"):
         cpu = f"{cpu} \u00b7 {count} CPUs"
-    rounds = {len(dataset["benchmark"][(label, task, threads)]["rounds"])
-              for label in labels for task, threads in tasks if (label, task, threads) in dataset["benchmark"]}
-    rounds_text = f"{min(rounds)}\u2013{max(rounds)}" if len(rounds) > 1 else str(next(iter(rounds), "?"))
+    low, high = _round_range(dataset, labels, tasks)
+    round_text = (f"observed min\u2013max over {low} warm paired rounds" if low == high
+                  else f"per-series observed min\u2013max over {low}\u2013{high} warm rounds") if low is not None else "warm rounds"
     unit = _common_unit(dataset, tasks)
     unit_text = f"{unit}, higher is better" if unit else "units per task, higher is better"
     tokie = dataset["artifacts"].get("tokie", {})
@@ -602,7 +635,7 @@ def _footer(fig, dataset, labels, libraries, tasks):
         build = build.get("commit") or build.get("sha") or build.get("label")
     provenance = f" \u00b7 tokie {str(build)[:12]}" if build else ""
     lines = [
-        f"Dot = median; range = observed min\u2013max over {rounds_text} warm paired rounds (not CI). {unit_text}; log scale within each task.",
+        f"Dot = median; range = {round_text} (not CI). {unit_text}; log scale within each task.",
         f"Decode: shared np.uint32 ids \u2192 Unicode; {_decode_adapters(libraries)} \u2014 conversions inside the clock.",
         f"{cpu}{provenance} \u00b7 samples above \u00b7 protocol/tables: {dataset['report']}",
     ]
@@ -769,7 +802,7 @@ def write_tables(dataset, path):
         lines.extend(["### Validation", "", "| Model | Encode mismatches | Decode mismatches | Batch mismatches | Status |",
                       "| --- | ---: | ---: | ---: | --- |"])
         for label in labels:
-            entry = _flat_validation(dataset["validation"].get(label, {}))
+            entry = dataset["validation"].get(label, {})
             lines.append(f"| {_model_name(dataset, label)} | {entry.get('encode_mismatches', 'N/A')} | "
                          f"{entry.get('decode_mismatches', 'N/A')} | {entry.get('batch_mismatches', 'N/A')} | "
                          f"{'ok' if entry.get('ok') else 'check'} |")
