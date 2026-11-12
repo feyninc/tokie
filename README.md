@@ -37,6 +37,8 @@ tokie is a Rust tokenizer library with Python bindings. It loads a Hugging Face 
 pip install tokie
 ```
 
+`pip install tokie` installs the published 0.2.0 wheel, which accepts Python lists for `decode` and `decode_bytes` as well as arrays. The current source tree accepts arrays only. The examples below pass arrays, so they work with both.
+
 ### Rust
 
 ```toml
@@ -44,7 +46,7 @@ pip install tokie
 tokie = "0.2"
 ```
 
-These docs describe the 0.2.0 API. To migrate from 0.1.4, see [API changes in 0.2](docs/API_CHANGES_0_2.md).
+These docs describe the current source tree. The strict `decode` array contract is unreleased: the published 0.2.0 wheel also accepts Python lists. See [the decode input note](docs/RELEASE_NOTE_DECODE_UINT32.md). To migrate from 0.1.4, see [API changes in 0.2](docs/API_CHANGES_0_2.md).
 
 Coming from Hugging Face `tokenizers`? See the [migration guide](docs/MIGRATION.md).
 
@@ -64,14 +66,14 @@ plus = tokenizer.encode_plus("Hello, world!")
 print(plus.tolist())
 print(tokenizer.encode_plus("Hello", pair="world", truncate=True, pad=True, max_len=8).tolist())
 
-print(tokenizer.decode(plus.tolist(), skip=True))
+print(tokenizer.decode(plus, skip=True))
 
 flat, ends = tokenizer.batch(["Hello!", "World"])
 print(tokenizer.count_tokens("Hello, world!"))
 print(tokenizer.count_tokens_batch(["Hello!", "World"]))
 ```
 
-`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the parsed template, so BERT's single sequence is `[CLS]`, the ids, `[SEP]`. `pair` uses the pair template. `truncate` and `pad` share `max_len`, and that length counts the template ids; truncation drops from the right, longest sequence first, and padding is fixed on the right. `batch` returns one id array and `ends[i]`, the cumulative id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off. Python returns NumPy arrays, not 0.1.4 `Encoding` objects; there is no `.ids`, so use `.tolist()`.
+`encode` returns a `uint32` array and leaves the template off. `encode_plus` writes the parsed template, so BERT's single sequence is `[CLS]`, the ids, `[SEP]`. `pair` uses the pair template. `truncate` and `pad` share `max_len`, and that length counts the template ids; truncation drops from the right, longest sequence first, and padding is fixed on the right. `batch` returns one id array and `ends[i]`, the cumulative id count after text `i`. `count_tokens` returns the length `encode` would append. `count_tokens_batch` returns one length per text. Both leave the template off. Python returns NumPy arrays, not 0.1.4 `Encoding` objects; there is no `.ids`. Use `.tolist()` only to print or assert. `decode` and `decode_bytes` take a one-dimensional native `uint32` array directly, such as `plus` or `flat[start:end]`; do not pass `.tolist()`. Lists are rejected in this source tree (published 0.2.0 accepts them).
 
 ### Rust
 
@@ -149,6 +151,21 @@ let mut again = Tokenizer::open("model.tokie")?;
 ```
 
 `from_pretrained` in Python and `from_pretrained`/`pretrained` in Rust open exactly one `.tokie` file from the repo, whatever its name. A repo with no `.tokie` file is parsed from `tokenizer.json`; several `.tokie` files is an error. There is no runtime `.tkz` fallback: a genuine legacy `TOKI` image is refused by magic, not by filename, while a JSON file merely named `.tkz` is parsed as JSON. `from_json(path)` and `from_file(path)` are path aliases for `open`, and `to_file` is an alias for `save` in Rust. Legacy 0.1.4 binaries cannot read a `.tokie` file: rebuild from `tokenizer.json` with the new code, because renaming a `.tkz` file is not enough.
+
+### Decode input
+
+`decode` and `decode_bytes` take a one-dimensional native-endian NumPy `uint32` array. The array must be C-contiguous and aligned. Empty, read-only, and contiguous slice arrays are accepted. Pass `encode`, `encode_plus`, or a slice of `batch`'s flat ids directly. For ids already in a Python list, convert explicitly with `numpy.array(values, dtype=numpy.uint32)`; there is no implicit cast or fallback. `.tolist()` is for printing and assertions, not for passing to decode. `batch`'s `ends` array is `uint64`; it is not decode input.
+
+```python
+ids = tokenizer.encode("Hello")
+print(tokenizer.decode(ids))
+print(tokenizer.decode_bytes(ids, skip=True))
+
+flat, ends = tokenizer.batch(["Hello", "world"])
+print(tokenizer.decode(flat[: ends[0]]))  # first document
+```
+
+Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`. Non-contiguous or unaligned non-empty arrays raise `ValueError`. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`. These rules apply to the current source tree; the published 0.2.0 wheel also accepts lists. The benchmark tables below were measured with the published wheel and are unchanged.
 
 ## Benchmarks
 

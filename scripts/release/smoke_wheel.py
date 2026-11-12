@@ -250,14 +250,45 @@ def smoke_check(expected_version: str, wheel: Path | None) -> None:
     if ends.tolist() != [1, 2, 3, 3]:
         fail(f"batch ends are {ends.tolist()}, expected [1, 2, 3, 3]")
 
-    if tok.decode([3]) != "\u00e9":
-        fail("decode([3]) did not return the decoded non-ASCII pair")
-    if tok.decode_bytes([2]) != b"\xc3":
-        fail("decode_bytes([2]) did not keep the invalid UTF-8 byte")
-    if tok.decode_bytes([2, 4, 3]) != b"\xc3[MASK]\xc3\xa9":
+    # `decode` and `decode_bytes` take a native `uint32` array directly. The
+    # `encode` result is already that array; the hand-written fixtures below
+    # are built once, outside the calls, so no list is ever passed.
+    if tok.decode(ids) != "a":
+        fail("decode(encode('a')) did not return 'a'")
+
+    decoded_pair = numpy.array([3], dtype=numpy.uint32)
+    if tok.decode(decoded_pair) != "\u00e9":
+        fail("decode(array([3], uint32)) did not return the decoded non-ASCII pair")
+
+    invalid_utf8 = numpy.array([2], dtype=numpy.uint32)
+    if tok.decode_bytes(invalid_utf8) != b"\xc3":
+        fail("decode_bytes(array([2], uint32)) did not keep the invalid UTF-8 byte")
+    if tok.decode(invalid_utf8) != "\ufffd":
+        fail("decode(array([2], uint32)) did not replace invalid UTF-8")
+
+    mixed = numpy.array([2, 4, 3], dtype=numpy.uint32)
+    if tok.decode_bytes(mixed) != b"\xc3[MASK]\xc3\xa9":
         fail("decode_bytes did not keep the special token")
-    if tok.decode_bytes([2, 4, 3], skip=True) != b"\xc3\xc3\xa9":
+    if tok.decode_bytes(mixed, skip=True) != b"\xc3\xc3\xa9":
         fail("decode_bytes(skip=True) did not drop the special token")
+
+    empty = numpy.array([], dtype=numpy.uint32)
+    if tok.decode(empty) != "":
+        fail("decode(empty uint32 array) did not return an empty string")
+    if tok.decode_bytes(empty) != b"":
+        fail("decode_bytes(empty uint32 array) did not return empty bytes")
+
+    # Unknown ids in the id space stay TokieError: 9999 is above this vocab,
+    # and u32::MAX is the maximum value the input type can carry.
+    for unknown_id in (9999, 2**32 - 1):
+        unknown = numpy.array([unknown_id], dtype=numpy.uint32)
+        for method in (tok.decode, tok.decode_bytes):
+            try:
+                method(unknown)
+            except tokie.TokieError:
+                pass
+            else:
+                fail(f"decode fixture did not reject unknown id {unknown_id}")
 
     vocab = tok.get_vocab()
     expected_vocab = {

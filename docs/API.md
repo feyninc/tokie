@@ -1,5 +1,8 @@
 # API
 
+> [!NOTE]
+> This page describes the unreleased source tree. The strict `decode` array contract is not in the published 0.2.0 wheel, which also accepts Python lists. See [the decode input note](RELEASE_NOTE_DECODE_UINT32.md).
+
 tokie 0.2 has two layers. `encode`, `batch`, `decode`, `count_tokens`, and the vocabulary calls are the fast core. They append into buffers the caller owns, or return a small result. `encode_plus` is the rich call: it applies the parsed template, optionally encodes a pair, truncates from the right, and pads on the right. The 0.1.4 facade is not back. [API_CHANGES_0_2.md](API_CHANGES_0_2.md) lists every restored name, intentional difference, and removed surface. There is no full-compatibility guarantee.
 
 ## Template
@@ -18,8 +21,8 @@ tokie 0.2 has two layers. `encode`, `batch`, `decode`, `count_tokens`, and the v
 | `encode_batch`, `encode_batch_flat` | `batch` | One id buffer and one cumulative `ends` entry per text. |
 | `count_tokens` | `count_tokens` | Encode into tokenizer-owned scratch and return the length. Builds the ids; not allocation-free or early-exit. Template off in both releases. |
 | `count_tokens_batch` | `count_tokens_batch` | `batch` into that buffer and return one length per text. Template off. |
-| `decode` | `decode` | Python returns `str` and stays lossy. Rust appends into a `String`. |
-| `decode_bytes` | `decode_bytes` | Raw bytes; no lossy UTF-8. `skip` omits specials. |
+| `decode` | `decode` | Python returns `str` and stays lossy; Python input is a native `uint32` NumPy array. Rust appends into a `String`. |
+| `decode_bytes` | `decode_bytes` | Raw bytes; no lossy UTF-8. Python input is a native `uint32` NumPy array. `skip` omits specials. |
 | `id_to_token` / `token_to_id` | `token` / `id` | Renamed, not aliased. 0.1.4 lookups used the decoder spelling; new `token`/`id` use the raw vocab spelling, so the keys are not interchangeable. |
 | `get_vocab` | `get_vocab` | Raw vocab spelling, consistent with `token`/`id`. The 0.1.4 decoder keys no longer apply. The entry count may be smaller than `vocab_size`. |
 | `vocab_size` | `vocab_size` | Highest id + 1, including gaps and added ids. |
@@ -61,7 +64,7 @@ The metadata calls are `vocab_size()`, `get_vocab()`, `pad_token_id()`, `num_spe
 
 ## Python
 
-`encode` and `encode_plus` return a NumPy `uint32` array. `batch` returns a `uint32` ids array and a `uint64` cumulative `ends` array. There is no `Encoding` object and no `.ids`; use `.tolist()`. `decode` returns `str`; `decode_bytes` returns `bytes`.
+`encode` and `encode_plus` return a NumPy `uint32` array. `batch` returns a `uint32` ids array and a `uint64` cumulative `ends` array. There is no `Encoding` object and no `.ids`; use `.tolist()` only to print or assert. `decode` returns `str`; `decode_bytes` returns `bytes`. Both take a one-dimensional native-endian NumPy `uint32` array that is C-contiguous and aligned. Pass the array from `encode`, `encode_plus`, or a slice of `batch`'s flat ids directly; do not call `.tolist()` first.
 
 ```python
 tokenizer = tokie.Tokenizer.from_pretrained("google-bert/bert-base-uncased")
@@ -71,8 +74,8 @@ tokenizer.encode("Hello")                  # uint32 array, template off
 tokenizer.encode_plus("Hello")             # template on
 tokenizer.encode_plus("Hello", pair="world", truncate=True, pad=True, max_len=8)
 flat, ends = tokenizer.batch(["Hello", "world"])  # template off; ends are cumulative
-tokenizer.decode(flat[: ends[0]].tolist())        # str, lossy if needed
-tokenizer.decode_bytes(flat[: ends[0]].tolist(), skip=True)  # raw bytes
+tokenizer.decode(flat[: ends[0]])                 # str, lossy if needed
+tokenizer.decode_bytes(flat[: ends[0]], skip=True)  # raw bytes
 
 tokenizer.vocab_size
 tokenizer.get_vocab()                      # raw token -> id; may be smaller than vocab_size
@@ -80,7 +83,9 @@ tokenizer.pad_token_id                     # [PAD] then <pad>, else None
 tokenizer.num_special_tokens_to_add(is_pair=False)
 ```
 
-`encode` and `encode_plus` release the GIL. `batch` does too. `threads(n)` sets the worker count. `count_tokens` and `count_tokens_batch` write into reusable scratch on the tokenizer; they build the ids and stay template-off in both releases. Neither is allocation-free or an early-exit counter.
+Empty, read-only, and contiguous slice arrays are accepted. For ids built by hand, use `numpy.array(values, dtype=numpy.uint32)`; there is no implicit cast or fallback. Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`. Non-contiguous or unaligned non-empty arrays raise `ValueError`. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`. `batch`'s `ends` array is `uint64`, not decode input; slice the flat `uint32` ids with `flat[start:end]`.
+
+`encode` and `encode_plus` release the GIL. `batch` does too. `decode` and `decode_bytes` copy the input ids to an owned buffer under the GIL, then release it for the core decode. `threads(n)` sets the worker count. `count_tokens` and `count_tokens_batch` write into reusable scratch on the tokenizer; they build the ids and stay template-off in both releases. Neither is allocation-free or an early-exit counter.
 
 ## Loading
 

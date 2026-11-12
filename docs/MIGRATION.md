@@ -1,5 +1,8 @@
 # Migrating from Hugging Face `tokenizers`
 
+> [!NOTE]
+> This guide describes the unreleased source tree. The strict `decode` array contract is not in the published 0.2.0 wheel, which also accepts Python lists. See [the decode input note](RELEASE_NOTE_DECODE_UINT32.md).
+
 `encode` appends ids and leaves the template off. `encode_plus` applies the template. Hugging Face `encode` adds the template by default, so use `encode_plus` where you relied on that. Coming from tokie 0.1.4 rather than Hugging Face? See [API.md](API.md) and [API_CHANGES_0_2.md](API_CHANGES_0_2.md).
 
 ## Python
@@ -12,8 +15,8 @@ tokenizer = tokie.Tokenizer.from_pretrained("google-bert/bert-base-uncased")
 
 ids = tokenizer.encode("Hello, world!")        # template off
 plus = tokenizer.encode_plus("Hello, world!")  # [CLS], ids, [SEP] for BERT uncased
-print(tokenizer.decode(plus.tolist(), skip=True))
-print(tokenizer.decode_bytes(plus.tolist(), skip=True))
+print(tokenizer.decode(plus, skip=True))
+print(tokenizer.decode_bytes(plus, skip=True))
 
 flat, ends = tokenizer.batch(["Hello!", "World"])
 print(tokenizer.token(101))
@@ -25,7 +28,9 @@ tokenizer.save("model.tokie")
 again = tokie.Tokenizer.open("model.tokie")
 ```
 
-`encode` and `encode_plus` return a `uint32` array. `batch` returns `(uint32 ids, uint64 ends)`. There is no `Encoding` and no `.ids`; use `.tolist()`. `decode` returns a `str` and is lossy when the bytes are not UTF-8. `decode_bytes` returns raw bytes. Both keep specials by default; `skip=True` omits them. `ends[i]` is the cumulative id count after text `i`.
+`encode` and `encode_plus` return a `uint32` array. `batch` returns `(uint32 ids, uint64 ends)`. There is no `Encoding` and no `.ids`; use `.tolist()` only to print or assert. `decode` and `decode_bytes` take a one-dimensional native-endian NumPy `uint32` array that is C-contiguous and aligned; pass `plus` or `flat[start:end]` directly. `decode` returns a `str` and is lossy when the bytes are not UTF-8. `decode_bytes` returns raw bytes. Both keep specials by default; `skip=True` omits them. `ends[i]` is the cumulative id count after text `i`.
+
+Hugging Face `tokenizers` returns Python lists from `encode`. To reuse those ids with tokie, convert once: `ids = numpy.array(ids, dtype=numpy.uint32)`. Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`; non-contiguous or unaligned non-empty arrays raise `ValueError`. Empty and read-only arrays are accepted. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`.
 
 `count_tokens` and `count_tokens_batch` measure `encode`, not `encode_plus`. The template is excluded in both 0.1.4 and 0.2.
 
@@ -66,7 +71,7 @@ let again = Tokenizer::open("model.tokie")?;
 | truncation or padding | `truncate` and `pad` on the same call. Right truncation, longest sequence first. Right fixed padding. One `max_len` covers both and counts the template ids. |
 | `encode(text, add_special_tokens=False)` | `encode` |
 | `encode_batch(texts)` | `batch`. The template stays off. Call `encode_plus` per text when the template is required. |
-| `decode(ids)` | Python `decode(ids)`; Rust `decode` with `Specials::Keep`. Use `skip=True` / `Specials::Skip` to omit specials. |
+| `decode(ids)` | Python `decode(ids_array)` with a native `uint32` NumPy array; Rust `decode` with `Specials::Keep`. Use `skip=True` / `Specials::Skip` to omit specials. |
 | `decode` to raw bytes | `decode_bytes`. Raw bytes, not lossy UTF-8. |
 | `id_to_token(id)` | `token`, returning the raw vocab spelling. 0.1.4 used the old decoder spelling; the keys are not interchangeable, so this is not an alias. |
 | `token_to_id(token)` | `id`, using the raw vocab spelling. |

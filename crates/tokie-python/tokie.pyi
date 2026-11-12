@@ -49,19 +49,27 @@ class Tokenizer:
         ...
     def decode(
         self,
-        ids: Sequence[int] | numpy.typing.NDArray[numpy.uint32],
+        ids: numpy.typing.NDArray[numpy.uint32],
         skip: bool = False,
     ) -> str:
-        """Text for `ids`. `ids` may be a list, tuple, or the `encode` array.
-        `skip` omits specials. Invalid UTF-8 is replaced."""
+        """Text for `ids`. `ids` must be a 1-D `uint32` NumPy array that is
+        C-contiguous, aligned, and native-endian. Empty and read-only arrays are
+        accepted. A wrong dtype, non-native byte order, or other rank raises
+        `TypeError`; a non-empty non-contiguous or misaligned array raises
+        `ValueError`. Do not mutate `ids` while this call runs. `skip` omits
+        specials. Invalid UTF-8 is replaced."""
         ...
     def decode_bytes(
         self,
-        ids: Sequence[int] | numpy.typing.NDArray[numpy.uint32],
+        ids: numpy.typing.NDArray[numpy.uint32],
         skip: bool = False,
     ) -> bytes:
-        """Raw bytes for `ids`. `ids` may be a list, tuple, or the `encode` array.
-        `skip` omits specials. Invalid UTF-8 stays as bytes."""
+        """Raw bytes for `ids`. `ids` must be a 1-D `uint32` NumPy array that is
+        C-contiguous, aligned, and native-endian. Empty and read-only arrays are
+        accepted. A wrong dtype, non-native byte order, or other rank raises
+        `TypeError`; a non-empty non-contiguous or misaligned array raises
+        `ValueError`. Do not mutate `ids` while this call runs. `skip` omits
+        specials. Invalid UTF-8 stays as bytes."""
         ...
     def batch(
         self, texts: Sequence[str]
