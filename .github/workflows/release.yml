@@ -5,8 +5,16 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
+      target:
+        description: "Release target. 'all' publishes Rust and Python; 'python' publishes Python only."
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - python
       version:
-        description: "Release version without the v prefix (for example 0.2.0)"
+        description: "Release version without the v prefix (for example 0.3.0)"
         required: true
         type: string
       publish:
@@ -15,9 +23,10 @@ on:
         default: false
         type: boolean
 
-# A release and a manual run for the same version must not race.
+# A release and a manual run for the same target and version must not race.
+# The python- prefix keeps a Python-only run from colliding with an all run.
 concurrency:
-  group: release-${{ github.event.release.tag_name || format('v{0}', inputs.version) }}
+  group: release-${{ github.event.release.tag_name || format('{0}v{1}', inputs.target == 'python' && 'python-' || '', inputs.version) }}
   cancel-in-progress: false
 
 env:
@@ -33,6 +42,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      target: ${{ steps.check.outputs.target }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,6 +59,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TARGET: ${{ inputs.target || 'all' }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -58,18 +70,19 @@ jobs:
           else
             python scripts/release/check_versions.py \
               --version "$INPUT_VERSION" \
+              --target "$INPUT_TARGET" \
               --github-output "$GITHUB_OUTPUT"
           fi
 
       - name: Require the release tag to be on main
         if: github.event_name == 'release'
         env:
-          VERSION: ${{ steps.check.outputs.version }}
+          TAG: ${{ steps.check.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="v$VERSION"
+          tag="$TAG"
           if ! printf '%s' "$tag" | grep -Eq \
-            '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+            '^(python-)?v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
             echo "::error::validated version did not form a safe release tag: $tag"
             exit 1
           fi
@@ -85,6 +98,14 @@ jobs:
 
       - name: Unit-test the release helpers
         run: python scripts/release/test_release_scripts.py
+
+      - name: Reject PyPI publish on a manual run
+        if: github.event_name == 'workflow_dispatch' && steps.check.outputs.target == 'python' && inputs.publish
+        env:
+          TARGET: ${{ steps.check.outputs.target }}
+        run: |
+          echo "::error::publish=true is not allowed for target=$TARGET; PyPI uploads happen only on a published GitHub release"
+          exit 1
 
       - name: Reject publish from a non-main ref
         if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref != 'refs/heads/main'
@@ -349,9 +370,10 @@ jobs:
       - build-pyemscripten
       - build-sdist
       - smoke-pyemscripten
-    # A published release always publishes. A manual run publishes only when
-    # publish=true and the ref is main. A manual preflight never writes.
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main')
+    # A published release always publishes Rust crates for an "all" target. A
+    # manual run publishes only when publish=true and the ref is main. A manual
+    # preflight never writes, and a Python-only release never touches crates.io.
+    if: needs.validate-version.outputs.target == 'all' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -393,13 +415,24 @@ jobs:
     name: Upload wheels and sdist to PyPI
     needs:
       - validate-version
-      - publish-crates
       - build-wheels
       - build-pyemscripten
+      - smoke-pyemscripten
       - build-sdist
+      - publish-crates
     # PyPI is release-event only. A manual run, with publish true or false,
-    # never uploads to PyPI.
-    if: github.event_name == 'release'
+    # never uploads to PyPI. Every artifact job must have succeeded; for a
+    # Python-only release publish-crates is skipped by design, while an "all"
+    # release must have published the crates first.
+    if: >-
+      always() && !cancelled() && github.event_name == 'release'
+      && needs.validate-version.result == 'success'
+      && needs.build-wheels.result == 'success'
+      && needs.build-pyemscripten.result == 'success'
+      && needs.smoke-pyemscripten.result == 'success'
+      && needs.build-sdist.result == 'success'
+      && ((needs.validate-version.outputs.target == 'all' && needs.publish-crates.result == 'success')
+      || (needs.validate-version.outputs.target == 'python' && needs.publish-crates.result == 'skipped'))
     runs-on: ubuntu-latest
     permissions:
       contents: read

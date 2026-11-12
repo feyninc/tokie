@@ -1,7 +1,7 @@
 # tokie 0.2.0
 
 > [!NOTE]
-> These are the historical release notes for published 0.2.0. The unreleased working tree now requires a native `uint32` NumPy array for Python `decode` and `decode_bytes`; the published wheel also accepts Python lists. See [the decode input note](RELEASE_NOTE_DECODE_UINT32.md).
+> These are the historical release notes for published 0.2.0. Python 0.3.0 requires a native `uint32` NumPy array for Python `decode` and `decode_bytes`; 0.2.0 also accepted Python lists. See [the decode input note](RELEASE_NOTE_DECODE_UINT32.md) and the [Python 0.3.0 release notes](PYTHON_RELEASE_0_3.md).
 
 tokie 0.2.0 is a breaking release for Rust and Python. The core is rebuilt
 around caller-owned buffers: encode appends into a caller-owned vector or

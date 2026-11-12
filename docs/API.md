@@ -1,7 +1,7 @@
-# API
+# tokie API
 
 > [!NOTE]
-> This page describes the unreleased source tree. The strict `decode` array contract is not in the published 0.2.0 wheel, which also accepts Python lists. See [the decode input note](RELEASE_NOTE_DECODE_UINT32.md).
+> These docs describe Python 0.3.0 and Rust 0.2.0. Python 0.3.0 requires a one-dimensional native `uint32` NumPy array for `decode` and `decode_bytes`; Python 0.2.0 also accepted lists. See [the decode input note](RELEASE_NOTE_DECODE_UINT32.md) and the [Python 0.3.0 release notes](PYTHON_RELEASE_0_3.md).
 
 tokie 0.2 has two layers. `encode`, `batch`, `decode`, `count_tokens`, and the vocabulary calls are the fast core. They append into buffers the caller owns, or return a small result. `encode_plus` is the rich call: it applies the parsed template, optionally encodes a pair, truncates from the right, and pads on the right. The 0.1.4 facade is not back. [API_CHANGES_0_2.md](API_CHANGES_0_2.md) lists every restored name, intentional difference, and removed surface. There is no full-compatibility guarantee.
 
@@ -83,7 +83,7 @@ tokenizer.pad_token_id                     # [PAD] then <pad>, else None
 tokenizer.num_special_tokens_to_add(is_pair=False)
 ```
 
-Empty, read-only, and contiguous slice arrays are accepted. For ids built by hand, use `numpy.array(values, dtype=numpy.uint32)`; there is no implicit cast or fallback. Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`. Non-contiguous or unaligned non-empty arrays raise `ValueError`. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`. `batch`'s `ends` array is `uint64`, not decode input; slice the flat `uint32` ids with `flat[start:end]`.
+Empty, read-only, and contiguous slice arrays are accepted. For ids built by hand, use `numpy.asarray(values, dtype=numpy.uint32)`; there is no implicit cast or fallback. Lists, tuples, bytes, memoryview, other dtypes, other ranks, and foreign byte order raise `TypeError`. Non-contiguous or unaligned non-empty arrays raise `ValueError`. Gap and unknown ids, including `2**32 - 1`, still raise `tokie.TokieError`. Python 0.3.0 enforces these rules; 0.2.0 also accepted lists. `batch`'s `ends` array is `uint64`, not decode input; slice the flat `uint32` ids with `flat[start:end]`.
 
 `encode` and `encode_plus` release the GIL. `batch` does too. `decode` and `decode_bytes` copy the input ids to an owned buffer under the GIL, then release it for the core decode. `threads(n)` sets the worker count. `count_tokens` and `count_tokens_batch` write into reusable scratch on the tokenizer; they build the ids and stay template-off in both releases. Neither is allocation-free or an early-exit counter.
 
@@ -97,7 +97,7 @@ The Cargo feature is `hub`; `hf` is an alias.
 
 ## Speed
 
-The 0.2 implementation is complete. [BENCHMARK_AFTER.md](BENCHMARK_AFTER.md) records the final results: correctness gates pass, the Rust quiet-window pair found no slowdown at its reported finite resolution, and the Python matrix has no statistically reliable familywise regression; the strict performance criterion is uncertified/partial. The table below is design rationale for the 0.2 shape, not measurement.
+The Rust 0.2 implementation is complete. [BENCHMARK_AFTER.md](BENCHMARK_AFTER.md) records the final results: correctness gates pass, the Rust quiet-window pair found no slowdown at its reported finite resolution, and the Python matrix has no statistically reliable familywise regression; the strict performance criterion is uncertified/partial. The table below is design rationale for the 0.2 shape, not measurement.
 
 | Change | Expected effect |
 | --- | --- |

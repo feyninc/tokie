@@ -1,7 +1,7 @@
 # API changes from tokie 0.1.4 to 0.2
 
 > [!NOTE]
-> These are historical notes for the published 0.2.0 release, including the examples below, which pass Python lists to `decode`. The unreleased working tree now requires a native `uint32` NumPy array for `decode` and `decode_bytes`. See [the decode input note](RELEASE_NOTE_DECODE_UINT32.md).
+> These are historical notes for the published 0.2.0 release, including the examples below, which pass Python lists to `decode`. Python 0.3.0 requires a native `uint32` NumPy array for `decode` and `decode_bytes`. See [the decode input note](RELEASE_NOTE_DECODE_UINT32.md) and the [Python 0.3.0 release notes](PYTHON_RELEASE_0_3.md).
 
 **Published 0.1.4:** commit `1a378c8` (crates.io and PyPI).
 **0.2 target:** commit `c59c8c8` plus the `bhavnick/api-014-compat` branch. It is unreleased at the time of writing.
