@@ -49,10 +49,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/chonkie-inc/tokie"
-Repository = "https://github.com/chonkie-inc/tokie"
+Homepage = "https://github.com/feyninc/tokie"
+Repository = "https://github.com/feyninc/tokie"
 Documentation = "https://docs.rs/tokie"
-"Bug Tracker" = "https://github.com/chonkie-inc/tokie/issues"
+"Bug Tracker" = "https://github.com/feyninc/tokie/issues"
 
 [tool.maturin]
 manifest-path = "Cargo.toml"

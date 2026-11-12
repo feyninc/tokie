@@ -44,7 +44,7 @@ pip install tokie
 tokie = "0.2"
 ```
 
-This tree is the unreleased 0.2. crates.io and PyPI still serve 0.1.4, which does not have these calls. See [API changes in 0.2](docs/API_CHANGES_0_2.md).
+These docs describe the 0.2.0 API. To migrate from 0.1.4, see [API changes in 0.2](docs/API_CHANGES_0_2.md).
 
 Coming from Hugging Face `tokenizers`? See the [migration guide](docs/MIGRATION.md).
 
