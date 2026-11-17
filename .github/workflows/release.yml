@@ -6,13 +6,14 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: "Release target. 'all' publishes Rust and Python; 'python' publishes Python only."
+        description: "Release target. 'all' publishes Rust and Python; 'python' publishes Python only; 'rust' publishes Rust crates only."
         required: true
         default: all
         type: choice
         options:
           - all
           - python
+          - rust
       version:
         description: "Release version without the v prefix (for example 0.3.0)"
         required: true
@@ -24,9 +25,9 @@ on:
         type: boolean
 
 # A release and a manual run for the same target and version must not race.
-# The python- prefix keeps a Python-only run from colliding with an all run.
+# The python- and rust- prefixes keep a one-language run from colliding with an all run.
 concurrency:
-  group: release-${{ github.event.release.tag_name || format('{0}v{1}', inputs.target == 'python' && 'python-' || '', inputs.version) }}
+  group: release-${{ github.event.release.tag_name || format('{0}v{1}', inputs.target != 'all' && format('{0}-', inputs.target) || '', inputs.version) }}
   cancel-in-progress: false
 
 env:
@@ -82,7 +83,7 @@ jobs:
           set -euo pipefail
           tag="$TAG"
           if ! printf '%s' "$tag" | grep -Eq \
-            '^(python-)?v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+            '^(python-|rust-)?v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
             echo "::error::validated version did not form a safe release tag: $tag"
             exit 1
           fi
@@ -373,7 +374,8 @@ jobs:
     # A published release always publishes Rust crates for an "all" target. A
     # manual run publishes only when publish=true and the ref is main. A manual
     # preflight never writes, and a Python-only release never touches crates.io.
-    if: needs.validate-version.outputs.target == 'all' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'))
+    # A Rust-only release publishes crates and never uploads to PyPI.
+    if: (needs.validate-version.outputs.target == 'all' || needs.validate-version.outputs.target == 'rust') && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     permissions:
       contents: read

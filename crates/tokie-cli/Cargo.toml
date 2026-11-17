@@ -1,6 +1,6 @@
 [package]
 name = "tokie-cli"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Encode and decode with a tokie tokenizer"
 license = "MIT OR Apache-2.0"
@@ -11,5 +11,5 @@ name = "tokie"
 path = "src/main.rs"
 
 [dependencies]
-tokie = { version = "0.2.0", path = "../tokie" }
+tokie = { version = "0.2.1", path = "../tokie" }
 clap = { version = "4", features = ["derive"] }

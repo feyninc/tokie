@@ -2,7 +2,7 @@
 """Validate a tokie release version against the tag and every manifest.
 
 The release workflow passes either a published GitHub release tag
-(``v0.2.0`` or ``python-v0.3.0``) or a manual version input (``0.3.0``) plus a
+(``v0.2.0``, ``python-v0.3.0`` or ``rust-v0.2.1``) or a manual version input (``0.3.0``) plus a
 target. This script rejects anything that is not a strict SemVer release before
 a later job can write to a registry.
 
@@ -11,6 +11,9 @@ member except normalie (0.1.0) carries the release version. ``--target python``
 checks a Python-only release: only ``tokie-python`` and ``pyproject.toml``
 carry the release version, while the Rust crates keep their own versions and
 must keep their dependency pins consistent with those actual versions.
+``--target rust`` checks a Rust-only release: pretokie, tokie and tokie-cli
+carry the release version, while ``tokie-python`` and ``pyproject.toml`` keep
+their own matching version.
 
 Only the standard library is used.
 """
@@ -39,7 +42,8 @@ PRERELEASE_IDENTIFIER = re.compile(r"[0-9A-Za-z-]+")
 NORMALIE_VERSION = "0.1.0"
 EXPECTED_PACKAGES = ("normalie", "pretokie", "tokie", "tokie-python", "tokie-cli")
 PYTHON_PACKAGE = "tokie-python"
-RELEASE_TARGETS = ("all", "python")
+RELEASE_TARGETS = ("all", "python", "rust")
+RUST_PACKAGES = ("pretokie", "tokie", "tokie-cli")
 # (manifest package, dependency) pairs whose version pin must match the
 # dependency's actual package version, whatever that version is.
 DEPENDENCY_EDGES = (
@@ -93,16 +97,18 @@ def version_from_tag(tag: str) -> str:
 def parse_release_tag(tag: str) -> tuple[str, str]:
     if tag.startswith("python-v"):
         return "python", version_from_tag(tag[len("python-") :])
+    if tag.startswith("rust-v"):
+        return "rust", version_from_tag(tag[len("rust-") :])
     if tag.startswith("v"):
         return "all", version_from_tag(tag)
     fail(
-        f"release tag {tag!r} must start with 'v' or 'python-v' "
-        "(for example v0.2.0 or python-v0.3.0)"
+        f"release tag {tag!r} must start with 'v', 'python-v' or 'rust-v' "
+        "(for example v0.2.0, python-v0.3.0 or rust-v0.2.1)"
     )
 
 
 def release_tag(target: str, version: str) -> str:
-    prefix = "python-" if target == "python" else ""
+    prefix = f"{target}-" if target in ("python", "rust") else ""
     return f"{prefix}v{version}"
 
 
@@ -216,6 +222,11 @@ def check_versions(root: Path, version: str, target: str = "all") -> dict[str, s
             expected = NORMALIE_VERSION if package == "normalie" else version
             if found != expected:
                 fail(f"{package} version is {found!r}, expected {expected!r}")
+    elif target == "rust":
+        for package in ("normalie", *RUST_PACKAGES):
+            expected = NORMALIE_VERSION if package == "normalie" else version
+            if versions[package] != expected:
+                fail(f"{package} version is {versions[package]!r}, expected {expected!r}")
     else:
         if versions["normalie"] != NORMALIE_VERSION:
             fail(
@@ -228,7 +239,7 @@ def check_versions(root: Path, version: str, target: str = "all") -> dict[str, s
                 f"expected {version!r}"
             )
 
-    check_pyproject(root, version)
+    check_pyproject(root, versions[PYTHON_PACKAGE] if target == "rust" else version)
     check_dependency_pins(root, versions)
     return versions
 
@@ -238,7 +249,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--version", help="release version, for example 0.3.0")
     parser.add_argument(
         "--tag",
-        help="release tag, for example v0.2.0 or python-v0.3.0",
+        help="release tag, for example v0.2.0, python-v0.3.0 or rust-v0.2.1",
     )
     parser.add_argument(
         "--target",

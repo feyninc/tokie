@@ -1,6 +1,6 @@
 # tokie
 
-`tokie` loads a Hugging Face `tokenizer.json` or a `.tokie` image and emits token ids. It implements BPE, WordPiece, SentencePiece BPE, and Unigram. The normalizer is [`normalie`](https://crates.io/crates/normalie); the pretokenizer is [`pretokie`](https://crates.io/crates/pretokie). This crate is 0.2.0.
+`tokie` loads a Hugging Face `tokenizer.json` or a `.tokie` image and emits token ids. It implements BPE, WordPiece, SentencePiece BPE, and Unigram. The normalizer is [`normalie`](https://crates.io/crates/normalie); the pretokenizer is [`pretokie`](https://crates.io/crates/pretokie). This crate is 0.2.1.
 
 ```toml
 [dependencies]
