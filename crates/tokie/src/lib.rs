@@ -17,4 +17,5 @@ mod tokenizer;
 /// Id of one token in a loaded vocab.
 pub type TokenId = u32;
 
+pub use pretokie::Span;
 pub use tokenizer::{EncodePlus, Error, Plus, Specials, Tokenizer};

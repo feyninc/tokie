@@ -99,3 +99,72 @@ fn t5_roundtrip() {
         roundtrip(path);
     }
 }
+
+/// Byte-level BPE over GPT-2's 256 byte chars, with one merge, `Ġ` `a`.
+fn tiny_json() -> String {
+    let mut shown: Vec<u32> = (33..=126).chain(161..=172).chain(174..=255).collect();
+    let mut chars = shown.clone();
+    let mut extra = 0;
+    for byte in 0..256 {
+        if !shown.contains(&byte) {
+            shown.push(byte);
+            chars.push(256 + extra);
+            extra += 1;
+        }
+    }
+    let quoted = |ch: u32| serde_json::to_string(&char::from_u32(ch).unwrap().to_string()).unwrap();
+    let mut vocab: Vec<String> = chars.iter().enumerate().map(|(id, &ch)| format!("{}: {id}", quoted(ch))).collect();
+    vocab.push("\"Ġa\": 256".to_string());
+    format!(
+        r#"{{
+            "pre_tokenizer": {{"type": "ByteLevel", "add_prefix_space": false, "use_regex": true}},
+            "decoder": {{"type": "ByteLevel"}},
+            "model": {{"type": "BPE", "vocab": {{{}}}, "merges": ["Ġ a"]}}
+        }}"#,
+        vocab.join(", ")
+    )
+}
+
+fn ids(tok: &mut Tokenizer, text: &str) -> Vec<u32> {
+    let mut ids = Vec::new();
+    tok.encode(text, &mut ids).unwrap();
+    ids
+}
+
+#[test]
+fn from_bytes_loads_a_tokie_file_and_json() {
+    let json = tiny_json();
+    let mut original = Tokenizer::json(&json).unwrap();
+    let path = temp_path();
+    original.save(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let mut from_tokie = Tokenizer::from_bytes(&bytes).unwrap();
+    let mut from_json = Tokenizer::from_bytes(json.as_bytes()).unwrap();
+    for text in ["", "Hello world", "café 😀"] {
+        let want = ids(&mut original, text);
+        assert_eq!(ids(&mut from_tokie, text), want, "{text:?}");
+        assert_eq!(ids(&mut from_json, text), want, "{text:?}");
+    }
+    assert!(Tokenizer::from_bytes(b"TOKI\0\0\0\0").is_err());
+    assert!(Tokenizer::from_bytes(&[0xff, 0xfe]).is_err());
+}
+
+/// A `.tokie` in the Hugging Face cache loads without asking the Hub.
+#[cfg(feature = "hub")]
+#[test]
+fn pretrained_reads_a_cached_tokie_first() {
+    let home = temp_path().with_extension("hf");
+    let repo = home.join("hub").join("models--tokie-test--cache-first");
+    let snapshot = repo.join("snapshots").join("0123abcd");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::create_dir_all(repo.join("refs")).unwrap();
+    std::fs::write(repo.join("refs").join("main"), "0123abcd\n").unwrap();
+    let mut original = Tokenizer::json(&tiny_json()).unwrap();
+    original.save(snapshot.join("cache-first.tokie")).unwrap();
+    // SAFETY: no other test in this binary reads HF_HOME.
+    unsafe { std::env::set_var("HF_HOME", &home) };
+    let mut loaded = Tokenizer::pretrained("tokie-test/cache-first").unwrap();
+    assert_eq!(ids(&mut loaded, "Hello world"), ids(&mut original, "Hello world"));
+    let _ = std::fs::remove_dir_all(&home);
+}
