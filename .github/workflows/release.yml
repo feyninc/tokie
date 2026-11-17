@@ -45,6 +45,7 @@ jobs:
       version: ${{ steps.check.outputs.version }}
       tag: ${{ steps.check.outputs.tag }}
       target: ${{ steps.check.outputs.target }}
+      python_version: ${{ steps.check.outputs.python_version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -181,7 +182,7 @@ jobs:
 
       - name: Verify exactly one wheel per supported Python
         env:
-          VERSION: ${{ needs.validate-version.outputs.version }}
+          VERSION: ${{ needs.validate-version.outputs.python_version }}
         # Windows defaults to pwsh, which needs $env:VERSION. Run under Git Bash
         # so the shared "$VERSION" expansion works on every matrix entry.
         shell: bash
@@ -192,7 +193,7 @@ jobs:
 
       - name: Install and smoke every wheel in a matching venv
         env:
-          VERSION: ${{ needs.validate-version.outputs.version }}
+          VERSION: ${{ needs.validate-version.outputs.python_version }}
         # Same pwsh caveat as above: this step expands "$VERSION" in bash.
         shell: bash
         run: >-
@@ -300,7 +301,7 @@ jobs:
 
       - name: Run the functional smoke test
         env:
-          VERSION: ${{ needs.validate-version.outputs.version }}
+          VERSION: ${{ needs.validate-version.outputs.python_version }}
         run: |
           source .venv-pyodide/bin/activate
           wheel=$(ls dist/*.whl)
@@ -338,7 +339,7 @@ jobs:
 
       - name: Verify the sdist bundles the workspace crates
         env:
-          VERSION: ${{ needs.validate-version.outputs.version }}
+          VERSION: ${{ needs.validate-version.outputs.python_version }}
         run: |
           archive=$(ls crates/tokie-python/dist/*.tar.gz)
           python scripts/release/smoke_wheel.py verify-sdist \
@@ -347,7 +348,7 @@ jobs:
 
       - name: Install the sdist in a clean venv and smoke it
         env:
-          VERSION: ${{ needs.validate-version.outputs.version }}
+          VERSION: ${{ needs.validate-version.outputs.python_version }}
         run: |
           archive=$(ls crates/tokie-python/dist/*.tar.gz)
           py=$(uv python find 3.12)

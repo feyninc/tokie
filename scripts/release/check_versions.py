@@ -305,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
             handle.write(f"version={version}\n")
             handle.write(f"tag={tag}\n")
             handle.write(f"target={target}\n")
+            handle.write(f"python_version={versions[PYTHON_PACKAGE]}\n")
 
     print(f"release target: {target}")
     print(f"release version: {version}")
