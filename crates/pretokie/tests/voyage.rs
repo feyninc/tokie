@@ -214,3 +214,39 @@ fn fuzzed_ascii_windows_match_the_regex() {
         assert_matches(&re, &text);
     }
 }
+
+/// A whitespace run that reaches a multi-byte character across the 64-byte
+/// window: the bytes past the window's stop are unclassified, not evidence
+/// that the run ended, so the run stays whole as the regex has it.
+#[test]
+fn whitespace_runs_across_the_window_edge_match_the_regex() {
+    let re = regex();
+    let tails = [
+        "   \u{2028}",
+        "\u{a0}\u{a0}\u{a0}",
+        "\r\n  \u{3000}",
+        "\n\u{2029} x",
+        " \u{1680}\u{2000}",
+        "\t\u{85}",
+    ];
+    for lead in ["ﬁ", "w", "Ж"] {
+        for pad in 40..90 {
+            for tail in tails {
+                assert_matches(&re, &format!("{lead}{}{tail}", "w".repeat(pad)));
+                assert_matches(&re, &format!("{lead}{}{tail}x", "w ".repeat(pad / 2)));
+            }
+        }
+    }
+}
+
+/// The two smallest texts found where a run crossing the window split wrongly.
+#[test]
+fn smallest_window_edge_cases_match_the_regex() {
+    let re = regex();
+    for text in [
+        "ﬁשלום'sword👩\u{200d}💻2026Åمرحبا```ÅwordWord\r\n   \u{2028}",
+        "\u{301}\u{301}\r\n\n\rﬁ\rWordWord1,299.99дума\u{301}\u{301}|2026дума\t2026\r\u{a0}\u{a0}\u{a0}",
+    ] {
+        assert_matches(&re, text);
+    }
+}

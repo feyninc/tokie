@@ -234,3 +234,37 @@ fn fuzzed_ascii_windows_match_the_regex() {
         assert_matches(&re, &text);
     }
 }
+
+/// A whitespace run that reaches a multi-byte character across the 64-byte
+/// window: the bytes past the window's stop are unclassified, not evidence
+/// that the run ended, so the run stays whole as the regex has it.
+#[test]
+fn whitespace_runs_across_the_window_edge_match_the_regex() {
+    let re = Regex::new(O200K).expect("o200k pattern");
+    let tails = [
+        "   \u{2028}",
+        "\u{a0}\u{a0}\u{a0}",
+        "\r\n  \u{3000}",
+        "\n\u{2029} x",
+        " \u{1680}\u{2000}",
+        "\t\u{85}",
+    ];
+    for lead in ["ﬁ", "w", "Ж"] {
+        for pad in 40..90 {
+            for tail in tails {
+                assert_matches(&re, &format!("{lead}{}{tail}", "w".repeat(pad)));
+                assert_matches(&re, &format!("{lead}{}{tail}x", "w ".repeat(pad / 2)));
+            }
+        }
+    }
+}
+
+/// The smallest text found where a run crossing the window split wrongly.
+#[test]
+fn smallest_window_edge_case_matches_the_regex() {
+    let re = Regex::new(O200K).expect("o200k pattern");
+    assert_matches(
+        &re,
+        "\u{205f}५\u{200b}\u{200a}7Å\u{3000}\u{200d}'\u{2028}7ЖÅ\u{1680}'S\t\"\u{2000}\u{1680}\u{1680}👩\u{200d}💻Z#'S\n\u{2028}\u{a0}\u{a0}\u{200a}€Word\u{85}€#\u{301}#",
+    );
+}

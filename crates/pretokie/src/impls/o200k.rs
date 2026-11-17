@@ -841,6 +841,14 @@ fn bits<const CONTRACTIONS: bool, const DIGITS3: bool, const SLASH: bool, const 
     if next_tail && abs & (1u64 << 63) != 0 {
         cut = cut.min(tail_owner(abs, punct, space, 63));
     }
+    // A whitespace run that reaches `stop` may go on past it: the bytes from
+    // `stop` are unclassified, not evidence that the run has ended. As for a
+    // run that reaches the window's end, the scalar walker takes it from its
+    // start.
+    if stop < 64 && stop > 0 && !tail_nonws && ws & (1u64 << (stop - 1)) != 0 {
+        let below = nonws & mask_below(stop);
+        cut = cut.min(if below == 0 { 0 } else { 64 - below.leading_zeros() });
+    }
 
     if CONTRACTIONS {
         let mut apostrophe = masks.apostrophe & boundary & prev_letter & keep;
