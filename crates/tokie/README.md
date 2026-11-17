@@ -28,7 +28,7 @@ fn load() -> Result<(), tokie::Error> {
 }
 ```
 
-`Tokenizer::open` reads either format by magic. `Tokenizer::json` parses text. `Tokenizer::pretrained` reads one `.tokie` file from the Hub repo, or parses `tokenizer.json` when the repo has none; `from_pretrained` is an alias. `from_json` and `from_file` are path aliases for `open`. `save` and `to_file` write a `.tokie` file.
+`Tokenizer::open` reads either format by magic. `Tokenizer::json` parses text. `Tokenizer::from_bytes` loads either format from bytes, such as an `include_bytes!` file. `Tokenizer::pretrained` reads one `.tokie` file from the Hub repo, or parses `tokenizer.json` when the repo has none; a `.tokie` file already in the Hub cache is opened without asking the Hub. `from_pretrained` is an alias. `from_json` and `from_file` are path aliases for `open`. `save` and `to_file` write a `.tokie` file.
 
 ## Encode
 

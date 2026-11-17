@@ -51,14 +51,21 @@ pub fn decode(&self, ids: &[TokenId], text: &mut String, specials: Specials) -> 
 pub fn decode_bytes(&self, ids: &[TokenId], specials: Specials) -> Result<Vec<u8>, Error>;
 pub fn count_tokens(&mut self, text: &str) -> Result<usize, Error>;
 pub fn count_tokens_batch(&mut self, texts: &[&str]) -> Result<Vec<usize>, Error>;
+pub fn pretokenize(&mut self, text: &str, pieces: &mut Vec<Span>);
+pub fn count_pretokens(&mut self, text: &str) -> usize;
 
 pub fn open(path: impl AsRef<Path>) -> Result<Self, Error>;        // from_json / from_file aliases
 pub fn json(text: &str) -> Result<Self, Error>;                    // parse text
+pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error>;            // .tokie or tokenizer.json bytes
 pub fn pretrained(repo: &str) -> Result<Self, Error>;              // from_pretrained alias
 pub fn save(&self, path: impl AsRef<Path>) -> Result<(), Error>;   // to_file alias
 ```
 
 `encode_plus(text, ids)` is the single-sequence template. `encode_plus(Plus::new(text).pair(other).truncate(n).pad(n), ids)` adds the rest. `batch` writes cumulative `ends`: text `i` is `ids[prev..ends[i]]`.
+
+`pretokenize` clears `pieces` and writes the byte spans of `text` that the model encodes one at a time (`tokie::Span`, re-exported from pretokie: `u32` `start` and `end`, so `text` is at most 4 GiB); `count_pretokens` returns how many there are without encoding. Every piece encodes to at least one id, so `count_pretokens(text) <= count_tokens(text)`. The spans are exact for byte-level BPE. Where a normalizer rewrites text, BERT and T5 models keep the original cut when it has as many pieces as the rewritten text and otherwise return one piece per word; other models return the rewritten stretch as one piece.
+
+`pretrained` opens a `.tokie` file already in the Hub cache without asking the Hub, so a repo loaded once works offline. Otherwise it downloads as before, and falls back to a cached `tokenizer.json` when the Hub cannot be reached.
 
 The metadata calls are `vocab_size()`, `get_vocab()`, `pad_token_id()`, `num_special_tokens_to_add(is_pair)`, `token(id)`, and `id(token)`. `get_vocab` returns the raw token strings. `vocab_size` is the highest id plus one, so it can exceed the number of entries in `get_vocab`.
 

@@ -5,6 +5,7 @@ use crate::fold::{CharFold, seed as fold_seed};
 use crate::wordpiece::VocabTrie;
 use crate::cache::{Cache, Prep, ProbeView, mix, pack, pack_bounds, pack_spans};
 use crate::cut::Cut;
+use pretokie::Span;
 use crate::norm::Norm;
 use crate::unigram::Lattice;
 use crate::TokenId;
@@ -400,7 +401,11 @@ impl Tokenizer {
         Ok(tok)
     }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+    /// Load a tokenizer from the bytes of a `.tokie` file or a `tokenizer.json`.
+    ///
+    /// The `.tokie` magic picks the format. This loads a tokenizer that was
+    /// embedded with `include_bytes!` or read from somewhere other than a file.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() >= 8 && &bytes[..8] == b"TOKIE\x89\r\n" {
             return from_image(crate::file::decode(bytes)?);
         }
@@ -589,44 +594,59 @@ impl Tokenizer {
     ///
     /// The repo's `.tokie` file is opened, whatever its name. A repo with no
     /// `.tokie` file is parsed from `tokenizer.json`. The file stays in the Hub
-    /// cache. A later call with the same repo reads that copy. A build without
+    /// cache. A later call with the same repo opens the cached `.tokie` file
+    /// without asking the Hub, so it works offline. When the Hub cannot be
+    /// reached, a cached `tokenizer.json` is parsed instead. A build without
     /// the `hub` feature keeps the method and returns an error.
     pub fn pretrained(repo: &str) -> Result<Self, Error> {
         #[cfg(feature = "hub")]
         {
-            let api = hf_hub::api::sync::Api::new().map_err(|err| Error::new(format!("hub: {err}")))?;
-            let model = api.model(repo.to_string());
-            let info = model.info().map_err(|err| Error::new(format!("hub: {err}")))?;
-            let mut tokie_files: Vec<&str> = info
-                .siblings
-                .iter()
-                .map(|file| file.rfilename.as_str())
-                .filter(|name| name.ends_with(".tokie"))
-                .collect();
-            tokie_files.sort_unstable();
-            return match tokie_files.as_slice() {
-                [name] => {
-                    let path = model.get(name).map_err(|err| Error::new(format!("hub: {err}")))?;
-                    Self::open(path)
-                }
-                [] => {
-                    let path = model
-                        .get("tokenizer.json")
-                        .map_err(|err| Error::new(format!("hub: {err}")))?;
-                    let text = fs::read_to_string(&path)
-                        .map_err(|err| format!("read {}: {err}", path.display()))?;
-                    Self::json(&text)
-                }
-                names => Err(Error::new(format!(
-                    "hub: {repo} has several .tokie files: {}",
-                    names.join(", ")
-                ))),
-            };
+            let cache = hf_hub::Cache::from_env();
+            if let Some(path) = cached_tokie(&cache, repo) {
+                return Self::open(path);
+            }
+            match Self::fetch(repo) {
+                Ok(tok) => Ok(tok),
+                Err(Fetch::Unreachable(err)) => match cache.model(repo.to_string()).get("tokenizer.json") {
+                    Some(path) => Self::from_json(path),
+                    None => Err(err),
+                },
+                Err(Fetch::Failed(err)) => Err(err),
+            }
         }
         #[cfg(not(feature = "hub"))]
         {
             let _ = repo;
             Err(Error::new("hub download was left out of this build"))
+        }
+    }
+
+    #[cfg(feature = "hub")]
+    fn fetch(repo: &str) -> Result<Self, Fetch> {
+        let hub = |err: hf_hub::api::sync::ApiError| Fetch::Unreachable(Error::new(format!("hub: {err}")));
+        let api = hf_hub::api::sync::Api::new().map_err(hub)?;
+        let model = api.model(repo.to_string());
+        let info = model.info().map_err(hub)?;
+        let mut tokie_files: Vec<&str> = info
+            .siblings
+            .iter()
+            .map(|file| file.rfilename.as_str())
+            .filter(|name| name.ends_with(".tokie"))
+            .collect();
+        tokie_files.sort_unstable();
+        match tokie_files.as_slice() {
+            [name] => {
+                let path = model.get(name).map_err(hub)?;
+                Self::open(path).map_err(Fetch::Failed)
+            }
+            [] => {
+                let path = model.get("tokenizer.json").map_err(hub)?;
+                Self::from_json(path).map_err(Fetch::Failed)
+            }
+            names => Err(Fetch::Failed(Error::new(format!(
+                "hub: {repo} has several .tokie files: {}",
+                names.join(", ")
+            )))),
         }
     }
 
@@ -761,6 +781,271 @@ impl Tokenizer {
         let result = self.encode(text, &mut ids).map(|()| ids.len());
         self.scratch.count = ids;
         result
+    }
+
+    /// Split `text` into the pieces the model encodes one at a time, as byte
+    /// spans into `text`. `&text[span.start as usize..span.end as usize]` is
+    /// a piece.
+    ///
+    /// The spans are non-empty, in order, do not overlap, and fall on char
+    /// boundaries. Each piece encodes to at least one id, so
+    /// `pieces.len() <= count_tokens(text)`. An added token is one piece.
+    /// Bytes that encode to nothing, such as whitespace that a metaspace or a
+    /// BERT split drops, fall between pieces.
+    ///
+    /// The spans are exact when the tokenizer cuts the text it was given, as
+    /// byte-level BPE models do. Where the normalizer rewrites a stretch of
+    /// text, offsets into the rewritten text would not point into `text`.
+    /// BERT and T5 models keep the cut of the original text where it has as
+    /// many pieces as the rewritten text, and fall back to one piece per word
+    /// where it does not. Other models return a rewritten stretch as one
+    /// piece.
+    ///
+    /// # Panics
+    ///
+    /// When `text` is longer than 4 GiB, which a `u32` span cannot index.
+    pub fn pretokenize(&mut self, text: &str, pieces: &mut Vec<Span>) {
+        assert!(u32::try_from(text.len()).is_ok(), "text is longer than 4 GiB");
+        pieces.clear();
+        self.each_piece(text, pieces);
+    }
+
+    /// How many pieces [`Self::pretokenize`] finds in `text`. This is a lower
+    /// bound on [`Self::count_tokens`], and the walk encodes nothing.
+    pub fn count_pretokens(&mut self, text: &str) -> usize {
+        let mut count = Count(0);
+        self.each_piece(text, &mut count);
+        count.0
+    }
+
+    fn each_piece(&mut self, text: &str, each: &mut impl Sink) {
+        let mut raw = std::mem::take(&mut self.scratch.raw_parts);
+        let mut norm = std::mem::take(&mut self.scratch.norm_parts);
+        split_added(text, &self.tables.raw_added, &mut raw);
+        for part in &raw {
+            let (start, end) = match *part {
+                Part::Id(_, start, end) => {
+                    each.one(start, end);
+                    continue;
+                }
+                Part::Text(start, end) => (start, end),
+            };
+            let segment = &text[start..end];
+            if let Some(rewritten) = self.rewrite(segment) {
+                if !matches!(self.tables.norm_added, Needles::Empty) {
+                    split_added(&rewritten, &self.tables.norm_added, &mut norm);
+                    if norm.iter().any(|part| matches!(part, Part::Id(..)))
+                        && self.rewritten_added(segment, start, &rewritten, &norm, each)
+                    {
+                        continue;
+                    }
+                }
+                self.rewritten_segment(segment, start, &rewritten, each);
+                continue;
+            }
+            split_added(segment, &self.tables.norm_added, &mut norm);
+            for part in &norm {
+                match *part {
+                    Part::Id(_, s, e) => each.one(start + s, start + e),
+                    Part::Text(s, e) => self.cut_pieces(&segment[s..e], start + s, each),
+                }
+            }
+        }
+        self.scratch.raw_parts = raw;
+        self.scratch.norm_parts = norm;
+    }
+
+    /// Cut one segment of the caller's text, which starts at byte `base`.
+    fn cut_pieces(&self, segment: &str, base: usize, each: &mut impl Sink) {
+        if segment.is_empty() {
+            return;
+        }
+        if self.mark {
+            // A metaspace marks every run of non-whitespace as one word. T5
+            // cuts at those words. Any other cut sees `▁`, which has no byte
+            // in `segment`, so the stretch is one piece.
+            if self.cut == Cut::T5 && !self.prefix_space {
+                each_word(segment, |s, e| each.one(base + s, base + e));
+            } else if self.view_pieces(segment) > 0 {
+                each.one(base, base + segment.len());
+            }
+            return;
+        }
+        if self.prefix_space && !segment.starts_with(' ') {
+            // The cut sees one more byte than `segment`, so every span is
+            // shifted back by one, and a piece of only that space is dropped.
+            let mut view = String::with_capacity(segment.len() + 1);
+            view.push(' ');
+            view.push_str(segment);
+            self.cut.drive(&view, |batch| {
+                for span in batch {
+                    let start = (span.start as usize).saturating_sub(1);
+                    let end = span.end as usize - 1;
+                    if start < end {
+                        each.one(base + start, base + end);
+                    }
+                }
+            });
+        } else {
+            self.cut.drive(segment, |batch| each.batch(base, batch));
+        }
+    }
+
+    /// Pieces of a segment the normalizer rewrites, with no added token in
+    /// the rewritten text.
+    fn rewritten_segment(&mut self, segment: &str, base: usize, rewritten: &str, each: &mut impl Sink) {
+        if matches!(self.cut, Cut::Bert | Cut::T5) {
+            let mut own = Vec::new();
+            self.cut_pieces(segment, base, &mut own);
+            if own.len() == self.view_pieces(rewritten) {
+                each.batch(0, &own);
+            } else {
+                self.rewritten_lines(segment, base, each);
+            }
+        } else if self.view_pieces(rewritten) > 0 {
+            each.one(base, base + segment.len());
+        }
+    }
+
+    /// Pieces of a rewritten segment whose rewritten text holds normalized
+    /// added tokens, split into `parts`. Each added token is one piece.
+    ///
+    /// The tokens are found in the rewritten text, so this needs to know
+    /// where each rewritten byte came from. That is only known when the
+    /// normalizer rewrites each char on its own, as BERT's does. Returns
+    /// false, emitting nothing, when it does not.
+    fn rewritten_added(
+        &mut self,
+        segment: &str,
+        base: usize,
+        rewritten: &str,
+        parts: &[Part],
+        each: &mut impl Sink,
+    ) -> bool {
+        // `ends[i]` is (end in the rewritten text, end in `segment`) of char i.
+        let mut ends = vec![(0, 0)];
+        let mut out = 0;
+        let mut buf = [0; 4];
+        for (at, ch) in segment.char_indices() {
+            let one = ch.encode_utf8(&mut buf);
+            let piece = self.rewrite(one);
+            let piece = piece.as_deref().unwrap_or(one);
+            if rewritten.as_bytes().get(out..out + piece.len()) != Some(piece.as_bytes()) {
+                return false;
+            }
+            out += piece.len();
+            ends.push((out, at + ch.len_utf8()));
+        }
+        if out != rewritten.len() {
+            return false;
+        }
+        let source = |out: usize| {
+            let i = ends.partition_point(|&(end, _)| end < out);
+            ends.get(i).filter(|&&(end, _)| end == out).map(|&(_, src)| src)
+        };
+        let mut cuts = Vec::with_capacity(parts.len());
+        for part in parts {
+            let (s, e) = match *part {
+                Part::Id(_, s, e) | Part::Text(s, e) => (s, e),
+            };
+            let (Some(s), Some(e)) = (source(s), source(e)) else {
+                return false;
+            };
+            cuts.push((matches!(part, Part::Id(..)), s, e));
+        }
+        for (added, s, e) in cuts {
+            let text = &segment[s..e];
+            if added {
+                each.one(base + s, base + e);
+            } else if let Some(rewritten) = self.rewrite(text) {
+                self.rewritten_segment(text, base + s, &rewritten, each);
+            } else {
+                self.cut_pieces(text, base + s, each);
+            }
+        }
+        true
+    }
+
+    /// Pieces of a rewritten segment, line by line and then word by word.
+    ///
+    /// BERT and T5 cut at whitespace and drop it, and their normalizers map
+    /// each char on its own, so a line or a word can be normalized and cut
+    /// alone. Text the normalizer keeps is cut exactly. Rewritten text keeps
+    /// the cut of its original when that has as many pieces as the cut of
+    /// the rewritten text. A line that fails this is visited word by word,
+    /// and a word that fails it is one piece. Whitespace the normalizer
+    /// removes does not separate lines or words.
+    fn rewritten_lines(&mut self, segment: &str, base: usize, each: &mut impl Sink) {
+        let mut own = Vec::new();
+        let mut at = 0;
+        let lines: Vec<&str> = if self.keeps_space("\n") {
+            segment.split_inclusive('\n').collect()
+        } else {
+            vec![segment]
+        };
+        for line in lines {
+            if !self.rewritten_piece(line, base + at, &mut own, each) {
+                let mut words: Vec<std::ops::Range<usize>> = Vec::new();
+                each_word(line, |s, e| match words.last_mut() {
+                    Some(last) if !self.keeps_space(&line[last.end..s]) => last.end = e,
+                    _ => words.push(s..e),
+                });
+                for word in words {
+                    let text = &line[word.clone()];
+                    let start = base + at + word.start;
+                    if !self.rewritten_piece(text, start, &mut own, each) {
+                        each.one(start, start + text.len());
+                    }
+                }
+            }
+            at += line.len();
+        }
+    }
+
+    /// Whether whitespace `space` still holds whitespace once normalized.
+    fn keeps_space(&mut self, space: &str) -> bool {
+        self.rewrite(space).is_none_or(|out| out.chars().any(char::is_whitespace))
+    }
+
+    /// Emit the cut of `text` when the normalizer keeps it, or when its cut
+    /// has as many pieces as the cut of the rewritten text. Returns false,
+    /// emitting nothing, when the counts differ.
+    fn rewritten_piece(
+        &mut self,
+        text: &str,
+        at: usize,
+        own: &mut Vec<Span>,
+        each: &mut impl Sink,
+    ) -> bool {
+        let Some(rewritten) = self.rewrite(text) else {
+            self.cut_pieces(text, at, each);
+            return true;
+        };
+        let wanted = self.view_pieces(&rewritten);
+        own.clear();
+        self.cut_pieces(text, at, own);
+        if own.len() != wanted {
+            return wanted == 0;
+        }
+        each.batch(0, own);
+        true
+    }
+
+    /// Pieces in `text` once it is prefixed and marked as encode does.
+    fn view_pieces(&self, text: &str) -> usize {
+        let mut view = String::new();
+        if self.prefix_space && !text.is_empty() && !text.starts_with(' ') {
+            view.push(' ');
+        }
+        view.push_str(text);
+        if self.mark {
+            let mut marked = String::new();
+            mark_words(&view, &mut marked);
+            view = marked;
+        }
+        let mut count = 0;
+        self.cut.drive(&view, |batch| count += batch.len());
+        count
     }
 
     /// One length per text. This calls [`Self::batch`].
@@ -1000,7 +1285,7 @@ impl Tokenizer {
         split_added(text, &self.tables.raw_added, &mut parts);
         for i in 0..parts.len() {
             match parts[i] {
-                Part::Id(id) => ids.push(id),
+                Part::Id(id, ..) => ids.push(id),
                 Part::Text(start, end) => self.encode_raw(&text[start..end], ids)?,
             }
         }
@@ -1015,7 +1300,7 @@ impl Tokenizer {
         split_added(segment, &self.tables.norm_added, &mut parts);
         for i in 0..parts.len() {
             match parts[i] {
-                Part::Id(id) => ids.push(id),
+                Part::Id(id, ..) => ids.push(id),
                 Part::Text(start, end) => self.encode_segment(&segment[start..end], ids)?,
             }
         }
@@ -1502,10 +1787,51 @@ impl Tokenizer {
     }
 }
 
+/// Where the pretoken walk puts its pieces. `start` and `end` are byte
+/// offsets into the caller's text.
+trait Sink {
+    fn one(&mut self, start: usize, end: usize);
+
+    /// Pieces the cut found in a segment that starts at byte `base`.
+    fn batch(&mut self, base: usize, batch: &[Span]) {
+        for span in batch {
+            self.one(base + span.start as usize, base + span.end as usize);
+        }
+    }
+}
+
+impl Sink for Vec<Span> {
+    fn one(&mut self, start: usize, end: usize) {
+        self.push(Span { start: start as u32, end: end as u32 });
+    }
+
+    fn batch(&mut self, base: usize, batch: &[Span]) {
+        if base == 0 {
+            self.extend_from_slice(batch);
+        } else {
+            let base = base as u32;
+            self.extend(batch.iter().map(|s| Span { start: base + s.start, end: base + s.end }));
+        }
+    }
+}
+
+struct Count(usize);
+
+impl Sink for Count {
+    fn one(&mut self, _: usize, _: usize) {
+        self.0 += 1;
+    }
+
+    fn batch(&mut self, _: usize, batch: &[Span]) {
+        self.0 += batch.len();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Part {
     Text(usize, usize),
-    Id(u32),
+    /// An added token's id and its byte range.
+    Id(u32, usize, usize),
 }
 
 fn contains_added(text: &str, raw: &Needles, norm: &Needles) -> bool {
@@ -1613,7 +1939,7 @@ fn split_added(text: &str, needles: &Needles, out: &mut Vec<Part>) {
                 if start > at {
                     out.push(Part::Text(at, start));
                 }
-                out.push(Part::Id(token.id));
+                out.push(Part::Id(token.id, start, end));
                 at = end;
             }
         }
@@ -1642,7 +1968,7 @@ fn split_added(text: &str, needles: &Needles, out: &mut Vec<Part>) {
                 if start > at {
                     out.push(Part::Text(at, start));
                 }
-                out.push(Part::Id(ids[hit.pattern().as_usize()]));
+                out.push(Part::Id(ids[hit.pattern().as_usize()], start, end));
                 at = end;
             }
         }
@@ -2606,6 +2932,62 @@ fn merge_sides(value: &Value) -> Result<(&str, &str), String> {
             Ok((left, right))
         }
         _ => Err(format!("merge is not a pair: {value}")),
+    }
+}
+
+/// Why [`Tokenizer::fetch`] failed: the Hub could not be reached, or the
+/// repo's files do not make one tokenizer.
+#[cfg(feature = "hub")]
+enum Fetch {
+    Unreachable(Error),
+    Failed(Error),
+}
+
+/// The one `.tokie` file in the Hub cache's snapshot of `repo`'s main
+/// branch, in any folder of the snapshot.
+#[cfg(feature = "hub")]
+fn cached_tokie(cache: &hf_hub::Cache, repo: &str) -> Option<std::path::PathBuf> {
+    let folder = hf_hub::Repo::model(repo.to_string()).folder_name();
+    let root = cache.path().join(folder);
+    let commit = fs::read_to_string(root.join("refs").join("main")).ok()?;
+    let mut folders = vec![root.join("snapshots").join(commit.trim())];
+    let mut found = None;
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(folder).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "tokie") {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(path);
+            }
+        }
+    }
+    found
+}
+
+/// Call `each` with the byte range of every word [`mark_words`] marks.
+fn each_word(text: &str, mut each: impl FnMut(usize, usize)) {
+    let mut word = None;
+    for (at, ch) in text.char_indices() {
+        let space = if ch.is_ascii() {
+            ch == ' ' || (ch as u8).wrapping_sub(9) < 5
+        } else {
+            ch.is_whitespace()
+        };
+        match (space, word) {
+            (true, Some(start)) => {
+                each(start, at);
+                word = None;
+            }
+            (false, None) => word = Some(at),
+            _ => {}
+        }
+    }
+    if let Some(start) = word {
+        each(start, text.len());
     }
 }
 
