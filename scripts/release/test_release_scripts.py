@@ -358,7 +358,7 @@ class ReleaseTagTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(
                 output.read_text(encoding="utf-8"),
-                "version=0.3.0\ntag=python-v0.3.0\ntarget=python\n",
+                "version=0.3.0\ntag=python-v0.3.0\ntarget=python\npython_version=0.3.0\n",
             )
 
     def test_all_github_outputs_are_exact(self) -> None:
@@ -373,7 +373,7 @@ class ReleaseTagTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(
                 output.read_text(encoding="utf-8"),
-                "version=0.2.0\ntag=v0.2.0\ntarget=all\n",
+                "version=0.2.0\ntag=v0.2.0\ntarget=all\npython_version=0.2.0\n",
             )
 
 
