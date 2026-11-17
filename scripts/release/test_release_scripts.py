@@ -249,6 +249,30 @@ class RustTargetTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.assert_rejected(root)
 
+    def test_rust_github_outputs_keep_the_python_version(self) -> None:
+        temp, root = fake_release_workspace(pretokie="0.2.1", tokie="0.2.1", cli="0.2.1")
+        self.addCleanup(temp.cleanup)
+        with tempfile.TemporaryDirectory(prefix="tokie-output-") as directory:
+            output = Path(directory) / "output"
+            with redirect_stdout(StringIO()):
+                code = check_versions.main(
+                    [
+                        "--version",
+                        "0.2.1",
+                        "--target",
+                        "rust",
+                        "--root",
+                        str(root),
+                        "--github-output",
+                        str(output),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                "version=0.2.1\ntag=rust-v0.2.1\ntarget=rust\npython_version=0.3.0\n",
+            )
+
     def test_rust_tag_selects_target(self) -> None:
         self.assertEqual(
             check_versions.parse_release_tag("rust-v0.2.1"), ("rust", "0.2.1")
@@ -558,6 +582,46 @@ class WheelTests(unittest.TestCase):
         archive = directory / "tokie-0.2.0.tar.gz"
         write_sdist(archive, names)
         return archive
+
+    def test_python_version_is_pep440(self) -> None:
+        for given, expected in (
+            ("0.3.0", "0.3.0"),
+            ("0.3.0-rc.1", "0.3.0rc1"),
+            ("0.3.0rc1", "0.3.0rc1"),
+            ("0.3.0-alpha.2", "0.3.0a2"),
+            ("0.3.0-beta", "0.3.0b0"),
+            ("0.3.0-pre.1", "0.3.0rc1"),
+            ("0.3.0-dev.4", "0.3.0.dev4"),
+            ("0.3.0-post.1", "0.3.0.post1"),
+        ):
+            with self.subTest(given=given):
+                self.assertEqual(smoke_wheel.python_version(given), expected)
+
+    def test_python_version_rejects_non_pep440(self) -> None:
+        for given in ("0.3.0-foo.1", "0.3", "v0.3.0"):
+            with self.subTest(given=given):
+                with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                    smoke_wheel.python_version(given)
+
+    def test_verify_sdist_accepts_prerelease_archive(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tokie-sdist-") as directory:
+            names = [f"tokie-0.3.0rc1/{name}" for name in self.SDIST_FILES]
+            archive = Path(directory) / "tokie-0.3.0rc1.tar.gz"
+            write_sdist(archive, names)
+            with redirect_stdout(StringIO()):
+                code = smoke_wheel.main(
+                    ["verify-sdist", "--archive", str(archive), "--expected-version", "0.3.0-rc.1"]
+                )
+            self.assertEqual(code, 0)
+
+    def test_verify_set_accepts_prerelease_wheels(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tokie-wheels-") as directory:
+            for minor in range(10, 15):
+                (Path(directory) / f"tokie-0.3.0rc1-cp3{minor}-cp3{minor}-manylinux_2_28_x86_64.whl").touch()
+            code = smoke_wheel.main(
+                ["verify-set", "--dir", directory, "--expected-version", "0.3.0-rc.1"]
+            )
+            self.assertEqual(code, 0)
 
     def test_verify_sdist_accepts_full_archive(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tokie-sdist-") as directory:

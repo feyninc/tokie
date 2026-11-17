@@ -43,6 +43,15 @@ from pathlib import Path
 
 SUPPORTED_VERSIONS = ("3.10", "3.11", "3.12", "3.13", "3.14")
 CP_TAG = re.compile(r"^cp(?P<major>\d)(?P<minor>\d+)(?P<free>t?)$")
+# A release version such as 0.3.0-rc.1, or its PEP 440 form 0.3.0rc1.
+RELEASE_VERSION = re.compile(
+    r"^(?P<release>\d+\.\d+\.\d+)"
+    r"(?:[-_.]?(?P<pre>a|alpha|b|beta|c|rc|pre|preview)[-_.]?(?P<pre_n>\d+)?)?"
+    r"(?:[-_.]?(?P<post>post|rev|r)[-_.]?(?P<post_n>\d+)?)?"
+    r"(?:[-_.]?(?P<dev>dev)[-_.]?(?P<dev_n>\d+)?)?$",
+    re.IGNORECASE,
+)
+PRE_LABELS = {"a": "a", "alpha": "a", "b": "b", "beta": "b", "c": "rc", "rc": "rc", "pre": "rc", "preview": "rc"}
 
 # Mirrors tests/test_aliases.py::FULL. A BPE vocab with holes, a raw non-ASCII
 # spelling pair, a `[PAD]` spelling, one added special, and both templates.
@@ -91,6 +100,21 @@ class SmokeError(Exception):
 def fail(message: str) -> None:
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def python_version(version: str) -> str:
+    """Return the PEP 440 form that maturin writes into wheel and sdist metadata."""
+    match = RELEASE_VERSION.match(version)
+    if match is None:
+        fail(f"version {version!r} has no PEP 440 form")
+    out = match.group("release")
+    if match.group("pre"):
+        out += PRE_LABELS[match.group("pre").lower()] + str(int(match.group("pre_n") or 0))
+    if match.group("post"):
+        out += f".post{int(match.group('post_n') or 0)}"
+    if match.group("dev"):
+        out += f".dev{int(match.group('dev_n') or 0)}"
+    return out
 
 
 def wheel_parts(path: Path) -> dict[str, str]:
@@ -543,6 +567,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    args.expected_version = python_version(args.expected_version)
 
     if args.mode == "verify-set":
         versions = tuple(part.strip() for part in args.versions.split(",") if part.strip())
