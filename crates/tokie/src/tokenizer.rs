@@ -605,13 +605,14 @@ impl Tokenizer {
             if let Some(path) = cached_tokie(&cache, repo) {
                 return Self::open(path);
             }
-            let fetched = Self::fetch(repo);
-            if fetched.is_err()
-                && let Some(path) = cache.model(repo.to_string()).get("tokenizer.json")
-            {
-                return Self::from_json(path);
+            match Self::fetch(repo) {
+                Ok(tok) => Ok(tok),
+                Err(Fetch::Unreachable(err)) => match cache.model(repo.to_string()).get("tokenizer.json") {
+                    Some(path) => Self::from_json(path),
+                    None => Err(err),
+                },
+                Err(Fetch::Failed(err)) => Err(err),
             }
-            fetched
         }
         #[cfg(not(feature = "hub"))]
         {
@@ -621,10 +622,11 @@ impl Tokenizer {
     }
 
     #[cfg(feature = "hub")]
-    fn fetch(repo: &str) -> Result<Self, Error> {
-        let api = hf_hub::api::sync::Api::new().map_err(|err| Error::new(format!("hub: {err}")))?;
+    fn fetch(repo: &str) -> Result<Self, Fetch> {
+        let hub = |err: hf_hub::api::sync::ApiError| Fetch::Unreachable(Error::new(format!("hub: {err}")));
+        let api = hf_hub::api::sync::Api::new().map_err(hub)?;
         let model = api.model(repo.to_string());
-        let info = model.info().map_err(|err| Error::new(format!("hub: {err}")))?;
+        let info = model.info().map_err(hub)?;
         let mut tokie_files: Vec<&str> = info
             .siblings
             .iter()
@@ -634,21 +636,17 @@ impl Tokenizer {
         tokie_files.sort_unstable();
         match tokie_files.as_slice() {
             [name] => {
-                let path = model.get(name).map_err(|err| Error::new(format!("hub: {err}")))?;
-                Self::open(path)
+                let path = model.get(name).map_err(hub)?;
+                Self::open(path).map_err(Fetch::Failed)
             }
             [] => {
-                let path = model
-                    .get("tokenizer.json")
-                    .map_err(|err| Error::new(format!("hub: {err}")))?;
-                let text = fs::read_to_string(&path)
-                    .map_err(|err| format!("read {}: {err}", path.display()))?;
-                Self::json(&text)
+                let path = model.get("tokenizer.json").map_err(hub)?;
+                Self::from_json(path).map_err(Fetch::Failed)
             }
-            names => Err(Error::new(format!(
+            names => Err(Fetch::Failed(Error::new(format!(
                 "hub: {repo} has several .tokie files: {}",
                 names.join(", ")
-            ))),
+            )))),
         }
     }
 
@@ -834,19 +832,15 @@ impl Tokenizer {
             };
             let segment = &text[start..end];
             if let Some(rewritten) = self.rewrite(segment) {
-                let by_word = matches!(self.cut, Cut::Bert | Cut::T5)
-                    && matches!(self.tables.norm_added, Needles::Empty);
-                if by_word {
-                    let mut own = Vec::new();
-                    self.cut_pieces(segment, start, &mut own);
-                    if own.len() == self.view_pieces(&rewritten) {
-                        each.batch(0, &own);
-                    } else {
-                        self.rewritten_lines(segment, start, each);
+                if !matches!(self.tables.norm_added, Needles::Empty) {
+                    split_added(&rewritten, &self.tables.norm_added, &mut norm);
+                    if norm.iter().any(|part| matches!(part, Part::Id(..)))
+                        && self.rewritten_added(segment, start, &rewritten, &norm, each)
+                    {
+                        continue;
                     }
-                } else if self.view_pieces(&rewritten) > 0 {
-                    each.one(start, end);
                 }
+                self.rewritten_segment(segment, start, &rewritten, each);
                 continue;
             }
             split_added(segment, &self.tables.norm_added, &mut norm);
@@ -897,6 +891,81 @@ impl Tokenizer {
         }
     }
 
+    /// Pieces of a segment the normalizer rewrites, with no added token in
+    /// the rewritten text.
+    fn rewritten_segment(&mut self, segment: &str, base: usize, rewritten: &str, each: &mut impl Sink) {
+        if matches!(self.cut, Cut::Bert | Cut::T5) {
+            let mut own = Vec::new();
+            self.cut_pieces(segment, base, &mut own);
+            if own.len() == self.view_pieces(rewritten) {
+                each.batch(0, &own);
+            } else {
+                self.rewritten_lines(segment, base, each);
+            }
+        } else if self.view_pieces(rewritten) > 0 {
+            each.one(base, base + segment.len());
+        }
+    }
+
+    /// Pieces of a rewritten segment whose rewritten text holds normalized
+    /// added tokens, split into `parts`. Each added token is one piece.
+    ///
+    /// The tokens are found in the rewritten text, so this needs to know
+    /// where each rewritten byte came from. That is only known when the
+    /// normalizer rewrites each char on its own, as BERT's does. Returns
+    /// false, emitting nothing, when it does not.
+    fn rewritten_added(
+        &mut self,
+        segment: &str,
+        base: usize,
+        rewritten: &str,
+        parts: &[Part],
+        each: &mut impl Sink,
+    ) -> bool {
+        // `ends[i]` is (end in the rewritten text, end in `segment`) of char i.
+        let mut ends = vec![(0, 0)];
+        let mut out = 0;
+        let mut buf = [0; 4];
+        for (at, ch) in segment.char_indices() {
+            let one = ch.encode_utf8(&mut buf);
+            let piece = self.rewrite(one);
+            let piece = piece.as_deref().unwrap_or(one);
+            if rewritten.as_bytes().get(out..out + piece.len()) != Some(piece.as_bytes()) {
+                return false;
+            }
+            out += piece.len();
+            ends.push((out, at + ch.len_utf8()));
+        }
+        if out != rewritten.len() {
+            return false;
+        }
+        let source = |out: usize| {
+            let i = ends.partition_point(|&(end, _)| end < out);
+            ends.get(i).filter(|&&(end, _)| end == out).map(|&(_, src)| src)
+        };
+        let mut cuts = Vec::with_capacity(parts.len());
+        for part in parts {
+            let (s, e) = match *part {
+                Part::Id(_, s, e) | Part::Text(s, e) => (s, e),
+            };
+            let (Some(s), Some(e)) = (source(s), source(e)) else {
+                return false;
+            };
+            cuts.push((matches!(part, Part::Id(..)), s, e));
+        }
+        for (added, s, e) in cuts {
+            let text = &segment[s..e];
+            if added {
+                each.one(base + s, base + e);
+            } else if let Some(rewritten) = self.rewrite(text) {
+                self.rewritten_segment(text, base + s, &rewritten, each);
+            } else {
+                self.cut_pieces(text, base + s, each);
+            }
+        }
+        true
+    }
+
     /// Pieces of a rewritten segment, line by line and then word by word.
     ///
     /// BERT and T5 cut at whitespace and drop it, and their normalizers map
@@ -904,14 +973,23 @@ impl Tokenizer {
     /// alone. Text the normalizer keeps is cut exactly. Rewritten text keeps
     /// the cut of its original when that has as many pieces as the cut of
     /// the rewritten text. A line that fails this is visited word by word,
-    /// and a word that fails it is one piece.
+    /// and a word that fails it is one piece. Whitespace the normalizer
+    /// removes does not separate lines or words.
     fn rewritten_lines(&mut self, segment: &str, base: usize, each: &mut impl Sink) {
         let mut own = Vec::new();
         let mut at = 0;
-        for line in segment.split_inclusive('\n') {
+        let lines: Vec<&str> = if self.keeps_space("\n") {
+            segment.split_inclusive('\n').collect()
+        } else {
+            vec![segment]
+        };
+        for line in lines {
             if !self.rewritten_piece(line, base + at, &mut own, each) {
-                let mut words = Vec::new();
-                each_word(line, |s, e| words.push(s..e));
+                let mut words: Vec<std::ops::Range<usize>> = Vec::new();
+                each_word(line, |s, e| match words.last_mut() {
+                    Some(last) if !self.keeps_space(&line[last.end..s]) => last.end = e,
+                    _ => words.push(s..e),
+                });
                 for word in words {
                     let text = &line[word.clone()];
                     let start = base + at + word.start;
@@ -922,6 +1000,11 @@ impl Tokenizer {
             }
             at += line.len();
         }
+    }
+
+    /// Whether whitespace `space` still holds whitespace once normalized.
+    fn keeps_space(&mut self, space: &str) -> bool {
+        self.rewrite(space).is_none_or(|out| out.chars().any(char::is_whitespace))
     }
 
     /// Emit the cut of `text` when the normalizer keeps it, or when its cut
@@ -2852,21 +2935,34 @@ fn merge_sides(value: &Value) -> Result<(&str, &str), String> {
     }
 }
 
-/// The one `.tokie` file in the Hub cache's snapshot of `repo`'s main branch.
+/// Why [`Tokenizer::fetch`] failed: the Hub could not be reached, or the
+/// repo's files do not make one tokenizer.
+#[cfg(feature = "hub")]
+enum Fetch {
+    Unreachable(Error),
+    Failed(Error),
+}
+
+/// The one `.tokie` file in the Hub cache's snapshot of `repo`'s main
+/// branch, in any folder of the snapshot.
 #[cfg(feature = "hub")]
 fn cached_tokie(cache: &hf_hub::Cache, repo: &str) -> Option<std::path::PathBuf> {
     let folder = hf_hub::Repo::model(repo.to_string()).folder_name();
     let root = cache.path().join(folder);
     let commit = fs::read_to_string(root.join("refs").join("main")).ok()?;
-    let snapshot = root.join("snapshots").join(commit.trim());
+    let mut folders = vec![root.join("snapshots").join(commit.trim())];
     let mut found = None;
-    for entry in fs::read_dir(snapshot).ok()? {
-        let path = entry.ok()?.path();
-        if path.extension().is_some_and(|ext| ext == "tokie") {
-            if found.is_some() {
-                return None;
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(folder).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "tokie") {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(path);
             }
-            found = Some(path);
         }
     }
     found

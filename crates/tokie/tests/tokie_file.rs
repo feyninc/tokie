@@ -150,13 +150,14 @@ fn from_bytes_loads_a_tokie_file_and_json() {
     assert!(Tokenizer::from_bytes(&[0xff, 0xfe]).is_err());
 }
 
-/// A `.tokie` in the Hugging Face cache loads without asking the Hub.
+/// A `.tokie` in the Hugging Face cache loads without asking the Hub, also
+/// from a folder of the snapshot.
 #[cfg(feature = "hub")]
 #[test]
 fn pretrained_reads_a_cached_tokie_first() {
     let home = temp_path().with_extension("hf");
     let repo = home.join("hub").join("models--tokie-test--cache-first");
-    let snapshot = repo.join("snapshots").join("0123abcd");
+    let snapshot = repo.join("snapshots").join("0123abcd").join("assets");
     std::fs::create_dir_all(&snapshot).unwrap();
     std::fs::create_dir_all(repo.join("refs")).unwrap();
     std::fs::write(repo.join("refs").join("main"), "0123abcd\n").unwrap();

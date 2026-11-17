@@ -46,10 +46,23 @@ fn byte_level(prefix_space: bool) -> Tokenizer {
 
 /// Lowercasing WordPiece: the normalizer rewrites the text.
 fn bert() -> Tokenizer {
+    bert_with("")
+}
+
+/// `bert()` plus a normalized added token, `<x>`.
+fn bert_with_added() -> Tokenizer {
+    bert_with(
+        r#""added_tokens": [{"id": 5, "content": "<x>", "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": true, "special": false}],"#,
+    )
+}
+
+fn bert_with(added: &str) -> Tokenizer {
     let words = ["[UNK]", "hello", "world", ",", "!"];
     let vocab: Vec<String> = words.iter().enumerate().map(|(id, w)| format!("\"{w}\": {id}")).collect();
     let json = format!(
         r###"{{
+            {added}
             "normalizer": {{"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": true,
                 "strip_accents": null, "lowercase": true}},
             "pre_tokenizer": {{"type": "BertPreTokenizer"}},
@@ -102,6 +115,9 @@ const CORPUS: &[&str] = &[
     "<|x|>",
     "a<|x|><|x|>b <|x|>",
     "fn main() {\n    println!(\"hi\");\n}\n",
+    "a\u{b}b",
+    "hello\u{b}world a\u{0}b\u{fffd}c",
+    "<X><X> hello<x>World",
 ];
 
 /// Spans are in order, non-empty, on char boundaries, and no more than the
@@ -171,3 +187,17 @@ fn metaspace_pieces_are_words() {
     assert_eq!(pieces(&mut tok, "\u{2003}"), Vec::<&str>::new());
 }
 
+#[test]
+fn normalized_added_tokens_are_one_piece_each() {
+    let mut tok = bert_with_added();
+    check(&mut tok);
+    assert_eq!(tok.count_tokens("<X><X>").unwrap(), 2);
+    assert_eq!(pieces(&mut tok, "<X><X>"), ["<X>", "<X>"]);
+}
+
+#[test]
+fn removed_separator_does_not_split() {
+    let mut tok = bert();
+    assert_eq!(tok.count_tokens("a\u{b}b").unwrap(), 1);
+    assert_eq!(pieces(&mut tok, "a\u{b}b"), ["a\u{b}b"]);
+}
