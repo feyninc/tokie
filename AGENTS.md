@@ -8,9 +8,9 @@ License is MIT OR Apache-2.0.
 
 | Path | Package | Role |
 | --- | --- | --- |
-| `crates/tokie` | `tokie` 0.2.0 | Tokenizer. Normalie rewrites the string, pretokie splits it, tokie emits ids. |
+| `crates/tokie` | `tokie` 0.2.1 | Tokenizer. Normalie rewrites the string, pretokie splits it, tokie emits ids. |
 | `crates/normalie` | `normalie` 0.1.0 | Normalizers used by tokie. |
-| `crates/pretokie` | `pretokie` 0.2.0 | Pretokenizers used by tokie. Splits text into pieces before the model encodes them. |
+| `crates/pretokie` | `pretokie` 0.2.1 | Pretokenizers used by tokie. Splits text into pieces before the model encodes them. |
 | `crates/tokie-python` | `tokie-python` | PyO3 bindings. The Python module name is `tokie`. |
 | `crates/tokie-cli` | `tokie-cli` | `tokie` binary for building, verifying, and uploading tokenizers. |
 
@@ -32,7 +32,7 @@ cargo test -p pretokie
 cargo test -p tokie
 ```
 
-Check or test one package. `tokie` 0.2 builds against this pretokie and normalie. Pretokie is 0.2.0. Normalie is 0.1.0.
+Check or test one package. `tokie` 0.2 builds against this pretokie and normalie. Pretokie is 0.2.1. Normalie is 0.1.0.
 
 ## Commit messages
 

@@ -6,7 +6,7 @@
   <a href="https://github.com/feyninc/tokie">GitHub</a> · <a href="https://crates.io/crates/tokie">crates.io</a>
 </p>
 
-Python bindings for the tokie Rust tokenizer. The `tokie` Python package is 0.3.0 and wraps the Rust `tokie` 0.2.0 crate. `encode`, `encode_plus`, and `batch` release the GIL and return NumPy arrays. There is no `Encoding` object and no `.ids` attribute; use `.tolist()` only to print or assert.
+Python bindings for the tokie Rust tokenizer. The `tokie` Python package is 0.3.0 and wraps the Rust `tokie` 0.2 crate. `encode`, `encode_plus`, and `batch` release the GIL and return NumPy arrays. There is no `Encoding` object and no `.ids` attribute; use `.tolist()` only to print or assert.
 
 `decode` and `decode_bytes` take the array returned by `encode`, `encode_plus`, or a slice of `batch`'s flat `uint32` ids. Pass it directly; do not call `.tolist()` first. The array must be one-dimensional, native-endian, C-contiguous, and aligned `uint32`. Lists, tuples, and arrays of another dtype are rejected; 0.2.0 also accepted lists.
 

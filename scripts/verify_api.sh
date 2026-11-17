@@ -101,7 +101,7 @@ if [ "$MISSING" -ne 0 ]; then
 fi
 
 run normalie cargo test --locked -p normalie --tests
-run pretokie cargo test --locked -p pretokie@0.2.0 --tests
+run pretokie cargo test --locked -p pretokie@0.2.1 --tests
 run tokie cargo test --locked -p tokie --tests
 run tokie-cli cargo test --locked -p tokie-cli --tests
 run bench-oracles cargo test --locked --manifest-path bench/tokie/Cargo.toml --test oracles -- --nocapture --test-threads=1

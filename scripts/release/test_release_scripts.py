@@ -137,9 +137,9 @@ class VersionTests(unittest.TestCase):
         check_versions.check_versions(ROOT, "0.3.0", "python")
 
     def test_repo_all_release_rejects_split_versions(self) -> None:
-        # The repo currently ships Python 0.3.0 against Rust 0.2.0, so neither
+        # The repo currently ships Python 0.3.0 against Rust 0.2.1, so neither
         # an all-0.2 nor an all-0.3 coordinated release is valid.
-        for version in ("0.2.0", "0.3.0"):
+        for version in ("0.2.1", "0.3.0"):
             with (
                 self.subTest(version=version),
                 redirect_stderr(StringIO()),
@@ -216,6 +216,44 @@ class VersionTests(unittest.TestCase):
                 self.assertRaises(SystemExit),
             ):
                 check_versions.parse_semver(value, "version")
+
+
+class RustTargetTests(unittest.TestCase):
+    def assert_rejected(self, root: Path, version: str = "0.2.1") -> None:
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            check_versions.check_versions(root, version, "rust")
+
+    def test_repo_rust_release_matches_rust_only(self) -> None:
+        check_versions.check_versions(ROOT, "0.2.1", "rust")
+
+    def test_rust_versions_ahead_of_python_are_accepted(self) -> None:
+        temp, root = fake_release_workspace(pretokie="0.2.1", tokie="0.2.1", cli="0.2.1")
+        self.addCleanup(temp.cleanup)
+        check_versions.check_versions(root, "0.2.1", "rust")
+
+    def test_rust_crate_left_behind_is_rejected(self) -> None:
+        for kwargs in (
+            {"tokie": "0.2.1", "cli": "0.2.1"},
+            {"pretokie": "0.2.1", "tokie": "0.2.1"},
+            {"pretokie": "0.2.1", "cli": "0.2.1", "cli_tokie": "0.2.0"},
+        ):
+            with self.subTest(**kwargs):
+                temp, root = fake_release_workspace(**kwargs)
+                self.addCleanup(temp.cleanup)
+                self.assert_rejected(root)
+
+    def test_rust_still_checks_pyproject_against_python(self) -> None:
+        temp, root = fake_release_workspace(
+            pretokie="0.2.1", tokie="0.2.1", cli="0.2.1", pyproject="0.3.1"
+        )
+        self.addCleanup(temp.cleanup)
+        self.assert_rejected(root)
+
+    def test_rust_tag_selects_target(self) -> None:
+        self.assertEqual(
+            check_versions.parse_release_tag("rust-v0.2.1"), ("rust", "0.2.1")
+        )
+        self.assertEqual(check_versions.release_tag("rust", "0.2.1"), "rust-v0.2.1")
 
 
 class PythonTargetTests(unittest.TestCase):
@@ -350,7 +388,8 @@ class WorkflowGateTests(unittest.TestCase):
         "publish-crates",
     }
     PUBLISH_CRATES_IF = (
-        "needs.validate-version.outputs.target == 'all' && "
+        "(needs.validate-version.outputs.target == 'all' || "
+        "needs.validate-version.outputs.target == 'rust') && "
         "(github.event_name == 'release' || "
         "(github.event_name == 'workflow_dispatch' && inputs.publish "
         "&& github.ref == 'refs/heads/main'))"
@@ -441,7 +480,10 @@ class WorkflowGateTests(unittest.TestCase):
     def test_gate_check_catches_removed_target_guard(self) -> None:
         publish = self.job_block(self.text(), "publish-crates")
         mutated = publish.replace(
-            "needs.validate-version.outputs.target == 'all' && ", "", 1
+            "(needs.validate-version.outputs.target == 'all' || "
+            "needs.validate-version.outputs.target == 'rust') && ",
+            "",
+            1,
         )
         self.assertTrue(self.gate_errors(self.text().replace(publish, mutated)))
 
@@ -665,7 +707,7 @@ class PublishWorkspaceTests(unittest.TestCase):
     def test_default_repo_root_uses_script_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="outside-repo-") as outside:
             proc = run_publish(
-                ["validate-workspace", "--version", "0.2.0"],
+                ["validate-workspace", "--version", "0.2.1"],
                 cwd=Path(outside),
             )
         self.assertEqual(proc.returncode, 0, proc.stderr)
